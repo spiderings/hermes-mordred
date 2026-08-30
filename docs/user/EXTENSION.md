@@ -1,8 +1,8 @@
 # Mordred — browser extension guide
 
 > **Status**: preview. This page covers the packaged localhost WebSocket server,
-> browser pairing, encrypted gateway chat, history, and wallet bridge. For the
-> general Mordred setup, start with [`QUICKSTART.md`](./QUICKSTART.md).
+> browser pairing, encrypted gateway chat, history, and wallet bridge. See
+> [`QUICKSTART.md`](./QUICKSTART.md) for general Mordred setup.
 
 ## Install
 
@@ -36,14 +36,18 @@ The browser client is a separately distributed
 git clone https://github.com/mordredagent/mordred-extension-dist.git
 ```
 
-Open `chrome://extensions` (or the equivalent page in Brave, Arc, or Edge),
-enable Developer mode, choose **Load unpacked**, and select the cloned `dist/`
-directory. There is currently no published Firefox bundle.
+1. Open `chrome://extensions` (or the equivalent page in Brave, Arc, or Edge).
+2. Enable Developer mode.
+3. Choose **Load unpacked**.
+4. Select the cloned `dist/` directory.
+
+There is currently no published Firefox bundle.
 
 ## Start and pair
 
 Stock `hermes-agent` does not host or automatically start the Extension API.
-Start the packaged server in the foreground:
+Start the packaged server in the foreground; the `#` line below shows what
+the server prints on startup, not something to type:
 
 ```sh
 hermes-mordred extension serve
@@ -61,8 +65,8 @@ lsof -nP -iTCP:7788 -sTCP:LISTEN
 hermes-mordred extension serve --port 7799
 ```
 
-An alternate port requires a custom extension build whose manifest permits and
-client configuration selects that port.
+An alternate port requires a custom extension build whose manifest permits
+that port and whose client configuration selects it.
 
 In a second terminal, generate a pairing code and wait for the browser
 extension to consume it:
@@ -73,13 +77,33 @@ hermes-mordred extension pair --timeout 300
 ```
 
 `pair` prints a `MORT-...` code and, with the `messaging` extra, a terminal QR.
-The standalone server and compatible legacy/custom gateway implementations use
-`~/.hermes/extension/pending.json`, so either can consume the code.
+Enter the code in the extension's popup, or open the `Web page:` URL printed
+at startup, to complete pairing. The standalone server and compatible
+legacy/custom gateway implementations use `~/.hermes/extension/pending.json`,
+so either can consume the code.
 
 The `Web page:` line printed at startup contains a private URL fragment. Copy
 the complete URL, including `#token=...`, when opening the bundled localhost
 page. The fragment is not sent in the HTTP request and is removed from browser
 history before the app starts.
+
+## Standalone behavior
+
+`extension serve` binds the Hermes runtime installed by the `hermes-agent`
+dependency, so chat invokes the real agent. A stub handler appears only when
+that runtime cannot be imported, and startup logs state which handler was
+selected.
+
+The server does not start automatically. Hermes currently has no plugin boot
+hook for long-running services, so use one of these deployment models:
+
+- Run `extension serve` explicitly in a terminal or process supervisor.
+- Use a compatible legacy/custom gateway only when it explicitly includes the
+  Extension API.
+- Install a launchd/systemd unit whose command is the full
+  `hermes-mordred extension serve` path.
+
+Ctrl+C and SIGTERM shut the standalone server down cleanly.
 
 ## Security model
 
@@ -93,7 +117,7 @@ The currently published browser bundle targets Chromium and can additionally
 register a WebAuthn credential. The server accepts `moz-extension://` transport
 origins for compatible custom clients, but Firefox WebAuthn registration is
 refused until the protocol can carry its stable browser-specific ceremony
-origin and RP ID.
+origin and relying-party ID (RP ID).
 
 For wallet requests, the browser cannot select an arbitrary chain or RPC URL.
 Both must match the operator-selected values in
@@ -106,17 +130,23 @@ recovers the actual signer and verifies that it still matches the address shown
 in the approval prompt.
 
 `personal_sign` prompts distinguish a readable message from an opaque payload.
-A bare 32-byte digest — a Safe transaction hash, a meta-transaction — is
-labelled as unverifiable and warns that the signature alone may authorize
-contract actions or asset movement off-chain. Only a payload that decodes to
-readable text is described as moving no assets.
+A bare 32-byte digest (a Gnosis Safe multisig transaction hash, or a relayed
+meta-transaction) is labelled as unverifiable and warns that the signature
+alone may authorize contract actions or asset movement off-chain. Only a
+payload that decodes to readable text is described as moving no assets.
 
-The localhost page response carries `Content-Security-Policy` (script and style
-pinned by hash, `frame-ancestors 'none'`, `connect-src` limited to the page's
-own loopback WebSocket), `X-Frame-Options: DENY`, `Referrer-Policy:
-no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`,
-so the page holding the launch-fragment token cannot be framed and its token
-cannot leak through a referrer.
+The localhost page response carries these headers:
+
+- `Content-Security-Policy` — script and style pinned by hash,
+  `frame-ancestors 'none'`, and `connect-src` limited to the page's own
+  loopback WebSocket.
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: no-referrer`
+- `X-Content-Type-Options: nosniff`
+- `Cache-Control: no-store`
+
+Together, these mean the page holding the launch-fragment token cannot be
+framed and its token cannot leak through a referrer.
 
 Client-visible errors are stable codes. Exception detail (file paths, backend
 and provider messages) is written to the Hermes log instead of the reply.
@@ -158,24 +188,6 @@ agent. Encrypted commands receive encrypted replies with the same channel key.
 Deploy a v3-capable browser extension and Mordred server together.
 
 The complete wire contract is in [`SLACK_E2E.md`](../dev/SLACK_E2E.md).
-
-## Standalone behavior
-
-`extension serve` binds the Hermes runtime installed by the `hermes-agent`
-dependency, so chat invokes the real agent. A stub handler appears only when
-that runtime cannot be imported, and startup logs state which handler was
-selected.
-
-The server does not start automatically. Hermes currently has no plugin boot
-hook for long-running services, so use one of these deployment models:
-
-- Run `extension serve` explicitly in a terminal or process supervisor.
-- Use a compatible legacy/custom gateway only when it explicitly includes the
-  Extension API.
-- Install a launchd/systemd unit whose command is the full
-  `hermes-mordred extension serve` path.
-
-Ctrl+C and SIGTERM shut the standalone server down cleanly.
 
 ## Troubleshooting
 

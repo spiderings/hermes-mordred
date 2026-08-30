@@ -44,9 +44,9 @@ hermes-mordred/
 ├── docs/dev/                         # SPEC / PLAN / TODO / ROADMAP / CI / setup, etc.
 ├── docs/user/                        # QUICKSTART / USAGE / EXTENSION
 ├── tools/                            # bump_version.py / check_hook_payload_drift.py
-├── scripts/                          # keyvault_offline_digest.py (air-gapped verification)
+├── scripts/                          # keyvault_offline_digest.py (air-gapped verification), install.sh, and dev-era poc_*.py harnesses
 ├── native/                           # sekey-helper (Swift) / tpmkey-helper (Rust)
-└── packaging/                        # config-decrypt .pth bootstrap
+└── packaging/                        # config-decrypt .pth bootstrap, plus PyPI name-reservation / rename compat-shim scaffolding
 ```
 
 ## Two venvs — which code is actually running
@@ -62,7 +62,7 @@ During development, **two independent Python environments** coexist. Mixing up w
 
 **If you want to run local code, use the repo `.venv/`.** Since it's an editable install, editing `src/` takes effect immediately without reinstalling.
 
-> **⚠️ You can't tell them apart by version number**: `__version__` in `__about__.py` only bumps at release time, so between releases the local dev-branch code and the published PyPI wheel **claim the same version string** while their contents differ — every merge to `dev` widens that gap until the next bump. `--version` therefore cannot answer "which one is running." The only reliable signal is `__file__` (see §"Verifying the local build").
+> **⚠️ You can't tell them apart by version number**: `__version__` in `__about__.py` only bumps at release time. Between releases, the local dev-branch code and the published PyPI wheel **claim the same version string** while their contents differ. Every merge to `dev` widens that gap until the next bump. `--version` therefore cannot answer "which one is running." The only reliable signal is `__file__` (see §"Verifying the local build").
 
 An in-place Hermes update that keeps `~/.hermes/hermes-agent/venv` normally
 keeps the installed Mordred wheel too, but it does not upgrade Mordred. If the
@@ -93,22 +93,22 @@ uv sync --all-extras
 
 `uv sync` reproduces `.venv/` according to `uv.lock`. **Installing into `~/.hermes/hermes-agent/venv` is not needed for development** — that's the environment for running the released version in production, and touching it risks breaking your local production configuration (only use Method B under §"Verifying the local build" if you absolutely need to do an end-to-end check against the production configuration).
 
-`hermes setup` is the command that generates the `~/.hermes/` profile (where config / keyvault / audit log live). Only run it if you have never used Hermes before. The `.venv`-side CLI also reads this same `~/.hermes/` by default (see the `HERMES_HOME` isolation section under §"Verifying the local build").
+`hermes setup` — the separate upstream Hermes command, not Mordred's `hermes-mordred setup` — is what generates the `~/.hermes/` profile (where config / keyvault / audit log live). Only run it if you have never used Hermes before. The `.venv`-side CLI also reads this same `~/.hermes/` by default (see the `HERMES_HOME` isolation section under §"Verifying the local build").
 
 ### Optional extras
 
-The extras defined by `[project.optional-dependencies]` in `pyproject.toml`. `uv sync --all-extras` installs all of them, so you normally don't need to think about them individually. The table below is for understanding what CI installs (= which environment the type checker needs to pass in):
+The extras below are defined by `[project.optional-dependencies]` in `pyproject.toml`. `uv sync --all-extras` installs all of them, so you normally don't need to think about them individually. The table below is for understanding what CI installs (= which environment the type checker needs to pass in):
 
 | Extra | Contents | When needed |
 |---|---|---|
 | `dev` | `pytest` / `pytest-cov` / `ruff` (pinned) / `mypy` (pinned) | **Required for everyday commands (below)**. Linters are strictly pinned to match CI |
 | `keyvault` | cross-platform crypto stack (`cryptography` / `argon2-cffi` / `blake3`) | Type-checking / testing keyvault. Recommended on all platforms |
 | `macos` | `keyvault` + pyobjc bridge (`Security` / `SystemConfiguration` / `Quartz`) | Developing Secure Enclave features on macOS |
-| `extension` | `aiohttp` + `cryptography` + `requests[socks]` + `urllib3` | Browser extension WebSocket gateway and Tor-routed wallet RPC (`extension serve`) |
+| `extension` | `aiohttp` + `aiohttp-socks` + `cryptography` + `requests[socks]` + `urllib3` | Browser extension WebSocket gateway and Tor-routed wallet RPC (`extension serve`) |
 | `ethereum` | `eth-keys` / `eth-account` / `rlp` / `eth-hash` | keyvault signing feature (`extension_sign.py`) |
 | `tor-control` | `stem` (Tor ControlPort cookie auth + liveness probe) | Tor liveness in strict mode |
 | `messaging` | `qrcode` | Device QR display for `extension pair` (falls back to plaintext if absent) |
-| `integration` | SOCKS5h client library + provider SDK | `pytest -m integration` network verification suite |
+| `integration` | SOCKS5h client libraries (`httpx[socks]` / `requests[socks]` / `aiohttp-socks`) + provider SDKs (`anthropic` / `openai` / `google-genai` / `boto3`) | `pytest -m integration` network verification suite |
 
 > **CI uses two dependency profiles**: the main strict lane intentionally runs with only `.[dev,keyvault,extension]`, while `feature-extras` installs `ethereum` / `messaging` / `tor-control`, requires their imports, and runs the focused feature suites so `importorskip` cannot hide missing coverage. Use `uv sync --all-extras` when developing those optional features, and also reproduce the main profile before pushing (see `CI.md`).
 
@@ -235,10 +235,11 @@ Run everything via `uv run` (= uses the repo `.venv`). Invoking `.venv/bin/…` 
 | Select / check network route | `.venv/bin/hermes-mordred network use <tor\|vpn\|clearnet>` / `network status` | Saves the next process route; restart Hermes to activate a changed route. `network status --json` shows the current process state |
 | Check overall status | `.venv/bin/hermes-mordred status` | Shows policy / network / keyvault / encryption on one screen (`--json` available). Read-only, no prompts or Secure Enclave access |
 | Start extension gateway | `.venv/bin/hermes-mordred extension serve --port 7799` | Use 7799 for the localhost page/API tests; the published Chromium bundle permits only 7788 |
+| Run every setup step in order | `.venv/bin/hermes-mordred setup` | One-command orchestrator: walks `hermes` → `configure` → `network` → `hardware-helper` → `keyvault` → `env-encryption` → `memory-encryption` in that fixed order, skipping steps already done; safe to re-run. Add `--non-interactive` for scripted runs. **Destructive — `HERMES_HOME` isolation recommended** |
 
-See `CI.md` for workflow details. The scheduled upstream check files an
-informational issue; the equivalent installed-Hermes contract test runs in the
-normal CI suite and can block an incompatible change.
+See [`CI.md`](./CI.md) for workflow details, including §`upstream-check.yml`
+details for the informational-issue workflow and the equivalent
+installed-Hermes contract test.
 
 ## Mordred-owned filesystem paths
 

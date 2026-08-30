@@ -17,7 +17,9 @@ configuration, and agent memories at rest.
 You need:
 
 - macOS, or Linux with TPM 2.0 development/runtime support;
-- a real interactive terminal for `keyvault init`; and
+- a real interactive terminal for `keyvault init` (it prompts for a
+  passphrase and displays a recovery seed phrase to write down, so a piped /
+  non-TTY session will not work); and
 - an installed [Hermes Agent](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/getting-started/installation.md).
 
 Linux supports the hardware-backed keyvault, but the transparent env/config
@@ -49,12 +51,6 @@ Hermes version, selects the macOS or Linux dependencies, installs Mordred from
 PyPI, and puts a `hermes-mordred` launcher next to `hermes`. It does **not**
 change configuration, create keys, or encrypt data.
 
-For an existing `mordred-hermes==0.1.0a15` installation, the script verifies
-that `hermes-mordred>=0.1.0a16` is available before removing the old
-distribution and installing the new one. Configuration, keys, and state are
-preserved. Do not manually install the two real distributions on top of each
-other; use the installer or uninstall the legacy name first.
-
 To include the browser-extension server and Ethereum wallet support from the
 start, use the extension bundle instead:
 
@@ -62,6 +58,12 @@ start, use the extension bundle instead:
 curl -fsSL https://raw.githubusercontent.com/mordredagent/hermes-mordred/main/scripts/install.sh | \
   bash -s -- --with-extension
 ```
+
+For an existing `mordred-hermes` installation (any pre-rename version), the
+script verifies that `hermes-mordred>=0.1.0a16` is available before removing
+the old distribution and installing the new one. Configuration, keys, and
+state are preserved. Do not manually install the two real distributions on
+top of each other; use the installer or uninstall the legacy name first.
 
 `--with-extension` is the convenience option for the `extension` and
 `ethereum` dependency groups. The `messaging` extra is not required to use the
@@ -123,7 +125,7 @@ uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
 
 ### Get the repository
 
-Normal users can skip this section. Contributors can clone the source with:
+Contributors can clone the source; normal users can skip this section.
 
 ```sh
 git clone https://github.com/mordredagent/hermes-mordred.git
@@ -132,10 +134,18 @@ cd hermes-mordred
 
 ### Build the venv
 
-Normal users should keep using the installer-managed Hermes environment. From
-a development checkout, create the separate editable environment with
-`uv sync --all-extras`; follow [`docs/dev/setup.md`](../dev/setup.md) so tests
-cannot modify production state under `~/.hermes`.
+From a checkout, create the separate editable environment with
+`uv sync --all-extras`. Normal users should keep using the
+installer-managed Hermes environment instead. See
+[`docs/dev/setup.md`](../dev/setup.md) for the full procedure and test
+isolation from `~/.hermes`.
+
+## 1. Invoke it
+
+The installer puts `hermes-mordred` in the same directory as `hermes`, so it
+works from any directory and in sh, bash, zsh, and fish. If that directory is
+not on `PATH`, the installer prints it at the end — add it and reload the
+shell.
 
 ## Setup at a glance
 
@@ -146,17 +156,9 @@ left off:
 hermes-mordred setup
 ```
 
-Prefer to run each step yourself? `setup` first checks that upstream Hermes
-itself is set up, then runs the sequence below, skipping whatever is already
-done. Run the interactive configuration, then optionally choose a network
-route:
-
-```sh
-hermes-mordred configure       # policy / LLM / harness
-hermes-mordred network init    # optional: Tor / VPN / clearnet
-```
-
-Prepare the platform helper and create the keyvault:
+Prefer to run each step yourself? See "2. First run, in order" below for the
+ordered sequence. The platform helper and keyvault-creation step differ by
+OS:
 
 ```sh
 # macOS — recommended for background gateways
@@ -168,26 +170,10 @@ hermes-mordred keyvault enable-tpm
 hermes-mordred keyvault init
 ```
 
-On macOS, finally encrypt `.env` and verify:
-
-```sh
-MORDRED_SEKEY_UNATTENDED=1 hermes-mordred encryption enable env
-hermes-mordred status
-```
-
-`keyvault init` and the file vault use distinct native keys. The environment
-variable applies to one process, so put it on both key-creation commands when
-both keys must work unattended.
-
-On Linux, finish by checking `hermes-mordred keyvault list` and
-`hermes-mordred status`; do not expect an `env [on]` row.
-
-## 1. Invoke it
-
-The installer puts `hermes-mordred` in the same directory as `hermes`, so it
-works from any directory and in sh, bash, zsh, and fish. If that directory is
-not on `PATH`, the installer prints it at the end — add it and reload the
-shell.
+`keyvault init` and the file vault (see Glossary; distinct from the keyvault)
+use distinct native keys. `MORDRED_SEKEY_UNATTENDED=1` applies to one process
+only, so when both keys must work unattended put it on `keyvault init` here and
+on the `encryption enable env` command in §3 below.
 
 ## 2. First run, in order
 
@@ -195,9 +181,10 @@ shell.
 (offering to run `hermes setup` if not), then runs the seven steps below in
 order, probing each one first and skipping whatever is already complete — so
 re-running it after an interruption picks up where it left off. Two moments
-still need you at the keyboard: the keyvault Passphrase and 24-word Seed
-Phrase backup at step 4 (have pen and paper ready), and the vault recovery
-passphrase the first time step 5 enables encryption.
+still need you at the keyboard: step 4 asks for the keyvault passphrase and
+displays the 24-word Seed Phrase to back up (have pen and paper ready). Step
+5 asks for the vault recovery passphrase the first time it enables
+encryption.
 
 | # | Command | Result |
 |---|---|---|
@@ -209,11 +196,12 @@ passphrase the first time step 5 enables encryption.
 | 6 | `hermes-mordred encryption enable memory` (macOS only) | Arms the memory hook and seals `~/.hermes/memories/*.md`. |
 | 7 | `hermes-mordred status` | Shows policy, route, keyvault, and encryption state. |
 
-On macOS, a successful final status includes an `env [on] enrolled` row. On
-Linux the row is inactive even if enrolled; that is an explicit platform
-limit, not protected runtime state. The macOS-only `workspace` target has a
-separate `sealed` / `open` / `off` state: `sealed` is protected, not disabled.
-Add `--json` for machine-readable status.
+On macOS, a successful final status includes an `env [on] active` row. On
+Linux the row instead reads `env [paused] enrolled; inactive on this OS
+(linux)`; that is an explicit platform limit, not protected runtime state.
+The macOS-only `workspace` target has a separate `sealed` / `open` / `off`
+state: `sealed` is protected, not disabled. Add `--json` for
+machine-readable status.
 
 ## 3. Fastest path: secrets encrypted at rest
 
@@ -245,6 +233,10 @@ hermes-mordred encryption enable memory
 hermes-mordred encryption enable all
 hermes-mordred encryption status
 ```
+
+`setup` already runs `encryption enable memory` for you on macOS as step 6
+above unless you opted out with `encryption disable memory`. Running it again
+here is a safe no-op when it is already active.
 
 Immediately after the first `encryption enable config`, the current plaintext
 `config.yaml` remains on disk: that command writes the opt-in marker after its
@@ -288,7 +280,7 @@ closed (not plaintext), and a session may see an empty memory. Separately,
 the audit log itself is encrypted only after `keyvault init` — before that,
 entries are written in plaintext.
 
-## 5. Network settings 🌐
+## 5. Network settings
 
 ```sh
 hermes-mordred network init

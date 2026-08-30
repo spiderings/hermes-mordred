@@ -37,10 +37,11 @@ gate into implementation requires a separate SPEC/PLAN change before code.
 
 ## Remaining browser-extension gateway integration
 
-Pairing, localhost serving, encrypted chat, history, wallet/RPC, and the real
-Hermes chat bridge ship in `mordred_hermes.extension`. The remaining question is
-service lifecycle: keep explicit `extension serve`, document launchd/systemd,
-or integrate only if Hermes exposes a safe plugin service-boot hook.
+The shipped `mordred_e2e` behavior — pairing, localhost serving, encrypted
+chat, history, wallet/RPC, and the real Hermes chat bridge — is now described
+in [`SPEC.md`](./SPEC.md). The remaining question is service lifecycle: keep
+explicit `extension serve`, document launchd/systemd, or integrate only if
+Hermes exposes a safe plugin service-boot hook.
 
 - Preserve coexistence with a legacy/custom gateway or standalone Extension
   service already listening on port 7788.

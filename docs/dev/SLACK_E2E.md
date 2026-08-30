@@ -1,5 +1,3 @@
-<a id="hermes--gateway-e2e-&#x6697;&#x53f7;&#x5316;"></a>
-
 # Hermes ⇄ gateway E2E encryption
 
 This document defines how Hermes receives and replies to agent commands when
@@ -36,8 +34,6 @@ When Slack normalizes the Unicode lock emoji to `:lock:`,
 lock is also accepted for compatibility with existing renderers. An unknown
 version, multiple tokens, a plaintext prefix or suffix, non-canonical
 encoding, or tampering rejects the entire post.
-
-<a id="2-aad&#x3068;&#x5b9b;&#x5148;&#x675f;&#x7e1b;"></a>
 
 ## 2. AAD and destination binding
 
@@ -100,8 +96,6 @@ stamps `scope_id` from the event's team id, the shipped Discord adapter stamps
 nothing, and the outbound send path has no event, so only Slack inbound is
 tightened.
 
-<a id="3-replay&#x9632;&#x6b62;&#x3068;plaintext-release"></a>
-
 ## 3. Replay protection and plaintext release
 
 After authentication, domain-separated SHA-256 produces two identities:
@@ -126,8 +120,6 @@ The commit order is:
 
 A valid post that fails step 2 or 3, such as during an adapter outage, does not
 consume its replay entry. Replay-store read or write failures are fail-closed.
-
-<a id="4-&#x8fd4;&#x4fe1;"></a>
 
 ## 4. Replies
 
@@ -258,8 +250,6 @@ a v3 token. Mandatory platforms therefore skip it and send setup guidance just
 like any other plaintext input. Other platforms continue normal dispatch. A
 2026-08-02 security review found that this path could otherwise bypass the gate
 and leak an agent reply in plaintext.
-
-<a id="6-&#x30c6;&#x30b9;&#x30c8;&#x8981;&#x4ef6;"></a>
 
 ## 6. Test requirements
 

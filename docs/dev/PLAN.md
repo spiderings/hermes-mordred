@@ -79,12 +79,12 @@ readers.
   additional host-CLI compatibility surface after the plugins are enabled.
   Command examples use the canonical form; README mentions the host form only
   as a compatibility note.
-- The public distribution rename is staged at the package boundary: reserve
-  `hermes-mordred` independently, publish the real `0.1.0a16` distribution,
-  then publish a metadata-only `mordred-hermes` shim. The import tree,
-  entry-point IDs, persistent state, and native helper identifiers do not
-  change. [`CI.md`](./CI.md) §Normal release owns the ordering and compatibility
-  contract.
+- The public distribution rename completed 2026-08-12: `hermes-mordred` was
+  reserved independently, published as the real distribution, and
+  `mordred-hermes` now publishes only as a metadata-only compatibility shim.
+  The import tree, entry-point IDs, persistent state, and native helper
+  identifiers did not change. [`CI.md`](./CI.md) §Normal release owns the
+  ordering and compatibility contract for future releases.
 
 ### 0.6 CI workflow
 
@@ -138,6 +138,8 @@ isolated `HERMES_HOME` state.
 
 - Register the synthetic `mordred-local` provider from policy.
 - Refuse known external agent harnesses under strict policy.
+- `pre_llm_call` cannot rewrite the provider, so `pre_api_request` and the
+  auxiliary-client guards are the only live enforcement boundaries.
 - Enforce the resolved primary request in `pre_api_request` using both provider
   identity and the actual `base_url`.
 - Guard Hermes auxiliary LLM client construction separately because those
@@ -261,7 +263,9 @@ detect Hermes drift. The 0.13.0 floor and latest release are tested separately.
 Mordred consumes only the fields listed in
 [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md). The current contract is verified
 against installed Hermes and upstream `main`; the original 0.11.0 survey is
-historical context, not the source of truth.
+historical context, not the source of truth. 2026-05-10 is when the contract
+was first frozen; it is now continuously enforced by the weekly
+`.github/workflows/upstream-check.yml` run and `tests/test_hook_payload_drift.py`.
 
 ## Risks and unresolved decisions
 
@@ -287,6 +291,5 @@ historical context, not the source of truth.
 5. Record one-line Changes/Fixes entries in the PR description; do not create a
    `CHANGELOG.md`.
 
-Current in-flight item: agent-memory at-rest encryption, in three PRs — docs
-first, then the keyvault runtime hook, then the wizard lifecycle and `setup`
-step.
+No cross-plugin work is currently in flight; open items live in
+[`TODO.md`](./TODO.md).

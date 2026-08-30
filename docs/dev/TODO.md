@@ -10,15 +10,13 @@ condition. Preserve the zero-upstream-PR commitment and one-plugin-one-PR rule.
 
 ## Standalone-repo repair backlog (2026-07-01)
 
-The original repair backlog is complete. One extension-operability decision is
-still actionable:
+The repair backlog is complete. The only remaining item is the `extension
+serve` lifecycle decision; its canonical description — including the
+port-7788 coexistence and restart-after-upgrade constraints — is
+[`ROADMAP.md` — lifecycle integration](./ROADMAP.md#remaining-browser-extension-gateway-integration).
 
 - [ ] Decide and document the supported long-running lifecycle for
-  `extension serve`: explicit foreground operation, operator-managed
-  launchd/systemd examples, or integration through a future safe Hermes
-  service hook. Preserve coexistence with a standalone service or compatible
-  legacy/custom gateway already using port 7788, and define restart behavior
-  after package upgrades.
+  `extension serve` per that section.
 
 ## Phase 0 — Operational Setup (blocks all later phases)
 
@@ -113,11 +111,6 @@ No open implementation work for the current enforcement model.
 Automatic provider replacement requires a pre-client-construction boundary and
 remains in the roadmap; current strict behavior is refusal, not redirection.
 
-### PR1 prep findings (Codex review 2026-05-13)
-
-Stable anchor: `pre_llm_call` cannot rewrite the provider. The live boundaries
-are `pre_api_request` plus the auxiliary-client guards.
-
 ### 2.1 `mordred_llm_guard` plugin
 
 No open work.
@@ -142,6 +135,10 @@ The implementation is complete; two conservative provider classifications
 still need real-account evidence before they can be relaxed.
 
 ### Open decisions (resolved 2026-05-09 / 2026-05-13)
+
+The classification decision itself is resolved: both providers keep the
+conservative `unverified_baseline=True` stance until real-account evidence
+justifies changing it. Verification is still open:
 
 - [ ] Live-verify Bedrock DNS and proxy behavior with a real AWS account.
   Record the environment, SDK version, selected route, and result without
@@ -177,10 +174,7 @@ API and the operator CLI.
 
 ### Open decisions
 
-- [x] Select the single initialized logical key automatically, collect recovery
-  inputs through masked prompts, require a new `--output` path, and cover an
-  isolated export/recover round trip. Secrets are never accepted in argv or
-  written to logs.
+None for the current release.
 
 ### 4.1 `mordred_keyvault` plugin
 
@@ -190,34 +184,20 @@ operator surface.
 
 ### 4.2 Wizard additions (Phase 4)
 
-- [x] Add `hermes-mordred keyvault export --output <path>` backed by
-  `keyvault.api.export_backup()`.
-- [x] Write the output atomically as a mode-`0600` regular file, refuse unsafe
-  destinations, avoid printing secret inputs or blob contents, and leave no
-  partial output on failure.
-- [x] Verify the blob in tests against an isolated fresh profile/fake backend
-  without mutating the source profile.
-- [x] Update Quickstart/Usage/README to recommend
-  export-before-reset, cross-profile key migration, or attended-to-unattended
-  key replacement.
+No open work. `keyvault export --output` and `keyvault recover --blob` are
+shipped; see [`SPEC.md`](./SPEC.md) §export_backup / import_backup for the
+current CLI and wire contract.
 
 ### 4.3 Tests (Phase 4)
 
-- [x] Cover parser/help, interactive and non-interactive secret handling,
-  permissions, existing-output refusal, atomic failure cleanup, successful
-  round trip, wrong-passphrase failure, and source-profile preservation.
+No open work.
 
 ### 4.4 Agent-memory at-rest encryption (cross-plugin: keyvault + wizard)
 
-- [x] Docs: specify the sealed memory file format, arming rule, seam
-  coverage, and lifecycle in SPEC/PLAN/PATHS/ROADMAP (this PR).
-- [x] Keyvault runtime: the memory-hook wrapper around the memory tool seam,
-  the capability probe, and the CI canary against the installed upstream.
-- [x] Wizard lifecycle: `encryption enable/disable/purge memory`, `status`
-  drift, and the `setup` `memory-encryption` step.
-- [x] Live verification on Apple Silicon with a running gateway (2026-08-20).
-- [x] Record the live-verification result in [`CI.md`](./CI.md) §Manual
-  live-device validation log (2026-08-20).
+No open work. The shipped contract lives in [`SPEC.md`](./SPEC.md)
+§Agent-memory at-rest encryption, and the 2026-08-20 Apple Silicon
+live-verification result is recorded in [`CI.md`](./CI.md) §Manual
+live-device validation log.
 
 ### Acceptance gate (Phase 4)
 

@@ -1,8 +1,9 @@
 # Developer documentation
 
 Start with [`setup.md`](./setup.md) for the editable environment and safe local
-validation. This index lists every maintained developer document; completed
-design diaries and upstream snapshots remain available through Git history.
+validation. This index lists every maintained developer document; superseded
+design notes and historical upstream-fork snapshots are still available
+through Git history (`git log -- docs/dev/`) but are no longer maintained.
 
 ## Current sources of truth
 
@@ -40,5 +41,8 @@ tree solely as history.
   Git and PR descriptions. This repository has no `CHANGELOG.md` or docs
   archive directory.
 - Update package versions only with `python tools/bump_version.py <version>`.
-- Run the documentation link test and the standard repository checks after
-  editing these files.
+- After editing these files, run `uv run pytest tests/test_docs_links.py`
+  plus `uv run ruff check src tests scripts`,
+  `uv run ruff format --check src tests scripts`,
+  `uv run mypy --strict src tools scripts/keyvault_offline_digest.py`, and
+  the full `uv run pytest -q`.

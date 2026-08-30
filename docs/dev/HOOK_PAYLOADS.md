@@ -17,7 +17,7 @@ Current contract:
 
 | Hook | Fields Mordred reads | Consumers |
 |---|---|---|
-| `on_session_start` | `session_id` | Network activation and shared startup integrity |
+| `on_session_start` | `session_id` | Reserved — Hermes supplies it, but no Mordred handler currently reads it (the drift test still verifies Hermes provides it) |
 | `on_session_end` | none | Network cleanup and keyvault resealing |
 | `pre_tool_call` | `tool_name` | Privacy and network generic tool guards |
 | `pre_api_request` | `provider`, `base_url` | LLM and network egress policy |

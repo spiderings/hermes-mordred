@@ -14,7 +14,8 @@ boundaries. Hermes tests and releases remain upstream responsibilities.
 
 The standalone repository resolves `hermes-agent` from PyPI, ships its own five
 workflows, and has no inherited upstream workflows. The initial repository-split
-repair is complete; historical restoration details remain in Git.
+repair — the follow-up work from the 2026-07 move into this standalone
+repository — is complete; historical restoration details remain in Git.
 
 ## Active workflows
 
@@ -31,7 +32,7 @@ repair is complete; historical restoration details remain in Git.
 The workflow has eight jobs:
 
 1. **`test`** — Python/OS matrix; Ruff, shellcheck (one Linux cell), strict
-   mypy, pytest, coverage, and the status-skill drift guard.
+   mypy, pytest, coverage, and the SKILL.md drift guard (mordred-status).
 2. **`feature-extras`** — installs `ethereum`, `messaging`, and `tor-control`
    and runs their focused tests so optional coverage cannot disappear behind
    import skips.
@@ -60,6 +61,7 @@ Key policy:
   CLI target silently stops checking `tools/` or the shipped digest script.
 - GitHub Actions use immutable commit SHAs. Cargo commands use `--locked`.
 - The default pytest configuration excludes `integration` tests.
+- `pytest --cov` enforces an 80% coverage floor (`fail_under` in `pyproject.toml`).
 - Required branch checks are the Ubuntu and macOS Python 3.12 `test` cells;
   helper and integration jobs remain additional signals.
 - Live LLM and Secure Enclave tests have no automated workflow. VPN is the only
@@ -178,10 +180,11 @@ not stored API tokens.
 ### Initial setup (one-time, manual by the operator)
 
 Completed 2026-07-07: TestPyPI/PyPI trusted publishers, GitHub environments,
-and the `0.0.0.dev0` reservation are in place. The current private-repository
-billing plan does not permit required reviewers on the `pypi` environment;
-manual dispatch plus the production branch/CI gates are the compensating
-controls until that setting becomes available.
+and the `0.0.0.dev0` reservation are in place. Required reviewers on the
+`pypi` environment are not yet configured: the setting was unavailable under
+the former private-repository plan and has not been enabled since the
+repository became public. Manual dispatch plus the production branch/CI gates
+remain the compensating controls until a required reviewer is configured.
 
 Completed 2026-08-12 for the `hermes-mordred` rename: pending publishers were
 created on both indexes with owner `InternetMaximalism`, repository
@@ -236,11 +239,12 @@ There is currently no PR template, so authors add the headings manually.
 
 ## Branch protection (one-time setup)
 
-The current private-repository billing plan does not expose branch protection
-or rulesets. When available, protect both `dev` and `main`, require the Ubuntu
-and macOS Python 3.12 test cells, require branches to be current, and keep
-direct pushes to `main` disabled. Until then, the branching convention above is
-the operational control.
+Branch protection is not yet configured for `dev` or `main`: it was
+unavailable under the former private-repository plan and has not been set up
+since the repository became public. Protect both `dev` and `main`, require the
+Ubuntu and macOS Python 3.12 test cells, require branches to be current, and
+keep direct pushes to `main` disabled. Until that is done, the branching
+convention above is the operational control.
 
 ## Auditing
 

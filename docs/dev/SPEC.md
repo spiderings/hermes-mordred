@@ -66,6 +66,11 @@ compatibility policy.
   throughout a run. Its startup hook materializes a mode-`0600` plaintext file
   for the managed process lifetime and reseals it on clean exit; an unclean
   exit can leave that working copy until the next managed start and exit.
+- The `workspace` target protects the `claude-private` encrypted APFS volume
+  Mordred wraps, not a Hermes-owned file, and it is macOS-only. `sealed`
+  (detached) is the protected state; `open` (mounted) means the contents are
+  plaintext to every process running as the operator; `off` means the volume
+  is not set up here.
 - File-vault `vault recover` is supported only on macOS. The Linux TPM helper
   implements native wrapping, but the file vault has no Linux device-anchor
   store and must not claim a working recovery hot path there.
@@ -716,6 +721,34 @@ macOS env and agent-memory encryption, then runs only incomplete steps and
 prints status. It never resets or overwrites a blocked/corrupt keyvault.
 Non-interactive mode runs only the automatable subset and reports the
 interactive commands still needed.
+
+### Plugin: `mordred_e2e`
+
+`mordred_e2e` is the browser-extension gateway plugin and the one
+manifest-less entry point: `pyproject.toml` registers it directly against
+`mordred_hermes.extension.gateway_plugin` rather than a `plugin.yaml`.
+Extension chat runs through the same `AIAgent` class the messaging platforms
+use, so it passes through every other Mordred hook instead of acting as a
+side channel.
+
+A browser extension pairs to one Hermes profile through a code exchange plus
+an ECDH handshake, with an optional WebAuthn credential bound to the pairing;
+[`PATHS.md`](./PATHS.md) owns the resulting `<home>/extension/` state files.
+The standalone `hermes-mordred extension serve` command starts the localhost
+WebSocket server on port 7788 for pairing, chat, signing, and wallet/RPC
+requests; it does not start on its own alongside an ordinary Hermes session.
+
+On Slack and Discord, end-to-end encryption is mandatory across all channels:
+the `pre_gateway_dispatch` hook hands the agent only a complete, context-bound
+`ENC:v3` command, and anything it cannot decrypt is refused with a rate-limited
+needs-key notice to the sender instead of being forwarded in cleartext. A reply
+into an encrypted conversation is re-encrypted in kind.
+[`SLACK_E2E.md`](./SLACK_E2E.md) owns the exact wire grammar. Conversation
+history is recorded encrypted at rest under the pairing's shared key so any
+paired surface can replay it. The wallet/RPC bridge signs through the keyvault
+and broadcasts from the server side, honoring the `mordred_network` route (Tor
+when it is active) so RPC egress follows the same path as the rest of the
+process; the browser never reaches an RPC node directly.
 
 ## Operational Guarantees & Caveats
 

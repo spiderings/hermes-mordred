@@ -11,9 +11,15 @@
 
 ## 1. How to invoke
 
-Use `hermes-mordred <cmd>` for every Mordred operation. This is the canonical
-CLI form across the full supported Hermes version range and remains available
-before the plugins are configured or when their configuration needs recovery.
+Requires Python 3.11 or newer and `hermes-agent>=0.13.0` on macOS or Linux;
+see the [README](../../README.md#requirements) for the platform matrix.
+
+Use `hermes-mordred <cmd>` for every Mordred operation. This works on every
+supported Hermes version and stays available before Mordred is configured and
+whenever its configuration needs recovery. Newer Hermes versions also expose
+the same command tree as a registered subcommand of the Hermes host once the
+plugins are enabled — see the compatibility note in the
+[project README](../../README.md#use-it).
 
 > **Where `hermes-mordred` actually lives.** The console script itself is
 > installed alongside the interpreter, at
@@ -34,9 +40,6 @@ In this development checkout the fully-wired venv is `.venv`:
 cd <repo-root>            # the hermes-mordred checkout
 .venv/bin/hermes-mordred status
 ```
-
-Every example below uses `hermes-mordred <cmd>`. From an unactivated development
-checkout, use the full `.venv/bin/hermes-mordred` path instead.
 
 ### Enabling all Mordred plugins
 
@@ -106,6 +109,10 @@ final status in order. Completed steps are skipped on a rerun. A blocked or
 corrupt keyvault stops with repair guidance; setup never resets it
 automatically.
 
+On `setup`, `--with-hermes-setup` / `--skip-hermes-setup` force or skip the
+upstream `hermes setup` step for this run; the same-named flag means something
+different on `configure` (see below), where it is a deprecated no-op.
+
 ```sh
 hermes-mordred setup
 hermes-mordred setup --non-interactive
@@ -126,8 +133,8 @@ By default `configure` collects only the Mordred-specific prompts and does
 **not** run the upstream `hermes setup` wizard. Pass `--with-hermes-setup` to
 delegate to it first — useful on a fresh machine where Hermes itself is not
 configured yet (Hermes pre-fills each prompt so pressing Enter keeps existing
-values). The old `--skip-hermes-setup` flag is now the default behavior and
-is accepted as a deprecated no-op.
+values). On `configure`, the old `--skip-hermes-setup` flag is now the
+default behavior and is accepted as a deprecated no-op.
 ```sh
 hermes-mordred configure                                           # Mordred prompts only (default)
 hermes-mordred configure --with-hermes-setup                       # run `hermes setup` first, then Mordred prompts
@@ -193,11 +200,11 @@ hermes-mordred encryption change-passphrase             # rotate the recovery pa
 ```
 
 `on` means that the target's protection lifecycle is active, not that its
-plaintext never exists while in use. Most importantly, `config [on]`
-materializes a mode-`0600` plaintext `config.yaml` on disk for the lifetime of
-each managed Hermes process and reseals it on clean exit; an unclean exit can
-leave the working copy until the next managed start and exit. The concise
-target-by-target plaintext and restart matrix is in
+plaintext never exists while in use. Most importantly, `config [on]` writes a
+mode-`0600` plaintext `config.yaml` to disk for the lifetime of each managed
+Hermes process. It reseals that file on a clean exit. An unclean exit can
+leave the plaintext copy in place until the next managed start-and-exit
+cycle. The concise target-by-target plaintext and restart matrix is in
 [`QUICKSTART.md` §What the protected states mean](./QUICKSTART.md#what-the-protected-states-mean).
 
 Immediately after the first `encryption enable config`, the current plaintext
@@ -215,9 +222,9 @@ the hook reseals the current config and removes the plaintext. Do not re-run
 >
 > **Preconditions** (`enable memory` refuses, exit 1, writing nothing, unless
 > all hold): the `env` target is enabled and injecting — that shim is how the
-> key reaches the runtime; macOS; and the interpreter that runs `hermes` (plus
-> any gateway running right now) proves it can open a sealed file. The last
-> check is the same runtime guard the `.env` seal uses, and
+> key reaches the runtime; the platform is macOS; and the interpreter that runs
+> `hermes` (plus any gateway running right now) proves it can open a sealed
+> file. The last check is the same runtime guard the `.env` seal uses, and
 > `--force-runtime-unverified` bypasses it at your own risk.
 >
 > **What the verbs do.** `enable` stores the key (one Touch ID), writes the
@@ -246,12 +253,15 @@ the hook reseals the current config and removes the plaintext. Do not re-run
 > problem blocks start-up. The key itself lives in the vault `.env`; without
 > it, sealed memories cannot be recovered.
 >
-> **Known limitations.** Readers that bypass the memory tool see the sealed
-> text rather than plaintext (`hermes doctor`'s size report, the Desktop
-> learning graph, the Honcho migration upload) — degraded display, never a
-> leak. A writer in a process without the hook (a migration script) leaves
-> plaintext, which `status` shows as `exposed` and the next in-process write
-> seals. `memory.write_approval` stages pending writes as plaintext JSON under
+> **Known limitations** (see SPEC.md's
+> [agent-memory section](../dev/SPEC.md#agent-memory-at-rest-encryption-sealed-memory-file-format-v1)
+> for the readers and pending-write path named below). Readers that bypass the
+> memory tool see the sealed text rather than plaintext (`hermes doctor`'s size
+> report, the Desktop learning graph, the Honcho migration upload) — degraded
+> display, never a leak. A writer in a process without the hook (a migration
+> script) leaves plaintext, which `status` shows as `exposed` and the next
+> in-process write seals. `memory.write_approval` stages pending writes as
+> plaintext JSON under
 > `~/.hermes/pending/memory/` until they are applied (`enable` warns when the
 > flag is on). Run `hermes agent-import` from an interpreter that has the hook.
 > Drift backups (`*.md.bak.<ts>`) are sealed too. Upstream's own drift error
@@ -311,13 +321,18 @@ the hook reseals the current config and removes the plaintext. Do not re-run
 > **right now** under your account — read from the process table, because a
 > gateway started from some other virtualenv is what actually has to unseal the
 > file, and its recorded `gateway_state.json` argv can name a different
-> interpreter than the one the kernel exec'd. Four argv shapes are recognised:
-> `<python> -m hermes_cli… gateway run`, `<python> <launcher> gateway run` (how a
-> console script appears once the kernel rewrites the `#!` exec),
-> `<launcher> gateway run`, and `<shell> <launcher> gateway run` — the launcher
-> path must be absolute. A gateway running under another account (or a shape
-> outside that set) is not seen, and therefore not probed. If a running gateway
-> cannot load the shim, the command refuses and touches nothing (excerpt):
+> interpreter than the one the kernel exec'd. Four argv shapes are recognised
+> (the launcher path must be absolute in each):
+>
+> - `<python> -m hermes_cli… gateway run`
+> - `<python> <launcher> gateway run` (how a console script appears once the
+>   kernel rewrites the `#!` exec)
+> - `<launcher> gateway run`
+> - `<shell> <launcher> gateway run`
+>
+> A gateway running under another account (or a shape outside that set) is not
+> seen, and therefore not probed. If a running gateway cannot load the shim, the
+> command refuses and touches nothing (excerpt):
 >
 > ```text
 > error: refusing to vault-seal .env — a hermes gateway is RUNNING from a different
@@ -406,8 +421,11 @@ key IDs, or moving one between `HERMES_HOME` profiles.*
 Keys created by current releases are isolated per `HERMES_HOME`. A legacy
 keyvault remains readable, but `keyvault reset` intentionally retains its
 machine-global legacy Keychain tag because another profile may share it.
-Create an `MRKV` snapshot with `keyvault export --output <path>`, then import it
-into a fresh profile with `recover --blob <path>`. Keep the original profile
+Create an
+[`MRKV`](../dev/SPEC.md#backup-wire-format-versioning-phase-4-pr2-freeze-2026-05-14)
+snapshot (the passphrase-protected keyvault backup format) with
+`keyvault export --output <path>`, then import it into a fresh profile with
+`recover --blob <path>`. Keep the original profile
 and native helper store intact until the destination has been verified; export
 does not make reset or source removal safe by itself.
 
@@ -533,7 +551,9 @@ Three steps, in order:
    > `python3 -m pip install blake3`.
 
    It asks for three values in order: ① the 24-word Seed Phrase, ② the Passphrase,
-   ③ the top4(PoW) hex (shown on the init screen).
+   ③ the
+   [top4(PoW)](../dev/SPEC.md#proof-of-work-pow-algorithm-phase-4-pr10-step-0-freeze-2026-05-16)
+   hex (shown on the init screen).
 
 > On macOS, `keyvault init` can degrade to a software P-256 key in the login
 > Keychain when Secure Enclave access is unavailable. Linux has no software
