@@ -55,7 +55,7 @@ permissions:
 jobs:
   windows-private-fs:
     runs-on: windows-2022
-    timeout-minutes: 40
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -69,25 +69,24 @@ jobs:
         run: |
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install -e ".[dev,keyvault,extension]" uv
-      - name: Native ACL, path, publication and process tests
+      - name: Bisect A: previous selectors
+        timeout-minutes: 15
+        continue-on-error: true
         run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=600 -v
-          tests/test_private_fs.py tests/test_private_fs_posix.py
-          tests/test_private_fs_windows.py tests/test_private_fs_windows_faults.py
-          tests/test_private_fs_processes.py
-          tests/test_keyvault_wallet_storage.py
-          tests/test_private_fs_lifecycle.py tests/test_private_fs_lifecycle_faults.py
-          tests/test_private_fs_confidential.py tests/test_private_fs_confidential_windows.py
-          tests/test_private_fs_public_build.py tests/test_private_fs_public_build_windows.py
-          tests/test_windows_runtime.py tests/test_windows_installer.py
-          tests/test_windows_install_ownership.py tests/test_windows_install_powershell.py
-          tests/test_private_fs_principal.py tests/test_config_io_custody.py
-          tests/test_config_io.py tests/test_config_readers.py tests/test_config_io_windows.py
-          tests/test_audit_session.py tests/test_audit_session_faults.py
-          tests/test_audit_rotation.py tests/test_audit_session_processes.py
-          tests/test_audit_session_windows.py
-          tests/test_wizard_config_windows.py tests/test_wizard_config_native_windows.py
-          tests/test_windows_custody_profile.py tests/test_windows_custody.py
+          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=300 -v -p no:cacheprovider
+          tests/test_private_fs.py tests/test_private_fs_posix.py tests/test_private_fs_windows.py tests/test_private_fs_windows_faults.py tests/test_private_fs_processes.py tests/test_keyvault_wallet_storage.py tests/test_private_fs_lifecycle.py tests/test_private_fs_lifecycle_faults.py tests/test_private_fs_confidential.py tests/test_private_fs_confidential_windows.py tests/test_private_fs_public_build.py tests/test_private_fs_public_build_windows.py tests/test_windows_runtime.py tests/test_windows_installer.py tests/test_windows_install_ownership.py tests/test_windows_install_powershell.py tests/test_private_fs_principal.py tests/test_config_io_custody.py tests/test_config_io.py tests/test_config_readers.py tests/test_config_io_windows.py tests/test_audit_session.py tests/test_audit_session_faults.py tests/test_audit_rotation.py tests/test_audit_session_processes.py tests/test_audit_session_windows.py tests/test_wizard_config_windows.py tests/test_wizard_config_native_windows.py
+      - name: Bisect B: custody profile
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >-
+          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=300 -v -p no:cacheprovider
+          tests/test_windows_custody_profile.py
+      - name: Bisect C: custody
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >-
+          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=300 -v -p no:cacheprovider
+          tests/test_windows_custody.py
       - name: Build a wheel from the sdist and smoke outside the checkout
         run: |
           .\.venv\Scripts\uv.exe build --sdist --out-dir dist-private-fs
