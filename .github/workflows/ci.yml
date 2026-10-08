@@ -55,6 +55,7 @@ permissions:
 jobs:
   windows-private-fs:
     runs-on: windows-2022
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -70,7 +71,7 @@ jobs:
           .\.venv\Scripts\python.exe -m pip install -e ".[dev,keyvault,extension]" uv
       - name: Native ACL, path, publication and process tests
         run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts=
+          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=600 -v
           tests/test_private_fs.py tests/test_private_fs_posix.py
           tests/test_private_fs_windows.py tests/test_private_fs_windows_faults.py
           tests/test_private_fs_processes.py
