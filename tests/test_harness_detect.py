@@ -1,7 +1,7 @@
 """Tests for ``mordred_hermes.llm_guard.harness_detect``.
 
-SPEC.md L143: harnesses (Codex CLI, Claude CLI, Cursor, ACP clients) bypass
-Hermes hooks for their own daemon LLM traffic. Under strict policy
+Harnesses (Codex CLI, Claude CLI, Cursor, ACP clients) bypass Hermes hooks for
+their own LLM traffic. Under strict policy
 :func:`mordred_llm_guard.harness_detect.check_harness_primary` refuses the
 session; under lenient it warns + audits but continues; under off it is a
 no-op.

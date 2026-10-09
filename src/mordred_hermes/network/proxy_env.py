@@ -1,19 +1,18 @@
 """Proxy environment variables — pure mapping from network path to env vars.
 
 This module is read-only by design. It computes the ``{HTTPS_PROXY: ...}``
-dict that **should** be in ``os.environ`` for a given network path; PR2
-``runtime`` is the sole writer that actually mutates the process
+dict that **should** be in ``os.environ`` for a given network path; the
+network runtime is the sole writer that actually mutates the process
 environment (and tracks the prior values so it can restore on
 process exit).
 
 The Tor URL scheme is always ``socks5h://`` so DNS resolution happens
-inside the Tor circuit (TODO §3.1 L317). Plain ``http://`` proxy URLs are
+inside the Tor circuit. Plain ``http://`` proxy URLs are
 forbidden because the system resolver leaks queries before the request
 ever hits the proxy.
 
 ``NO_PROXY`` always contains ``localhost,127.0.0.1,::1`` regardless of
-path — Phase 2 ``mordred-local`` health probes break if proxy_env forces
-the localhost LLM through Tor (TODO §3.1 L316).
+path so `mordred-local` stays on loopback instead of being sent through Tor.
 """
 
 from __future__ import annotations
@@ -151,8 +150,7 @@ def _build_no_proxy(extras: Iterable[str]) -> str:
 class LibraryRequirement:
     """Minimum HTTP client library version that grew ``socks5h://`` support.
 
-    ``unverified_baseline`` was ``True`` for the PR3a conservative
-    baseline; TODO §0.8 L118-122 cleared it once
+    ``unverified_baseline`` is cleared once
     ``tests/integration/test_socks5h_libs.py`` empirically exercised the
     library against an in-process SOCKS5 inspector. ``notes`` carries the
     verified behaviour and any operator caveat.

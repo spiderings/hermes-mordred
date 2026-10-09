@@ -2,8 +2,8 @@
 
 The tool rewrites the version across every surface (the canonical
 ``__about__.py``, the docs ``VERSION`` marker, every ``plugin.yaml``, the
-README.md / docs/dev/setup.md install pins, and the exact compatibility-shim
-requirements). A bad bump that desyncs them would only be caught later by
+docs/dev/setup.md install pin, and the exact compatibility-shim requirements).
+A bad bump that desyncs them would only be caught later by
 ``test_packaging_versions.py``; these tests exercise the tool directly against
 a throwaway tree (``tmp_path`` + monkeypatched module paths) so its own logic —
 lockstep rewrite, dry-run, the monotonic/validity guards, and PEP 440
@@ -43,20 +43,8 @@ def bump(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, P
     doc.parent.mkdir(parents=True)
     doc.write_text("0.1.0a0\n", encoding="utf-8")
 
-    # README.md / docs/dev/setup.md carry copy-paste install pins too (see
-    # `_INSTALL_PIN_RE` / `_README_STATUS_RE` in the tool). Without pointing
-    # these at throwaway copies, `mod.main()` would rewrite this repo's real
-    # README.md / docs/dev/setup.md on every non-dry-run test below, since
-    # the tool's `_README` / `_SETUP_MD` module constants are bound to the
-    # real repo root at import time, before `_PKG_ROOT` is monkeypatched.
-    readme = pkg / "README.md"
-    readme.write_text(
-        "**Status: active alpha** — current release `0.1.0a0`\n\n"
-        'uv pip install --python p "hermes-mordred[macos]==0.1.0a0"\n'
-        'uv pip install --python p "hermes-mordred[keyvault]==0.1.0a0"\n',
-        encoding="utf-8",
-    )
-
+    # docs/dev/setup.md carries a copy-paste install pin. Point the module
+    # constant at a throwaway copy so non-dry-run tests never touch the repo.
     setup_md = pkg / "docs" / "dev" / "setup.md"
     setup_md.write_text(
         'uv pip install --python p --reinstall "hermes-mordred[macos]==0.1.0a0"\n',
@@ -73,17 +61,13 @@ def bump(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, P
         encoding="utf-8",
     )
 
+    # Mordred ships no plugin.yaml manifests (one entry-point plugin whose
+    # version Hermes reads from the distribution), so there is none to bump.
     manifests: list[Path] = []
-    for name in ("keyvault", "wizard"):
-        manifest = pkg / "src" / "mordred_hermes" / name / "plugin.yaml"
-        manifest.parent.mkdir(parents=True)
-        manifest.write_text(f"name: mordred_{name}\nversion: 0.1.0a0\ndescription: x\n", encoding="utf-8")
-        manifests.append(manifest)
 
     monkeypatch.setattr(mod, "_PKG_ROOT", pkg)
     monkeypatch.setattr(mod, "_ABOUT", about)
     monkeypatch.setattr(mod, "_DOC_VERSION", doc)
-    monkeypatch.setattr(mod, "_README", readme)
     monkeypatch.setattr(mod, "_SETUP_MD", setup_md)
     monkeypatch.setattr(mod, "_COMPAT_PYPROJECT", compat_pyproject)
     return mod, about, doc, manifests
@@ -96,10 +80,6 @@ def test_bump_updates_every_surface_in_lockstep(bump: tuple[ModuleType, Path, Pa
     assert doc.read_text(encoding="utf-8").strip() == "0.1.0b0"
     for manifest in manifests:
         assert "version: 0.1.0b0" in manifest.read_text(encoding="utf-8")
-    readme_text = mod._README.read_text(encoding="utf-8")
-    assert "current release `0.1.0b0`" in readme_text
-    assert 'hermes-mordred[macos]==0.1.0b0"' in readme_text
-    assert 'hermes-mordred[keyvault]==0.1.0b0"' in readme_text
     assert 'hermes-mordred[macos]==0.1.0b0"' in mod._SETUP_MD.read_text(encoding="utf-8")
     compat_text = mod._COMPAT_PYPROJECT.read_text(encoding="utf-8")
     assert 'version = "0.1.0b0"' in compat_text
@@ -114,9 +94,6 @@ def test_dry_run_writes_nothing(bump: tuple[ModuleType, Path, Path, list[Path]])
     assert doc.read_text(encoding="utf-8").strip() == "0.1.0a0"
     for manifest in manifests:
         assert "version: 0.1.0a0" in manifest.read_text(encoding="utf-8")
-    readme_text = mod._README.read_text(encoding="utf-8")
-    assert "current release `0.1.0a0`" in readme_text
-    assert 'hermes-mordred[macos]==0.1.0a0"' in readme_text
     assert 'hermes-mordred[macos]==0.1.0a0"' in mod._SETUP_MD.read_text(encoding="utf-8")
     assert 'version = "0.1.0a0"' in mod._COMPAT_PYPROJECT.read_text(encoding="utf-8")
 
@@ -143,8 +120,8 @@ def test_version_is_canonicalized(bump: tuple[ModuleType, Path, Path, list[Path]
 
 
 def test_allow_non_increasing_resyncs_drifted_files(bump: tuple[ModuleType, Path, Path, list[Path]]) -> None:
-    mod, _about, _doc, manifests = bump
-    # Simulate a hand-edit that left one manifest behind.
-    manifests[0].write_text("name: drifted\nversion: 0.0.1\ndescription: y\n", encoding="utf-8")
+    mod, _about, doc, _manifests = bump
+    # Simulate a hand-edit that left the docs marker behind.
+    doc.write_text("0.0.1\n", encoding="utf-8")
     assert mod.main(["0.1.0a0", "--allow-non-increasing"]) == 0
-    assert "version: 0.1.0a0" in manifests[0].read_text(encoding="utf-8")
+    assert doc.read_text(encoding="utf-8").strip() == "0.1.0a0"

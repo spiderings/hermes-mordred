@@ -106,6 +106,7 @@ class TestSubcommandTree:
             ["mordred", "keyvault", "init", "--paper-only"],
             ["mordred", "keyvault", "list"],
             ["mordred", "keyvault", "verify-digest"],
+            ["mordred", "keyvault", "export", "--output", "/tmp/keyvault-backup.mrkv"],
             ["mordred", "keyvault", "recover", "--blob", "/tmp/x"],
             ["mordred", "vault", "migrate"],
             ["mordred", "vault", "migrate", "/tmp/.env", "/tmp/config.yaml"],

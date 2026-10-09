@@ -74,8 +74,8 @@ class NetworkFallbackUnavailable(Exception):
     Two cases:
 
     1. ``sys.platform != "darwin"`` — short-circuit, ``__cause__`` is
-       ``None``. Phase 4 keyvault is macOS-only; the Linux ``ip`` / ``nmcli``
-       fallback is deferred to v2 (SPEC.md §Seed phrase display security).
+       ``None``. This fallback uses macOS SystemConfiguration; Linux keyvault
+       setup must use the ``mordred_network`` blackout provider.
     2. macOS without ``pyobjc-framework-SystemConfiguration`` — the
        underlying :class:`ImportError` is chained via ``__cause__``.
 
@@ -152,8 +152,8 @@ def _query_reachability_flags(host: bytes = _PROBE_HOST_V4) -> int:
     if sys.platform != "darwin":
         raise NetworkFallbackUnavailable(
             "OS reachability probe requires macOS; current platform is "
-            f"{sys.platform!r}. Phase 4 keyvault is macOS-only; the Linux "
-            "ip/nmcli fallback is deferred to v2."
+            f"{sys.platform!r}. On Linux, enable the mordred plugin (its network runtime) for the "
+            "keyvault blackout check."
         )
 
     try:
@@ -161,7 +161,7 @@ def _query_reachability_flags(host: bytes = _PROBE_HOST_V4) -> int:
     except ImportError as exc:
         raise NetworkFallbackUnavailable(
             "pyobjc-framework-SystemConfiguration is not installed; run "
-            "`pip install hermes-mordred[macos]` to enable the keyvault "
+            "`pip install hermes-mordred[macos]` to enable the macOS "
             "network-blackout fallback."
         ) from exc
 

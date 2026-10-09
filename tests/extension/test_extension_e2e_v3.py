@@ -11,11 +11,6 @@ import pytest
 from mordred_hermes.extension import crypto, e2e, gateway_plugin, pairing
 
 
-@pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-
 @pytest.fixture
 def channel_key() -> bytes:
     pairing._save_pairing(
@@ -635,3 +630,204 @@ def test_replay_cache_rejects_authenticated_identity_reuse(channel_key: bytes, r
         )
         assert claim is not None
         assert e2e.claim_gateway_replay(claim) is (index == 0)
+
+
+# --------------------------------------------------------------------------- #
+# Composite channel-key binding: the {team}/{guild} segment
+#
+# #83 made the composite id resolvable by matching only its first (platform)
+# and last (channel) segments, because a gateway event was not known to carry
+# the workspace id. ``SessionSource.scope_id`` does carry it on Slack, so the
+# middle segment is now enforced wherever the caller actually knows it — and
+# only there, since resurrecting a global "must match" would recreate the #83
+# outage on every event shape that omits the field.
+# --------------------------------------------------------------------------- #
+
+
+def _bind_key(stored_id: str) -> bytes:
+    """Store a channel key under ``stored_id`` on an actively paired install.
+
+    The pairing is what the replay store requires before it will claim an
+    authenticated envelope, so a hook-level test needs it to reach a verdict
+    other than a replay failure.
+    """
+    pairing._save_pairing(
+        pairing.Pairing(
+            aes_key=secrets.token_bytes(32),
+            ext_token="active-pairing",
+            ext_pubkey_b64="",
+            hermes_pubkey_b64="",
+            paired_at=0.0,
+        )
+    )
+    raw_key = secrets.token_bytes(32)
+    pairing.save_channel_key(stored_id, raw_key)
+    return raw_key
+
+
+def test_v3_composite_binding_requires_a_known_scope_to_match() -> None:
+    raw_key = _bind_key("slack:T0TEAM:C0BCX916V6Z")
+    token = _command(raw_key, chat_id="C0BCX916V6Z")
+
+    with pytest.raises(e2e.InvalidEncryptedEnvelope, match="key_not_bound_to_channel"):
+        e2e.decrypt_gateway_envelope(
+            token,
+            "slack",
+            chat_id="C0BCX916V6Z",
+            thread_root=None,
+            scope_id="T0OTHERTEAM",
+        )
+
+
+def test_v3_composite_binding_accepts_the_matching_scope() -> None:
+    raw_key = _bind_key("slack:T0TEAM:C0BCX916V6Z")
+    token = _command(raw_key, chat_id="C0BCX916V6Z")
+
+    plaintext, _kid, replay = e2e.decrypt_gateway_envelope(
+        token,
+        "slack",
+        chat_id="C0BCX916V6Z",
+        thread_root=None,
+        scope_id="T0TEAM",
+    )
+    assert plaintext == "authenticated command"
+    assert replay is not None
+
+
+@pytest.mark.parametrize("scope_id", [None, ""])
+def test_v3_composite_binding_stays_lenient_when_the_scope_is_unknown(scope_id: str | None) -> None:
+    """The #83 shape: no event field to compare against, so do not refuse."""
+    raw_key = _bind_key("slack:T0TEAM:C0BCX916V6Z")
+    token = _command(raw_key, chat_id="C0BCX916V6Z")
+
+    plaintext, _kid, _replay = e2e.decrypt_gateway_envelope(
+        token,
+        "slack",
+        chat_id="C0BCX916V6Z",
+        thread_root=None,
+        scope_id=scope_id,
+    )
+    assert plaintext == "authenticated command"
+
+
+def test_v3_bare_channel_id_binding_ignores_a_known_scope() -> None:
+    """A key stored under the native chat id carries no scope to check."""
+    raw_key = _bind_key("C0BCX916V6Z")
+    token = _command(raw_key, chat_id="C0BCX916V6Z")
+
+    plaintext, _kid, _replay = e2e.decrypt_gateway_envelope(
+        token,
+        "slack",
+        chat_id="C0BCX916V6Z",
+        thread_root=None,
+        scope_id="T0TEAM",
+    )
+    assert plaintext == "authenticated command"
+
+
+class _WrappableAdapter:
+    async def send(self, *_args, **_kwargs):
+        raise AssertionError("not called by inbound verification")
+
+
+class _SlackConnectWrappableAdapter(_WrappableAdapter):
+    def __init__(self, *installed_team_ids: str) -> None:
+        self._team_clients = {team_id: object() for team_id in installed_team_ids}
+
+
+def _scoped_slack_event(
+    token: str,
+    chat_id: str,
+    scope_id: str | None,
+    *,
+    raw_team_id: str | None = None,
+):
+    return SimpleNamespace(
+        text=token,
+        source=SimpleNamespace(
+            platform="slack",
+            chat_id=chat_id,
+            thread_id=None,
+            profile=None,
+            scope_id=scope_id,
+        ),
+        raw_message=({"type": "message", "channel": chat_id, "team": raw_team_id} if raw_team_id is not None else None),
+    )
+
+
+def test_gateway_hook_binds_a_slack_command_to_its_workspace() -> None:
+    """The hook feeds ``source.scope_id`` into key resolution.
+
+    A mismatch is refused as an invalid envelope; the matching workspace gets
+    past decryption (and only then stops on this test's unwrapped gateway), so
+    the two verdicts distinguish "wrong workspace" from "no reply path".
+    """
+    raw_key = _bind_key("slack:T0TEAM:C0BCX916V6Z")
+    gateway = SimpleNamespace(adapters={"slack": _WrappableAdapter()})
+
+    assert gateway_plugin.pre_gateway_dispatch(
+        event=_scoped_slack_event(_command(raw_key, chat_id="C0BCX916V6Z"), "C0BCX916V6Z", "T0OTHERTEAM"),
+        gateway=gateway,
+    ) == {"action": "skip", "reason": "mordred-invalid-encrypted-envelope"}
+
+    assert gateway_plugin.pre_gateway_dispatch(
+        event=_scoped_slack_event(_command(raw_key, chat_id="C0BCX916V6Z"), "C0BCX916V6Z", "T0TEAM"),
+        gateway=gateway,
+    ) == {"action": "rewrite", "text": "authenticated command"}
+
+
+def test_gateway_hook_accepts_external_slack_connect_scope_for_an_installed_host() -> None:
+    raw_key = _bind_key("slack:T0HOSTTEAM:C0BCX916V6Z")
+    gateway = SimpleNamespace(adapters={"slack": _SlackConnectWrappableAdapter("T0HOSTTEAM")})
+
+    assert gateway_plugin.pre_gateway_dispatch(
+        event=_scoped_slack_event(
+            _command(raw_key, chat_id="C0BCX916V6Z"),
+            "C0BCX916V6Z",
+            "T0EXTERNALTEAM",
+            raw_team_id="T0EXTERNALTEAM",
+        ),
+        gateway=gateway,
+    ) == {"action": "rewrite", "text": "authenticated command"}
+
+
+def test_gateway_hook_never_relaxes_slack_connect_to_an_uninstalled_key_scope() -> None:
+    raw_key = _bind_key("slack:T0STALETEAM:C0BCX916V6Z")
+    gateway = SimpleNamespace(adapters={"slack": _SlackConnectWrappableAdapter("T0HOSTTEAM")})
+
+    assert gateway_plugin.pre_gateway_dispatch(
+        event=_scoped_slack_event(
+            _command(raw_key, chat_id="C0BCX916V6Z"),
+            "C0BCX916V6Z",
+            "T0EXTERNALTEAM",
+            raw_team_id="T0EXTERNALTEAM",
+        ),
+        gateway=gateway,
+    ) == {"action": "skip", "reason": "mordred-invalid-encrypted-envelope"}
+
+
+def test_gateway_hook_requires_the_raw_slack_team_to_prove_the_external_scope() -> None:
+    raw_key = _bind_key("slack:T0HOSTTEAM:C0BCX916V6Z")
+    gateway = SimpleNamespace(adapters={"slack": _SlackConnectWrappableAdapter("T0HOSTTEAM")})
+
+    assert gateway_plugin.pre_gateway_dispatch(
+        event=_scoped_slack_event(
+            _command(raw_key, chat_id="C0BCX916V6Z"),
+            "C0BCX916V6Z",
+            "T0EXTERNALTEAM",
+            raw_team_id="T0DIFFERENTTEAM",
+        ),
+        gateway=gateway,
+    ) == {"action": "skip", "reason": "mordred-invalid-encrypted-envelope"}
+
+
+@pytest.mark.parametrize("scope_id", [None, "", 12345, object()])
+def test_gateway_hook_treats_an_absent_or_hostile_scope_as_unknown(scope_id: object) -> None:
+    """An unusable scope field must not refuse a legitimate command."""
+    raw_key = _bind_key("slack:T0TEAM:C0BCX916V6Z")
+    gateway = SimpleNamespace(adapters={"slack": _WrappableAdapter()})
+
+    assert gateway_plugin.pre_gateway_dispatch(
+        event=_scoped_slack_event(_command(raw_key, chat_id="C0BCX916V6Z"), "C0BCX916V6Z", scope_id),
+        gateway=gateway,
+    ) == {"action": "rewrite", "text": "authenticated command"}

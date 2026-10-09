@@ -146,7 +146,7 @@ def materialize_config(
     if not _marker_path(home).exists():
         return 0  # not opted in
 
-    from . import vault
+    from . import anchor, vault
 
     key_id = anchor_label = vault_identity(root)
     backend, store = resolve_backend_store(backend, store)
@@ -155,17 +155,22 @@ def materialize_config(
     # refusing is the fail-closed choice: starting on default config would silently
     # drop the operator's settings. Distinguish anchor deletion (artifacts remain,
     # vault.artifacts_present) for a sharper message — a Keychain *read error*
-    # propagates untouched.
-    if store.read(anchor_label) is None:
+    # propagates untouched. The open's own anchor read is the presence check
+    # (AnchorMissing only when the item is absent): one Keychain read, not two.
+    try:
+        opened = vault.open_vault(root, key_id=key_id, backend=backend, store=store, anchor_label=anchor_label)
+    except anchor.AnchorMissing as exc:
         if vault.artifacts_present(root):
             raise vault.VaultError(
                 f"config.yaml is vault-managed but the device anchor at {root} is missing "
                 f"— refusing to start (possible anchor deletion). {_RECOVERY_HINT}"
-            )
-        raise vault.VaultError(f"config.yaml is marked vault-managed but no vault exists at {root}. {_RECOVERY_HINT}")
+            ) from exc
+        raise vault.VaultError(
+            f"config.yaml is marked vault-managed but no vault exists at {root}. {_RECOVERY_HINT}"
+        ) from exc
 
     plaintext_path = home / config_name
-    with vault.open_vault(root, key_id=key_id, backend=backend, store=store, anchor_label=anchor_label) as opened:
+    with opened:
         enrolled = config_name in opened.list_files()
 
         if plaintext_path.exists() or plaintext_path.is_symlink():

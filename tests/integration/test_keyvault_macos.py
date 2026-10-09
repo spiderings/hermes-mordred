@@ -223,7 +223,7 @@ def test_config_decrypt_lifecycle_through_real_enclave(tmp_path: Path, monkeypat
     """
     _require_live_enclave()
     from mordred_hermes.keyvault import _seckey_backend, _seckey_helper
-    from mordred_hermes.keyvault._anchor_keychain import KeychainAnchorStore
+    from mordred_hermes.keyvault._anchor_keychain import default_anchor_store
     from mordred_hermes.keyvault._config_bootstrap import _marker_path, materialize_config, reseal_config
     from mordred_hermes.keyvault._identity import vault_identity
     from mordred_hermes.wizard import config_decrypt_cli, vault_cli
@@ -292,7 +292,7 @@ def test_config_decrypt_lifecycle_through_real_enclave(tmp_path: Path, monkeypat
         # SE key blobs live under tmp_path (auto-removed); only the login-Keychain
         # device anchor is real-system residue.
         with contextlib.suppress(Exception):
-            KeychainAnchorStore().delete(anchor_label)
+            default_anchor_store().delete(anchor_label)
 
 
 def test_config_decrypt_fail_closed_on_missing_anchor_through_real_enclave(
@@ -305,7 +305,7 @@ def test_config_decrypt_fail_closed_on_missing_anchor_through_real_enclave(
     """
     _require_live_enclave()
     from mordred_hermes.keyvault import _seckey_helper, vault
-    from mordred_hermes.keyvault._anchor_keychain import KeychainAnchorStore
+    from mordred_hermes.keyvault._anchor_keychain import default_anchor_store
     from mordred_hermes.keyvault._config_bootstrap import materialize_config, reseal_config
     from mordred_hermes.keyvault._identity import vault_identity
     from mordred_hermes.wizard import config_decrypt_cli, vault_cli
@@ -334,9 +334,9 @@ def test_config_decrypt_fail_closed_on_missing_anchor_through_real_enclave(
 
         # Simulate device-anchor deletion: the marker still promises a vault-managed
         # config, so materialize must fail closed (not fall back to a default config).
-        KeychainAnchorStore().delete(anchor_label)
+        default_anchor_store().delete(anchor_label)
         with pytest.raises(vault.VaultError):
             materialize_config(root=root, home=home)
     finally:
         with contextlib.suppress(Exception):
-            KeychainAnchorStore().delete(anchor_label)
+            default_anchor_store().delete(anchor_label)

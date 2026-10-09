@@ -35,9 +35,6 @@ from .._audit_io import (
     audit_path_stat as _audit_path_stat,
 )
 from .._audit_io import (
-    compress_rotated_file as _compress_rotated_file,
-)
-from .._audit_io import (
     exclusive_audit_lock as _exclusive_audit_lock,
 )
 from .._audit_io import (
@@ -47,7 +44,7 @@ from .._audit_io import (
     read_first_line as _read_first_line,
 )
 from .._log_rotation import next_rotation_target as _next_rotation_target
-from .._log_rotation import sweep_retention as _sweep_retention
+from .._log_rotation import rotate_and_compress as _rotate_and_compress
 from .._log_rotation import today_utc_date as _today_utc_date
 from .._log_rotation import utcnow_iso as _utcnow_iso
 
@@ -208,27 +205,15 @@ class NDJSONWriter:
         self._last_date = today
 
     def _rotate(self, date_suffix: str) -> None:
-        before = _audit_path_stat(self.path)
-        if before is None:
-            return
+        """Rename the active file aside, gzip it, and sweep expired rotations.
 
-        target = _next_rotation_target(self.path, date_suffix)
-        os.replace(self.path, target)
-        moved = _audit_path_stat(target)
-        if moved is None or (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
-            raise OSError("audit path changed during rotation")
-
-        gz_target = target.with_suffix(target.suffix + ".gz")
-        try:
-            _compress_rotated_file(target, gz_target)
-        except Exception as e:
-            # gzip failure does NOT lose data — `target` already holds the
-            # rotated content. Leave it un-gzipped; the next rotation's
-            # collision loop will pick a new suffix. Best-effort: clean up
-            # any partial .gz so it doesn't read as corrupt.
-            _LOG.warning("audit gzip rotation failed; raw rotated file kept at %s: %s", target, e)
-
-        _sweep_retention(self.path, self.retention_days)
+        Shared with ``EncryptedWriter._rotate`` via
+        :func:`mordred_hermes._log_rotation.rotate_and_compress` (the two
+        bodies were byte-for-byte identical apart from the logger). This
+        module's own ``_LOG`` is passed in, so a gzip failure is still reported
+        under ``mordred.privacy_check.audit``.
+        """
+        _rotate_and_compress(self.path, date_suffix, retention_days=self.retention_days, log=_LOG)
 
 
 # Phase 4 ``MRAL`` encrypted-log format tag — mirrors
@@ -361,8 +346,8 @@ def make_audit_writer(
 ) -> Writer:
     """Return the audit-log :class:`Writer` for the current keyvault state.
 
-    Phase 4 L465: once the Mordred keyvault is initialized the audit log
-    must be AES-GCM-encrypted at rest. This factory returns a keyvault
+    Once the Mordred keyvault is initialized, the audit log should be
+    AES-GCM-encrypted at rest. This factory returns a keyvault
     :class:`~mordred_hermes.keyvault.log_encryption.EncryptedWriter` when
     the keyvault is initialized *and* its audit-log wrapping key is
     usable, and an :class:`NDJSONWriter` otherwise.

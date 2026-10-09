@@ -1,6 +1,6 @@
-"""RED tests for Phase 4 PR8: ``hermes mordred keyvault {list,verify-digest}``.
+"""Tests for ``hermes-mordred keyvault {list,verify-digest}``.
 
-SPEC.md §4.2 / TODO.md §4.2 L429-430. These are the **backend-free**
+These are the **backend-free**
 keyvault CLI commands — they only read the on-disk keyvault layout
 (``meta.json`` + ``digests/<hash>.commit``) and need no Secure Enclave
 ``NativeBackend``:
@@ -579,6 +579,34 @@ class TestRecover:
         )
         assert rc == 1
         assert "nope.mrkv" in capsys.readouterr().err
+
+    def test_unreadable_blob_wins_over_a_seed_that_would_also_fail(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Multi-fault: the blob path does not exist AND the seed the operator
+        would type is also bogus (fails the BIP39 checksum). ``_read_backup_blob``
+        must run and report FIRST — the same "cannot read backup blob" message
+        as a lone missing blob — before either prompt is ever issued.
+
+        Mutation-sensitive: swapping ``_read_backup_blob`` and the
+        prompt/``_validated_seed_and_pow`` sequence inside ``recover`` makes
+        this fail — the seed prompt would run (recorded below) and the error
+        would become the BIP39 rejection instead.
+        """
+        prompt_io = _RecordingPromptIO(seed=" ".join(["abandon"] * 24), passphrase=RECOVER_PASS)
+
+        rc = keyvault_cli.recover(
+            blob_path=tmp_path / "nope.mrkv",
+            home=tmp_path,
+            backend=FakeBackend(),
+            prompt_io=prompt_io,
+        )
+
+        assert rc == 1
+        assert prompt_io.calls == []  # neither prompt was ever reached
+        err = capsys.readouterr().err.lower()
+        assert "cannot read backup blob" in err
+        assert "seed phrase rejected" not in err
 
     def test_bad_seed_checksum_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         blob_file = tmp_path / "b.mrkv"
@@ -1561,3 +1589,29 @@ class TestOfflineDigestScriptLocator:
         assert path is not None
         assert path.is_file()
         assert path.name == "keyvault_offline_digest.py"
+
+
+class TestOfflineCopyHint:
+    """The seed banner's copy hint must show a concrete, paste-safe copy
+    command when the digest tool was located (UX review 2026-08-20: naming
+    the path alone still left operators to invent the copy step), and must
+    state what the offline device needs in both branches.
+    """
+
+    def test_hint_with_located_script_shows_quoted_cp_command(self, tmp_path: Path) -> None:
+        from mordred_hermes.wizard import _keyvault_init
+
+        script = tmp_path / "keyvault_offline_digest.py"
+        script.write_text("#!/usr/bin/env python3\n")
+        hint = _keyvault_init._offline_copy_hint(script)
+        # Both paths quoted: pasting the line verbatim must never let the
+        # <your-usb> placeholder act as shell redirection.
+        assert f'cp "{script}" "/Volumes/<your-usb>/"' in hint
+        assert "python3 with the blake3 package" in hint
+
+    def test_hint_without_script_still_names_requirements(self) -> None:
+        from mordred_hermes.wizard import _keyvault_init
+
+        hint = _keyvault_init._offline_copy_hint(None)
+        assert "ships with hermes-mordred" in hint
+        assert "python3 with the blake3 package" in hint

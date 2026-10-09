@@ -1,4 +1,4 @@
-# M7 — PyPI name-reservation stub (TODO §0.5 L70).
+# Historical PyPI name-reservation stub; this is not the real package.
 #
 # This is NOT the real Mordred plugin bundle. It is an intentionally
 # empty `0.0.0.dev0` distribution whose only job is to claim the
@@ -23,8 +23,8 @@ authors = [{ name = "InternetMaximalism" }]
 license = { text = "MIT" }
 
 [project.urls]
-Homepage = "https://github.com/InternetMaximalism/hermes-mordred"
-Source = "https://github.com/InternetMaximalism/hermes-mordred"
+Homepage = "https://github.com/mordredagent/hermes-mordred"
+Source = "https://github.com/mordredagent/hermes-mordred"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mordred_hermes"]

@@ -32,6 +32,7 @@ from ._vault_open import _display_name, _open_cold_path, _open_hot_path_or_repor
 if TYPE_CHECKING:
     from ..keyvault.anchor import AnchorStore
     from ..keyvault.wrap import NativeBackend
+    from ._flow_session import FlowSession
     from .configure import PromptIO
 
 # Upper bound for a manifest read in `status` (real manifests are a few KBs;
@@ -158,6 +159,7 @@ def _enroll_one(
     backend: NativeBackend | None,
     store: AnchorStore | None,
     read_back: bool,
+    flow_session: FlowSession | None = None,
 ) -> tuple[int, int | None, bytes | None]:
     """Open the vault hot path once, enroll ``plaintext`` under ``name``, and close.
 
@@ -171,11 +173,14 @@ def _enroll_one(
     Returns ``(rc, generation, read_back_bytes)``. On ``rc != 0`` the generation
     and bytes are ``None`` (the reason is already on stderr); ``read_back_bytes``
     is ``None`` whenever ``read_back`` is false.
+
+    With a ``flow_session`` the flow's already open vault is reused (no unlock
+    at all), or the one opened here is kept for the flow's later steps.
     """
     from ..keyvault import anchor, vault
     from ..keyvault._exceptions import WrapError
 
-    opened = _open_hot_path_or_report(root, backend=backend, store=store)
+    opened = _open_hot_path_or_report(root, backend=backend, store=store, flow_session=flow_session)
     if opened is None:
         return 1, None, None
 
@@ -198,6 +203,7 @@ def add(
     source: Path,
     backend: NativeBackend | None = None,
     store: AnchorStore | None = None,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Enroll ``source``'s bytes into the vault at ``root`` under ``name``.
 
@@ -220,7 +226,13 @@ def add(
         return 1
 
     rc, generation, _ = _enroll_one(
-        root=root, name=name, plaintext=plaintext, backend=backend, store=store, read_back=False
+        root=root,
+        name=name,
+        plaintext=plaintext,
+        backend=backend,
+        store=store,
+        read_back=False,
+        flow_session=flow_session,
     )
     if rc != 0:
         return rc
@@ -236,6 +248,7 @@ def add_and_verify(
     source: Path,
     backend: NativeBackend | None = None,
     store: AnchorStore | None = None,
+    flow_session: FlowSession | None = None,
 ) -> tuple[int, bytes | None]:
     """:func:`add`, plus the vault's decrypted copy of ``name`` read back in the
     *same* open — one device-key unlock (one Touch ID) for both enroll and verify.
@@ -254,7 +267,13 @@ def add_and_verify(
         return 1, None
 
     rc, generation, enrolled = _enroll_one(
-        root=root, name=name, plaintext=plaintext, backend=backend, store=store, read_back=True
+        root=root,
+        name=name,
+        plaintext=plaintext,
+        backend=backend,
+        store=store,
+        read_back=True,
+        flow_session=flow_session,
     )
     if rc != 0:
         return rc, None

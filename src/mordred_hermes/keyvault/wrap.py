@@ -187,9 +187,12 @@ class NativeBackend(Protocol):
         ...
 
     def delete_enclave_key(self, key_id: str) -> None:
-        """Remove the Keychain item for ``key_id``. Idempotent — no-op
-        when the item does not exist (mirrors ``errSecItemNotFound``
-        being treated as success in production)."""
+        """Remove the native item for ``key_id``.
+
+        Confirmed absence is a no-op where the backend can establish it.
+        Windows PCP cannot distinguish absence from inaccessible retained keys;
+        an unopenable keyset must refuse deletion, including repeated deletes.
+        """
         ...
 
     def enclave_ecdh(self, key_id: str, peer_pub: bytes) -> bytes:

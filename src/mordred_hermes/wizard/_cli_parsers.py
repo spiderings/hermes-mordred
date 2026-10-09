@@ -14,9 +14,11 @@ Subcommand tree (SPEC.md §Plugin: ``mordred_wizard``):
 - ``network {use,status,init}``                  — network-privacy path control + on-demand setup
 - ``policy {show,explain,dry-run,reload}``       — inspect / explain the active policy
 - ``audit {tail,grep,decrypt,purge}``            — read / maintain the audit log
-- ``keyvault {init,list,verify-digest,recover,reset,enable-se,enable-tpm,eth}`` — keyvault management
+- ``keyvault {init,list,verify-digest,export,recover,reset,enable-se,enable-tpm,eth}`` — keyvault management
 - ``vault {init,add,status,cat,migrate,...}``    — at-rest secrets/env vault
-- ``plugins list``                               — list discovered Mordred plugins
+- ``plugins list``                               — show the Mordred plugin and its components
+- ``plugins migrate``                            — switch config.yaml to the single ``mordred`` plugin
+- ``uninstall [--dry-run|--yes|--purge-data|--remove-helper]`` — remove Mordred, restore Hermes's files
 """
 
 from __future__ import annotations
@@ -52,11 +54,162 @@ def _setup_subparser(parser: argparse.ArgumentParser, *, required: bool = True) 
     _add_encryption(sub)
     _add_plugins(sub)
     _add_extension(sub)
+    _add_telegram(sub)
+    _add_egress(sub)
+    _add_desktop(sub)
+    _add_uninstall(sub)
 
 
 # -----------------------------------------------------------------------------
 # Subcommand parsers — each calls set_defaults(func=...) wiring its handler.
 # -----------------------------------------------------------------------------
+
+
+def _add_desktop(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser("desktop", help="Hermes Desktop setup page (install / uninstall / status)")
+    dsub = p.add_subparsers(dest="desktop_command", required=True, metavar="COMMAND")
+    for name, text in (
+        ("install", "Place the Mordred setup page and its local API in Hermes"),
+        ("uninstall", "Remove the Mordred setup page"),
+        ("status", "Show whether the setup page is installed"),
+    ):
+        dsub.add_parser(name, help=text).set_defaults(func=_handle_desktop)
+
+
+def _add_uninstall(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser(
+        "uninstall",
+        help="Remove Mordred and restore Hermes's files (decrypts what Mordred encrypted first)",
+        description=(
+            "Turn off every at-rest encryption target (restoring plaintext .env / config.yaml / memories), "
+            "remove Mordred's entries from config.yaml and .env, the Hermes Desktop page and the installer's "
+            "launcher, then uninstall the package from Hermes's environment. Mordred's data (vault, keyvault, "
+            "Telegram archive, audit log) is kept unless --purge-data is given."
+        ),
+    )
+    p.add_argument("--dry-run", action="store_true", help="Print the plan and change nothing")
+    p.add_argument("--yes", action="store_true", help="Do not ask for confirmation (not for --purge-data)")
+    p.add_argument(
+        "--purge-data",
+        action="store_true",
+        help="Also permanently delete Mordred's data and device keys (asks you to type a confirmation)",
+    )
+    p.add_argument(
+        "--erase-encrypted",
+        action="store_true",
+        help="Do not decrypt: delete encrypted data (sealed memories, vault copies of .env / config.yaml) "
+        "together with all Mordred data. Implies --purge-data; asks you to type a confirmation",
+    )
+    p.add_argument(
+        "--remove-helper",
+        action="store_true",
+        help="Also remove the Mordred-built native helper in ~/.local/bin (mordred-hermes-sekey / -tpmkey)",
+    )
+    p.set_defaults(func=_handle_uninstall)
+
+
+def _add_egress(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser("egress", help="Tool-egress level: stop the agent's tools from sending data out")
+    esub = p.add_subparsers(dest="egress_command", required=True, metavar="COMMAND")
+    esub.add_parser("status", help="Show the level, taint setting and blocklists").set_defaults(func=_handle_egress)
+    p_set = esub.add_parser("set", help="Set the level: lockdown | search | blocklist | off")
+    p_set.add_argument("level", choices=["lockdown", "search", "blocklist", "off"])
+    p_set.set_defaults(func=_handle_egress)
+    for name, arg, text in (
+        ("block", "domain", "Add a domain to the blocklist"),
+        ("unblock", "domain", "Remove a domain from the blocklist"),
+        ("block-tool", "tool", "Block a tool at every level except off"),
+        ("unblock-tool", "tool", "Unblock a tool"),
+    ):
+        p_item = esub.add_parser(name, help=text)
+        p_item.add_argument(arg)
+        p_item.set_defaults(func=_handle_egress)
+    p_taint = esub.add_parser("taint", help="Lock a session down after it reads private data (on|off)")
+    p_taint.add_argument("state", choices=["on", "off"])
+    p_taint.set_defaults(func=_handle_egress)
+
+
+def _add_telegram(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    p = sub.add_parser("telegram", help="Read-only import of your own Telegram account (optional extra)")
+    tsub = p.add_subparsers(dest="telegram_command", required=True, metavar="COMMAND")
+    p_setup = tsub.add_parser("setup", help="Guided first-time setup (Enclave, login, privacy LLM, first import)")
+    p_setup.add_argument(
+        "--no-touch-id",
+        action="store_true",
+        help="Create the Enclave key without a per-use Touch ID / passcode requirement",
+    )
+    p_setup.set_defaults(func=_handle_telegram)
+    p_doctor = tsub.add_parser("doctor", help="Health check from metadata only (no Touch ID, no content)")
+    p_doctor.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_doctor.set_defaults(func=_handle_telegram)
+    p_login = tsub.add_parser("login", help="Create a session, sealed by the Secure Enclave")
+    p_login.add_argument(
+        "--no-touch-id",
+        action="store_true",
+        help="Create the Enclave key without a per-use Touch ID / passcode requirement",
+    )
+    p_login.set_defaults(func=_handle_telegram)
+    p_sync = tsub.add_parser("sync", help="Import new messages from every dialog into the encrypted archive")
+    p_sync.add_argument(
+        "--all",
+        action="store_true",
+        help="Import everything: all history, channels, archived chats and large groups (slow)",
+    )
+    p_sync.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Only chats active in the last N days, and only their last N days of messages "
+        "(default: 3; 0 = all history)",
+    )
+    p_sync.add_argument(
+        "--include-large-groups",
+        action="store_true",
+        help="Also import groups with more than --large-group-size members (skipped by default)",
+    )
+    p_sync.add_argument(
+        "--large-group-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Member count above which a group is skipped (default: 100)",
+    )
+    p_sync.add_argument("--skip-channels", action="store_true", help="Skip broadcast channels")
+    p_sync.add_argument("--include-archived", action="store_true", help="Also import the Archived Chats folder")
+    p_sync.add_argument("--skip-archived", action="store_true", help="Skip the Archived Chats folder (the default)")
+    p_sync.add_argument(
+        "--limit-per-dialog",
+        type=int,
+        default=None,
+        metavar="N",
+        help="First import only: keep the newest N messages per dialog (default: all)",
+    )
+    p_sync.set_defaults(func=_handle_telegram)
+    p_status = tsub.add_parser("status", help="Show login state and archive counts")
+    p_status.add_argument("--show-account", action="store_true", help="Also print the account display name")
+    p_status.set_defaults(func=_handle_telegram)
+    p_logout = tsub.add_parser("logout", help="Revoke the session at Telegram and remove it from the vault")
+    p_logout.add_argument(
+        "--forget",
+        action="store_true",
+        help="Also delete the API credentials, the archive key and the local archive",
+    )
+    p_logout.set_defaults(func=_handle_telegram)
+    p_venice = tsub.add_parser("venice", help="Store the Venice.ai API key and model used for questions")
+    p_venice.add_argument("--model", default=None, help="Venice model id (must be labelled 'private')")
+    p_venice.set_defaults(func=_handle_telegram)
+    p_local = tsub.add_parser("local-llm", help="Send questions to a model on this machine (loopback only)")
+    p_local.add_argument("--endpoint", required=True, help="e.g. http://127.0.0.1:11434/v1")
+    p_local.add_argument("--model", required=True, help="Model name served by that endpoint")
+    p_local.set_defaults(func=_handle_telegram)
+    p_migrate = tsub.add_parser("migrate-tee", help="Move vault-stored credentials into the Secure Enclave seal")
+    p_migrate.add_argument(
+        "--no-touch-id",
+        action="store_true",
+        help="Create the Enclave key without a per-use Touch ID / passcode requirement",
+    )
+    p_migrate.set_defaults(func=_handle_telegram)
 
 
 def _add_extension(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -338,6 +491,9 @@ def _add_keyvault(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> N
     ksub.add_parser("verify-digest", help="Verify the keyvault digest").set_defaults(
         func=_handle_keyvault_verify_digest
     )
+    p_export = ksub.add_parser("export", help="Create a portable, passphrase-protected Keyvault backup snapshot")
+    p_export.add_argument("--output", required=True, help="New output file (must not already exist; written mode 0600)")
+    p_export.set_defaults(func=_handle_keyvault_export)
     p_recover = ksub.add_parser("recover", help="Restore from a backup blob")
     p_recover.add_argument("--blob", required=True, help="Path to the backup blob file")
     p_recover.set_defaults(func=_handle_keyvault_recover)
@@ -365,6 +521,9 @@ def _add_keyvault(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> N
     )
     p_enable_tpm.add_argument("--install-dir", help="Install directory for the helper (default: ~/.local/bin)")
     p_enable_tpm.set_defaults(func=_handle_keyvault_enable_tpm)
+    p_enable_win = ksub.add_parser("enable-winkey", help="Build and probe the Windows CNG TPM helper")
+    p_enable_win.add_argument("--install-dir", help="Helper directory (default: <HERMES_HOME>/bin)")
+    p_enable_win.set_defaults(func=_handle_keyvault_enable_winkey)
 
     from . import keyvault_eth_cli
 
@@ -457,7 +616,8 @@ def _add_vault(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None
 
     p_set_memory_key = vsub.add_parser(
         "set-memory-key",
-        help="Store/rotate HERMES_MEMORY_KEY in the vault .env so Hermes can encrypt agent memory at rest",
+        help="Store/rotate HERMES_MEMORY_KEY in the vault .env (the agent-memory encryption key; "
+        "`encryption enable memory` is what turns sealing on)",
     )
     p_set_memory_key.add_argument(
         "--root",
@@ -551,10 +711,20 @@ def _add_encryption(sub: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 def _add_plugins(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     p = sub.add_parser(
         "plugins",
-        help="List discovered Mordred plugins",
+        help="Show or migrate the Mordred Hermes plugin",
     )
     psub = p.add_subparsers(dest="plugins_command", required=True, metavar="COMMAND")
-    psub.add_parser("list", help="List discovered Mordred plugins").set_defaults(func=_handle_plugins_list)
+    psub.add_parser("list", help="Show the Mordred plugin and its components").set_defaults(func=_handle_plugins_list)
+    p_migrate = psub.add_parser(
+        "migrate",
+        help="Replace the old per-component plugin names in config.yaml with the single 'mordred' plugin",
+    )
+    p_migrate.add_argument(
+        "--only-legacy",
+        action="store_true",
+        help="Do nothing unless config.yaml still lists an old per-component name (used by install.sh)",
+    )
+    p_migrate.set_defaults(func=_handle_plugins_migrate)
 
 
 # -----------------------------------------------------------------------------
@@ -686,6 +856,12 @@ def _handle_keyvault_verify_digest(args: argparse.Namespace) -> int:
     return keyvault_cli.cli_verify_digest(args)
 
 
+def _handle_keyvault_export(args: argparse.Namespace) -> int:
+    from . import keyvault_export_cli
+
+    return keyvault_export_cli.cli_export(args)
+
+
 def _handle_keyvault_recover(args: argparse.Namespace) -> int:
     from . import keyvault_cli
 
@@ -800,10 +976,40 @@ def _handle_plugins_list(args: argparse.Namespace) -> int:
     return plugins_list.cli_handler(args)
 
 
+def _handle_plugins_migrate(args: argparse.Namespace) -> int:
+    from . import plugins_list
+
+    return plugins_list.migrate_cli_handler(args)
+
+
 def _handle_extension_pair(args: argparse.Namespace) -> int:
     from . import extension_pair_cli
 
     return extension_pair_cli.cli_extension_pair(args)
+
+
+def _handle_desktop(args: argparse.Namespace) -> int:
+    from ..desktop import install
+
+    return install.cli_desktop(args)
+
+
+def _handle_uninstall(args: argparse.Namespace) -> int:
+    from . import uninstall_cli
+
+    return uninstall_cli.cli_uninstall(args)
+
+
+def _handle_egress(args: argparse.Namespace) -> int:
+    from . import egress_cli
+
+    return egress_cli.cli_egress(args)
+
+
+def _handle_telegram(args: argparse.Namespace) -> int:
+    from . import telegram_cli
+
+    return telegram_cli.cli_telegram(args)
 
 
 def _handle_extension_serve(args: argparse.Namespace) -> int:
@@ -813,3 +1019,9 @@ def _handle_extension_serve(args: argparse.Namespace) -> int:
     from mordred_hermes.extension.__main__ import serve
 
     return serve(host=args.host, port=args.port)
+
+
+def _handle_keyvault_enable_winkey(args: argparse.Namespace) -> int:
+    from . import keyvault_native_cli
+
+    return keyvault_native_cli.cli_enable_winkey(args)

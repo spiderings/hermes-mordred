@@ -34,3 +34,7 @@ dev_init_keyvault.py
 .vscode
 gha-creds-*.json
 notes.md
+
+# Mordred Telegram archive and sealed credentials (encrypted; never commit)
+**/mordred/telegram/
+*.sealed

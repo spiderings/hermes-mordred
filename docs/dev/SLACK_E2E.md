@@ -86,6 +86,20 @@ Keys are never selected from a global `kid` index. Hermes considers only the
 thread's `parent_chat_id`, and decrypts only when that key's fingerprint
 matches `kid`.
 
+The extension registers a key under its own composite id
+(`slack:{team}:{cid}` / `discord:{guild}:{cid}`) while an event carries the
+platform's native channel id, so the composite matches when its first segment
+is the event's platform and its last segment is exactly the channel id. The
+middle `{team}`/`{guild}` segment is additionally required to equal the event's
+`SessionSource.scope_id` (`guild_id` is read as the deprecated alias) **when the
+event carries one**: a key bound in one workspace then cannot unlock a
+same-id channel in another. An absent, blank, or non-string scope keeps the
+lenient first-and-last match, because refusing there would recreate the failure
+in which no v3 command authenticates at all. Today the shipped Slack adapter
+stamps `scope_id` from the event's team id, the shipped Discord adapter stamps
+nothing, and the outbound send path has no event, so only Slack inbound is
+tightened.
+
 <a id="3-replay&#x9632;&#x6b62;&#x3068;plaintext-release"></a>
 
 ## 3. Replay protection and plaintext release
@@ -136,6 +150,18 @@ wrapped default-profile adapter is never substituted for an unprotected
 secondary-profile adapter on the same platform. The legacy
 `gateway.adapters` path remains supported for older Hermes versions.
 
+The 24-hour registry is keyed by `(platform, chat_id, thread_root)` and not by
+profile. The send wrapper receives only the adapter instance and the send
+arguments, and neither the shipped adapters nor Hermes expose the profile there
+— the profile is resolved per source in `build_source` — so a profile-keyed
+registry would miss on every reply and fail closed into a locked notice. Two
+profiles therefore share a registry entry when their workspaces reuse one
+channel id. That case still fails secure: the reply encrypts under the other
+profile's `kid`, which the active profile's keyring cannot resolve, so the send
+degrades to a locked notice instead of plaintext. The channel-binding rule in
+section 5 has no such gap because it reads the key store of whichever
+`HERMES_HOME` the gateway scoped in for this profile's turn.
+
 ## 5. Mandatory E2E
 
 Hermes never sends an unencrypted Slack or Discord message to the agent. It
@@ -148,6 +174,81 @@ channel, 60-second window). The notice is emitted before host authorization;
 without a cooldown, any channel member could amplify a message flood into an
 equal flood of bot posts. Suppression affects only the notice: every refused
 message still receives the `skip` verdict.
+
+### Outbound: channel-key binding
+
+Mandatory E2E is symmetric. **A Slack or Discord channel with a bound `K_chan`
+never receives cleartext from Hermes**, whether or not the reply-in-kind
+registry holds an entry for the conversation. The send wrapper encrypts when
+either condition holds:
+
+1. the conversation carried ciphertext within the 24-hour reply TTL
+   (section 4), or
+2. the channel has a bound `K_chan` and the platform is in the mandatory set.
+
+Rule 2 exists because rule 1 cannot see agent-initiated traffic. A cron result,
+a proactive notification, or any other send with no inbound thread context has
+no registry entry to inherit, and on Slack the adapter's synthetic per-message
+`thread_ts == ts` also keeps ordinary mentions out of the channel-level
+`(channel, None)` bucket, so that fallback is inert in the default
+`reply_in_thread` mode. Before rule 2 those sends left in cleartext into a
+channel the operator had configured as a ciphertext-only transport. A bound key
+means the channel's members can decrypt, and inbound cleartext is already
+refused there, so cleartext outbound is never the right answer.
+
+Consequences to know:
+
+- The binding is read from the key store on every classification that rule 1
+  does not already satisfy, so a key bound or removed in the extension takes
+  effect on the next send with no restart. An unreadable key store fails the
+  send closed rather than falling back to plaintext.
+- Rule 2 outlasts the 24-hour TTL. Expiry no longer reopens a cleartext path,
+  and the reply key is recovered from the binding once the remembered `kid` is
+  pruned.
+- Rule 2 does not apply to channels with no bound key: those are unchanged.
+- Two *different* keys bound to one channel — the store keys entries by the
+  extension's full composite id and never evicts, so a re-pairing or workspace
+  change leaves the old binding beside the new one — keep rule 2 active but
+  refuse to pick a key: the store carries no bound-at timestamp, and an id is
+  updated in place, so insertion order records first binding rather than
+  recency. The send emits the locked notice and logs the conflict instead of
+  encrypting under a possibly stale key that nobody can read. The same key
+  pushed under several ids is one binding, not a conflict. Replies are
+  unaffected because they use the keyId observed inbound.
+- A Discord thread inherits its parent channel's key, but the parent is
+  resolved from the live client inside the encrypted send, so a proactive send
+  addressed to a bare thread id can still miss rule 2. Replies are unaffected.
+- Messages the host itself originates through the adapter (authorization
+  notices and similar) are encrypted too when they target a bound channel.
+
+**The needs-key notice is the one exception.** It is Mordred's own fixed setup
+guidance, carries no agent or user content, and is addressed to exactly the
+person who could not encrypt, so ciphertext would make it unreadable by its only
+audience. It is marked as a control notice for the duration of that one send and
+bypasses rule 2 only; a conversation already marked encrypted under rule 1 still
+receives an encrypted notice, as before. The Slack locked notice is sent by the
+encrypted-send path directly and never passes through the wrapper.
+
+> **Live verification required before release.** Rule 2 changes what leaves the
+> gateway on a live workspace and the live-gated suites have no CI automation.
+> Re-run the Slack round-trip (encrypted command in a bound channel, encrypted
+> reply, an agent-initiated send into the same channel decrypting in the
+> extension, and a plaintext post still receiving a readable needs-key notice)
+> and record the result in `docs/dev/CI.md` §Manual live-device validation log.
+>
+> **Also verify Slack Connect (externally shared) channels, including a
+> `/hermes` slash command.** The two inbound paths derive the team id
+> differently: `_event_team_id` reads the inner event's `team_id`/`team` first
+> — in a shared channel that is the **posting user's** workspace — while slash
+> commands take the installing workspace from the command payload. The gateway
+> keeps exact scope binding for normal events and slash commands. It accepts an
+> installing-team alternative only for a proven external Slack channel event:
+> the raw event's channel and team must match the `SessionSource`, the source
+> team must not be an installed team, and the alternative must be one of the
+> live adapter's `auth_test`-backed installations. DMs, malformed events,
+> uninstalled or stale key scopes, and every non-Slack platform remain
+> fail-closed. Record both the external-member round-trip and the installing-
+> workspace slash result in `docs/dev/CI.md` §Manual live-device validation log.
 
 **An empty `text` value is also rejected as unencrypted input.** The Slack
 adapter strips bot mentions (`text.replace(f"<@{bot_uid}>", "").strip()`) and
@@ -175,3 +276,57 @@ and leak an agent reply in plaintext.
 - Rejection of empty or missing `text` on mandatory platforms for image/audio
   attachments and mention-only posts, while other platforms still dispatch
   normally
+- Encryption of an agent-initiated send with no thread context into a channel
+  with a bound key, no change for a channel without one, and encryption that
+  survives reply-TTL expiry
+- A needs-key notice into a bound channel still delivered in cleartext, with
+  the control-notice marker scoped to that send alone: a concurrent task does
+  not observe it, a task created inside it does inherit it, and it resets after
+  an exception
+- Two different keys bound to one channel yielding a locked notice rather than
+  a guess, while one key stored under several ids stays unambiguous
+- Refusal of a composite key whose scope segment contradicts a known
+  `scope_id`, and acceptance when the scope is unknown or the key is stored
+  under a bare channel id
+
+## 7. Known gaps
+
+**v3 replay evidence expires after 30 days.** The replay store keeps the
+`(kid, message_id)` and `(kid, nonce)` identities of accepted commands for
+`pairing._E2E_REPLAY_TTL_SECONDS` (30 days) with a fixed capacity, and the AAD
+carries no timestamp or other freshness field. A captured v3 frame therefore
+becomes acceptable again once its identities age out, provided its channel key
+is still bound and its `(platform, chat_id, thread_root)` destination is
+unchanged. The TTL is not arbitrary: unbounded evidence would make the store
+grow without limit, and exhausting the capacity refuses every authenticated
+command, so the window trades a long replay horizon against availability.
+
+Mitigation today is key lifecycle rather than protocol: rotating the channel key
+or re-pairing invalidates every captured frame immediately, because `kid` no
+longer resolves and the AAD no longer authenticates. Operators holding a
+long-lived channel key should rotate it on the same cadence as any other shared
+secret. The planned fix is a freshness field in the v4 AAD (a sender timestamp
+bound into the authenticated data and rejected outside a short skew window),
+which would let the replay store shrink its TTL to that window instead of
+carrying month-old evidence.
+
+**Composite key ids stay lenient without a scope.** See section 2: a Discord
+event and every outbound send classify without a workspace id, so their key
+binding is platform-and-channel only.
+
+**A chat turn overwrites an undecryptable history blob.** Extension chat
+history is stored as one encrypted blob. When the key that wrote it is gone —
+after a re-pairing, for example — `history.load_messages()` reports status
+`undecryptable` and returns no messages, and the next turn's persistence step
+(`chat.py`, `_persist_and_final`) compares that empty list against the turn's
+starting history and then calls `save_messages`, replacing the unreadable
+ciphertext with the new turn's transcript. The old blob is not recoverable
+afterwards.
+
+This is current behaviour and a deliberate product decision: refusing to
+persist would wedge the chat for every user whose history is already
+unreadable, and the blob is unreadable to Hermes too, so it cannot be merged.
+The operational consequence is the part to remember — **restoring a key backup
+recovers the old history only if it happens before the next chat turn in that
+conversation.** Operators who re-pair and want the previous transcript should
+restore the key (or copy the blob aside) first.

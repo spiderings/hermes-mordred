@@ -1,5 +1,8 @@
 """Shared ``policy.json`` read helper for config-reading plugin code.
 
+Windows canonical files use checked snapshots. The historical read behavior
+described below is retained for POSIX and generic presentation files only.
+
 Single-sources the "open ``policy.json`` and hand back a mapping, or fall
 back to empty on any read/parse failure" core that was independently
 copy-pasted across four call sites (``network`` x1 whole-dict load,
@@ -41,12 +44,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
+from ._config_io import POLICY_TRANSACTION_MARKER, CanonicalPaths, CanonicalSnapshot
 from ._policy_types import VALID_POLICY_MODES
 
-POLICY_TRANSACTION_MARKER = ".policy-write.pending"
+_platform = os.name
 
 
 def policy_transaction_marker_for_policy(path: Path) -> Path:
@@ -59,7 +64,7 @@ def policy_transaction_marker_for_config(path: Path) -> Path:
     return path.parent / "mordred" / POLICY_TRANSACTION_MARKER
 
 
-def policy_transaction_pending(marker: Path) -> bool:
+def _legacy_policy_transaction_pending(marker: Path) -> bool:
     """Treat any marker directory entry—or inability to inspect it—as pending."""
     try:
         marker.lstat()
@@ -70,6 +75,51 @@ def policy_transaction_pending(marker: Path) -> bool:
     return True
 
 
+def _paths_for_policy(path: Path) -> CanonicalPaths:
+    if path.parent.name.casefold() != "mordred":
+        raise ValueError("canonical policy must be directly inside home/mordred")
+    return CanonicalPaths(path.parent.parent, mordred_name=path.parent.name, policy_name=path.name)
+
+
+def _checked_marker(marker: Path) -> bytes | None:
+    from ._config_io import read_policy_marker
+
+    if marker.name != POLICY_TRANSACTION_MARKER:
+        raise ValueError("not the canonical policy marker")
+    result = read_policy_marker(_paths_for_policy(marker.with_name("policy.json")))
+    return result.data if result is not None else None
+
+
+def policy_transaction_pending(marker: Path) -> bool:
+    """False only for checked Windows absence; every uncertainty is pending."""
+    if _platform != "nt":
+        return _legacy_policy_transaction_pending(marker)
+    try:
+        return _checked_marker(marker) is not None
+    except (OSError, ValueError):
+        return True
+
+
+def policy_mapping_from_snapshot(snapshot: CanonicalSnapshot) -> dict[str, Any]:
+    """Parse checked policy bytes; malformed documents raise, absence is empty."""
+    if snapshot.policy is None:
+        return {}
+    data = json.loads(snapshot.policy.data.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("policy JSON must contain an object")
+    return data
+
+
+def policy_mode_from_snapshot(snapshot: CanonicalSnapshot, *, default: str) -> str:
+    """A single checked generation; malformed/invalid policy always means strict."""
+    try:
+        data = policy_mapping_from_snapshot(snapshot)
+    except (ValueError, UnicodeError):
+        return "strict"
+    mode = data.get("policy", default)
+    return mode if isinstance(mode, str) and mode in VALID_POLICY_MODES else "strict"
+
+
 def policy_transaction_warning(marker: Path) -> str | None:
     """Operator-facing explanation for a pending marker, or ``None`` if absent.
 
@@ -78,6 +128,20 @@ def policy_transaction_warning(marker: Path) -> str | None:
     surfaced remedy the operator sees only the refusals and has no path back to
     the cause, so every user-facing status surface shares this wording.
     """
+    if _platform == "nt":
+        try:
+            recorded_bytes = _checked_marker(marker)
+        except (OSError, ValueError):
+            recorded_bytes = b""
+        if recorded_bytes is None:
+            return None
+        detail = f" Marker recorded: {recorded_bytes.decode('utf-8', errors='replace')!r}." if recorded_bytes else ""
+        return (
+            f"a Mordred policy write is pending or cannot be safely inspected ({marker}).{detail} "
+            "Policy reads fail closed. Stop other Mordred processes and run `hermes-mordred configure` "
+            "to reconcile readable safe configuration. Unsafe or corrupt files require explicit "
+            "inspection and recovery; do not unconditionally remove the marker."
+        )
     if not policy_transaction_pending(marker):
         return None
     detail = ""
@@ -109,12 +173,32 @@ def load_policy_mapping(
     their own defaults without crashing. When ``log`` is supplied, a
     swallowed read/parse error is warned on it.
 
-    This uses an ``exists()`` pre-check and is therefore unsuitable for
+    This presentation adapter must never authorize through empty defaults.
+    Windows canonical policy reads always coordinate, even when the legacy
+    ``allow_pending_transaction`` boolean is true. Custom canonical leaves use
+    explicit snapshots. Generic JSON files and POSIX keep their old semantics.
+
+    The legacy branch uses an ``exists()`` pre-check and is therefore unsuitable for
     fail-closed readers that must distinguish "absent" from "unreadable"
     (see the module docstring re ``network.hooks``).
     """
+    if _platform == "nt" and path.name.casefold() == "policy.json":
+        from ._config_io import read_canonical_snapshot
+
+        try:
+            return policy_mapping_from_snapshot(read_canonical_snapshot(_paths_for_policy(path)))
+        except (OSError, ValueError, UnicodeError) as exc:
+            if log is not None:
+                log.warning("could not read checked policy %s: %s", path, exc)
+            return {}
+    return _load_policy_mapping_legacy(path, log=log, allow_pending_transaction=allow_pending_transaction)
+
+
+def _load_policy_mapping_legacy(
+    path: Path, *, log: logging.Logger | None, allow_pending_transaction: bool
+) -> dict[str, Any]:
     marker = policy_transaction_marker_for_policy(path)
-    if not allow_pending_transaction and policy_transaction_pending(marker):
+    if not allow_pending_transaction and _legacy_policy_transaction_pending(marker):
         if log is not None:
             log.error("policy transaction marker %s is present; using fail-closed empty settings", marker)
         return {}
@@ -127,7 +211,7 @@ def load_policy_mapping(
         if log is not None:
             log.warning("could not read %s: %s", path, e)
         return {}
-    if not allow_pending_transaction and policy_transaction_pending(marker):
+    if not allow_pending_transaction and _legacy_policy_transaction_pending(marker):
         if log is not None:
             log.error("policy transaction began while reading %s; using fail-closed empty settings", path)
         return {}
@@ -142,7 +226,8 @@ def read_policy_mode_fail_closed(
 ) -> str:
     """Open-first, fail-closed read of ``policy`` from ``path`` (M1 contract).
 
-    Only a clean ``FileNotFoundError`` — including a dangling symlink,
+    Windows uses the checked canonical snapshot; any coordination failure is
+    strict. On POSIX, only a clean ``FileNotFoundError`` — including a dangling symlink,
     equivalent to deletion — returns ``default`` (the fresh-install mode:
     ``"off"`` for network, ``"lenient"`` for llm_guard). A file that EXISTS
     and cannot be opened, read, or parsed, a non-dict root, and an invalid
@@ -152,6 +237,18 @@ def read_policy_mode_fail_closed(
     key — an incomplete file is user-authored, not an attack surface, and
     the pre-M1 readers agreed on that.
     """
+    if _platform == "nt":
+        from ._config_io import read_canonical_snapshot
+
+        try:
+            return policy_mode_from_snapshot(read_canonical_snapshot(_paths_for_policy(path)), default=default)
+        except (OSError, ValueError, UnicodeError) as exc:
+            log.error("could not read checked policy %s (%s); failing closed to strict", path, exc)
+            return "strict"
+    return _read_policy_mode_legacy(path, default=default, log=log)
+
+
+def _read_policy_mode_legacy(path: Path, *, default: str, log: logging.Logger) -> str:
     marker = policy_transaction_marker_for_policy(path)
     if policy_transaction_pending(marker):
         log.error("policy transaction marker %s is present; failing closed to strict", marker)

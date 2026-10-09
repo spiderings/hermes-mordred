@@ -29,6 +29,7 @@ from ._vault_open import _build_device_auth, _vault_identity
 if TYPE_CHECKING:
     from ..keyvault.anchor import AnchorStore
     from ..keyvault.wrap import NativeBackend
+    from ._flow_session import FlowSession
     from .configure import PromptIO
 
 
@@ -38,6 +39,8 @@ def init(
     prompt_io: PromptIO | None = None,
     backend: NativeBackend | None = None,
     store: AnchorStore | None = None,
+    flow_session: FlowSession | None = None,
+    _absence_checked: bool = False,
 ) -> int:
     """Create a fresh encrypted vault at ``root`` sealed under a new passphrase.
 
@@ -52,6 +55,18 @@ def init(
     implementations; tests inject fakes. Returns 0 on success, 1 on a re-init,
     a passphrase mismatch / empty passphrase, or a Secure-Enclave / Keychain
     error.
+
+    ``flow_session`` (a guided flow: ``setup``, ``encryption enable all``, the
+    Telegram / Desktop setup) shares state with the flow's other steps, in
+    memory only:
+
+    - a passphrase the operator already chose and confirmed earlier in the flow
+      becomes the recovery passphrase without prompting again, and one chosen
+      here is remembered for later steps;
+    - ``flow_session.unattended`` selects the new device key's policy (``None``
+      keeps the backend default: ``MORDRED_SEKEY_UNATTENDED``, else attended);
+    - the freshly created vault stays open in the flow, so the flow's next
+      steps enroll through it without unwrapping the master again (no Touch ID).
     """
     from ..keyvault import anchor, vault
     from ..keyvault._exceptions import WrapError, WrapKeyNotFound
@@ -63,9 +78,12 @@ def init(
 
     # Re-init guard before prompting: an existing anchor means a live vault. A
     # Keychain read failure here is fail-closed (we cannot prove the vault is
-    # absent, so we must not risk clobbering one).
+    # absent, so we must not risk clobbering one). ``_absence_checked`` is set
+    # only by :func:`ensure_initialised`, which has just read the same item and
+    # found none: reading it again would be one more Keychain access for
+    # nothing. ``init_vault`` re-checks under the vault lock either way.
     try:
-        already_initialised = store.read(anchor_label) is not None
+        already_initialised = not _absence_checked and store.read(anchor_label) is not None
     except (anchor.AnchorError, OSError) as exc:
         _term.emit_error(f"Cannot determine vault state at {root}: {exc}")
         return 1
@@ -82,27 +100,27 @@ def init(
     print("This vault can be opened two ways:")
     print("  • this device          — automatically, no typing (Secure Enclave, or a software key if unavailable)")
     print("  • a recovery passphrase — your backup, used only if this device is lost or replaced")
-    print("Next you'll set the recovery passphrase. You will NOT need to type it day to day.")
-    print()
-    passphrase = prompt_io.ask_password("Choose a vault recovery passphrase")
-    if not passphrase:
-        _term.emit_error("Passphrase must not be empty — nothing was written.")
-        return 1
-    if passphrase != prompt_io.ask_password("Re-enter the passphrase"):
-        _term.emit_error("Passphrases do not match — nothing was written.")
+    passphrase = _choose_recovery_passphrase(prompt_io, flow_session)
+    if passphrase is None:
         return 1
 
     try:
         # Ensure the device wrapping key exists (init seals under it). A
         # pre-existing key from a crashed earlier init is reused — not an error.
+        # (A pre-existing key keeps the policy it was created with.)
+        unattended = flow_session.unattended if flow_session is not None else None
         with contextlib.suppress(WrapKeyNotFound):
-            backend.generate_enclave_key(key_id)
-        # Create the vault, then close immediately — init enrolls nothing, and
-        # the context manager guarantees the in-RAM master is zeroed on exit.
-        with vault.init_vault(
+            backend.generate_enclave_key(key_id, unattended=unattended)
+        created = vault.init_vault(
             root, key_id=key_id, passphrase=passphrase, backend=backend, store=store, anchor_label=anchor_label
-        ):
-            pass
+        )
+        if flow_session is not None:
+            # Keep it open for the flow's next steps (closed when the flow ends):
+            # enrolling through it needs no second unwrap / Touch ID.
+            flow_session.keep_vault(root, created)
+        else:
+            # Standalone: init enrolls nothing; close now so the in-RAM master is zeroed.
+            created.close()
     except vault.VaultError as exc:
         # A concurrent init won the anchor race after our pre-check.
         _term.emit_error(f"Vault init refused: {exc}")
@@ -122,12 +140,40 @@ def init(
     return 0
 
 
+def _choose_recovery_passphrase(prompt_io: PromptIO, flow_session: FlowSession | None) -> str | None:
+    """The new vault's recovery passphrase: reused from the flow, or chosen now.
+
+    A passphrase the operator already chose and confirmed earlier in the same
+    flow is reused without prompting. Otherwise ask once plus one confirmation,
+    and remember the result in the flow. Returns ``None`` (after printing) on an
+    empty entry or a mismatch.
+    """
+    reused = flow_session.passphrase if flow_session is not None else None
+    if reused:
+        print("The recovery passphrase is the one you already chose in this setup run — no new prompt.")
+        print()
+        return reused
+    print("Next you'll set the recovery passphrase. You will NOT need to type it day to day.")
+    print()
+    passphrase = prompt_io.ask_password("Choose a vault recovery passphrase")
+    if not passphrase:
+        _term.emit_error("Passphrase must not be empty — nothing was written.")
+        return None
+    if passphrase != prompt_io.ask_password("Re-enter the passphrase"):
+        _term.emit_error("Passphrases do not match — nothing was written.")
+        return None
+    if flow_session is not None:
+        flow_session.remember_passphrase(passphrase)
+    return passphrase
+
+
 def ensure_initialised(
     *,
     root: Path,
     prompt_io: PromptIO | None = None,
     backend: NativeBackend | None = None,
     store: AnchorStore | None = None,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Create the vault if it is missing; no-op (return 0) if it already exists.
 
@@ -140,8 +186,14 @@ def ensure_initialised(
     Returns 0 when the vault exists (or was just created), 1 on a create failure
     (passphrase mismatch / empty, Secure-Enclave / Keychain error) or when the
     vault state cannot be determined (fail-closed, mirroring :func:`init`).
+
+    ``flow_session`` is forwarded to :func:`init` (see there).
     """
     from ..keyvault import anchor
+
+    if flow_session is not None and flow_session.lend_vault(root) is not None:
+        # The flow already holds this vault open, so it exists: no Keychain read.
+        return 0
 
     store = resolve_store(store)
 
@@ -158,7 +210,14 @@ def ensure_initialised(
     print(f"No vault yet at {root} — creating one (this is where `encryption` stores secrets at rest).")
     # `store` is already resolved above, so `init` reuses this instance rather than
     # opening a second Keychain connection — keep the resolution before delegating.
-    return init(root=root, prompt_io=prompt_io, backend=backend, store=store)
+    return init(
+        root=root,
+        prompt_io=prompt_io,
+        backend=backend,
+        store=store,
+        flow_session=flow_session,
+        _absence_checked=True,
+    )
 
 
 def change_passphrase(

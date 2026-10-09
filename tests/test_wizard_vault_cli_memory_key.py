@@ -18,9 +18,10 @@ from ._wizard_vault_cli_helpers import _PASSPHRASE, _PromptIO, _ReadOSErrorVault
 class TestSetMemoryKey:
     """``vault set-memory-key`` — enroll/rotate ``HERMES_MEMORY_KEY`` in the vault ``.env``.
 
-    The key lets Hermes encrypt ``~/.hermes/memories/*.md`` (upstream
-    AES-256-GCM); storing it in the vault ``.env`` means the device key protects
-    it at rest and the runtime shim injects it into the environment at startup.
+    The agent-memory encryption key: storing it in the vault ``.env`` means the
+    device key protects it at rest and the runtime shim injects it into the
+    environment at startup, where Mordred's memory hook reads it.
+    ``encryption enable memory`` is the switch that actually arms the hook.
     """
 
     @pytest.fixture(autouse=True)
@@ -127,8 +128,44 @@ class TestSetMemoryKey:
         self._init(root, backend, store)
         assert vault_memory_key.set_memory_key(root=root, backend=backend, store=store) == 0
         out = capsys.readouterr().out.lower()
-        assert "config.yaml" in out
-        assert "encryption" in out  # tells the operator how to turn it on
+        # Storing the key does not turn sealing on: name the switch that does.
+        assert "encryption enable memory" in out
+
+    def test_ensure_memory_key_returns_the_value_without_printing_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``enable memory`` needs the key *value* to migrate files — through the
+        same single vault open (one Touch ID), and never on stdout."""
+        root = tmp_path / "v"
+        backend, store = FakeBackend(), FakeAnchorStore()
+        self._init(root, backend, store)
+
+        rc, value = vault_memory_key.ensure_memory_key(root=root, rotate=False, backend=backend, store=store)
+
+        assert rc == 0
+        assert value == self._key_value(root)
+        captured = capsys.readouterr()
+        assert value is not None
+        assert value not in captured.out
+        assert value not in captured.err
+
+    def test_ensure_memory_key_returns_the_existing_value_on_a_no_op(self, tmp_path: Path) -> None:
+        root = tmp_path / "v"
+        backend, store = FakeBackend(), FakeAnchorStore()
+        self._init(root, backend, store)
+        assert vault_memory_key.set_memory_key(root=root, backend=backend, store=store) == 0
+
+        rc, value = vault_memory_key.ensure_memory_key(root=root, rotate=False, backend=backend, store=store)
+
+        assert rc == 0
+        assert value == self._key_value(root)  # unchanged, and reported back
+
+    def test_ensure_memory_key_reports_failure_without_a_value(self, tmp_path: Path) -> None:
+        rc, value = vault_memory_key.ensure_memory_key(
+            root=tmp_path / "v", rotate=False, backend=FakeBackend(), store=FakeAnchorStore()
+        )
+        assert rc == 1
+        assert value is None
 
     def test_uninitialised_vault_returns_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         rc = vault_memory_key.set_memory_key(root=tmp_path / "v", backend=FakeBackend(), store=FakeAnchorStore())

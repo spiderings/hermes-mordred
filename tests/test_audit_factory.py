@@ -1,6 +1,6 @@
-"""Tests for the privacy_check audit-writer factory (Phase 4 PR10 step-E).
+"""Tests for the privacy_check audit-writer factory.
 
-L465: once the keyvault is initialized, privacy_check must construct an
+Once the keyvault is initialized, privacy_check must construct an
 :class:`EncryptedWriter` instead of an :class:`NDJSONWriter` so the audit
 log is AES-GCM-encrypted at rest.
 

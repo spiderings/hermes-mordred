@@ -102,7 +102,7 @@ class TestGenerateHappyPath:
     def test_canonical_vector_succeeds(
         self, backend: FakeBackend, audit: _AuditCapture, home: Path, kv_root: Path
     ) -> None:
-        """The SPEC L355-362 fixed vector drives a full generate end to end:
+        """The canonical SPEC vector drives a full generate end to end:
         the digest prepare_generate computes for those inputs equals
         _SPEC_DIGEST, so generate finalizes successfully.
         """

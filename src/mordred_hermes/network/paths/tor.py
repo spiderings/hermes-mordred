@@ -9,7 +9,7 @@ Subprocess and socket I/O are factored through injectable callables so
 tests can replace them with fakes; production paths use the standard
 library defaults.
 
-Bridges / obfs4 / Snowflake are out of scope in v1 (TODO §3.1 L303). The
+Bridges / obfs4 / Snowflake are not supported. The
 caller is expected to surface a startup warning on censored networks.
 """
 
@@ -304,8 +304,8 @@ def wait_for_bootstrap(
 def stop(handle: TorHandle, *, grace_seconds: float = DEFAULT_GRACE_SECONDS) -> None:
     """Terminate, wait the grace window, then kill if still alive.
 
-    Mirrors the contract documented in TODO §3.1 L302
-    ("``process.terminate()`` + 5s grace + ``kill()``"). Idempotent if
+    Uses ``process.terminate()`` plus a grace period before ``kill()``.
+    Idempotent if
     the process already exited.
 
     Note on exception types (Codex review P1 / HIGH-1, 2026-05-13):

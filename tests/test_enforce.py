@@ -251,9 +251,7 @@ class TestStrictCloudRefused:
     def test_strict_allow_cloud_llm_false_vetoes_allowlist(self, tmp_path: Path) -> None:
         """``allow_cloud_llm: false`` must veto allowlist membership.
 
-        TODO L244: "strict + active provider が cloud_provider_allowlist
-        に該当 + allow_cloud_llm: true → passthrough" — both axes are
-        required.
+        Allowlist membership and the global cloud-LLM switch are both required.
         """
         cfg = _write_policy_json(
             tmp_path,

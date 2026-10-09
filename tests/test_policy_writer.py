@@ -20,19 +20,13 @@ from pathlib import Path
 import pytest
 
 from mordred_hermes.wizard.policy_writer import (
+    MORDRED_CONFIG_SECTIONS,
     MORDRED_PLUGIN_NAMES,
     PolicySnapshot,
-    PolicyWriter,
     _atomic_write_text,
 )
 
-
-def _writer(tmp_path: Path) -> PolicyWriter:
-    return PolicyWriter(
-        config_path=tmp_path / "config.yaml",
-        policy_json_path=tmp_path / "mordred" / "policy.json",
-        mordred_dir=tmp_path / "mordred",
-    )
+from ._helpers import _writer
 
 
 class TestEmitPolicyJson:
@@ -401,7 +395,7 @@ plugins:
     @pytest.mark.parametrize(
         "raw_enabled,preserved",
         [
-            ("mordred_wizard", "mordred_wizard"),
+            ("some_user_plugin", "some_user_plugin"),
             ("{broken: true}", None),
         ],
     )
@@ -474,7 +468,7 @@ manager = PluginManager()
 manager.discover_and_load(force=True)
 print(json.dumps({
     "enabled": sorted(enabled) if enabled is not None else None,
-    "wizard_discovered": "mordred_wizard" in manager._plugins,
+    "wizard_discovered": "mordred" in manager._plugins,
 }))
 """,
             ],
@@ -1146,28 +1140,97 @@ class TestAtomicWriteHardening:
         assert target.read_bytes() == b"replacement\n"
 
 
-class TestMordredE2EIsEnabledByConfigure:
-    """``mordred_e2e`` (``extension/gateway_plugin.py``, added in the
-    0.1.0a6 release as the 6th ``hermes_agent.plugins`` entry point) was
-    missing from ``MORDRED_PLUGIN_NAMES`` -- an oversight that left the E2E
-    plugin silently inert for every ``configure`` user, since Hermes only
-    invokes ``register()`` for entry-point plugins listed in
-    ``plugins.enabled`` (see the module docstring / ``_ensure_plugins_enabled``).
-    """
+class TestSinglePluginIdentity:
+    """Mordred is one Hermes plugin, ``mordred``. Config writers enable it and
+    migrate the six pre-0.2.0a0 per-component names (``mordred_e2e`` once went
+    missing from the enable list and left E2E inert; one name removes that
+    class of bug)."""
 
-    def test_mordred_e2e_is_a_known_plugin_name(self) -> None:
-        assert "mordred_e2e" in MORDRED_PLUGIN_NAMES
+    def test_only_mordred_is_enabled_and_sections_keep_their_names(self) -> None:
+        assert MORDRED_PLUGIN_NAMES == ("mordred",)
+        assert "mordred_e2e" in MORDRED_CONFIG_SECTIONS
+        assert "mordred_privacy_check" in MORDRED_CONFIG_SECTIONS
 
-    def test_fresh_write_enables_mordred_e2e(self, tmp_path: Path) -> None:
-        """``PolicyWriter.write`` (the ``configure`` code path) must list
-        ``mordred_e2e`` in ``plugins.enabled`` on a brand-new config.yaml,
-        same as every other Mordred plugin."""
+    def test_fresh_write_enables_mordred(self, tmp_path: Path) -> None:
         w = _writer(tmp_path)
         w.write(PolicySnapshot(policy="lenient"))
 
         from ruamel.yaml import YAML
 
-        yaml = YAML(typ="safe", pure=True)
         with (tmp_path / "config.yaml").open(encoding="utf-8") as f:
-            data = yaml.load(f)
-        assert "mordred_e2e" in data["plugins"]["enabled"]
+            data = YAML(typ="safe", pure=True).load(f)
+        assert data["plugins"]["enabled"] == ["mordred"]
+
+    def test_write_migrates_legacy_names(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            """\
+# operator comment
+plugins:
+  enabled:
+    - mordred_privacy_check
+    - other_plugin
+    - mordred_network
+  disabled:
+    - mordred_keyvault
+    - unrelated
+""",
+            encoding="utf-8",
+        )
+        w = _writer(tmp_path)
+        with caplog.at_level("WARNING", logger="mordred.wizard.policy_writer"):
+            w.upsert_mordred_sections({"mordred_privacy_check": {"policy": "lenient", "allow_cloud_llm": False}})
+
+        from ruamel.yaml import YAML
+
+        text = config_path.read_text(encoding="utf-8")
+        data = YAML(typ="safe", pure=True).load(text)
+        assert "# operator comment" in text
+        assert data["plugins"]["enabled"] == ["other_plugin", "mordred"]
+        assert data["plugins"]["disabled"] == ["unrelated"]
+        assert "can no longer be disabled separately" in caplog.text
+
+    def test_migrate_plugin_identity_only_touches_the_lists(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.yaml"
+        seed = """\
+model:
+  provider: local  # keep
+plugins:
+  enabled:
+    - mordred_e2e
+    - mordred_wizard
+  mordred_network:
+    default_path: tor
+"""
+        config_path.write_text(seed, encoding="utf-8")
+        w = _writer(tmp_path)
+
+        migration = w.migrate_plugin_identity()
+
+        assert migration.changed
+        assert migration.removed_enabled == ["mordred_e2e", "mordred_wizard"]
+        text = config_path.read_text(encoding="utf-8")
+        assert "provider: local  # keep" in text
+        assert "default_path: tor" in text
+        assert "- mordred\n" in text and "mordred_e2e" not in text
+        assert not (tmp_path / "mordred" / "policy.json").exists()
+
+        # Idempotent: a second run changes nothing and does not rewrite the file.
+        before = config_path.stat().st_mtime_ns
+        assert not w.migrate_plugin_identity().changed
+        assert config_path.stat().st_mtime_ns == before
+
+    def test_migrate_plugin_identity_leaves_a_missing_config_missing(self, tmp_path: Path) -> None:
+        assert not _writer(tmp_path).migrate_plugin_identity().changed
+        assert not (tmp_path / "config.yaml").exists()
+
+    def test_explicitly_disabled_mordred_is_respected_and_reported(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("plugins:\n  enabled: [mordred]\n  disabled: [mordred]\n", encoding="utf-8")
+
+        migration = _writer(tmp_path).migrate_plugin_identity()
+
+        assert not migration.changed
+        assert migration.mordred_disabled
+        assert any("still lists 'mordred'" in note for note in migration.notes())
+        assert "disabled: [mordred]" in config_path.read_text(encoding="utf-8")

@@ -12,8 +12,8 @@ normalization") splits the two:
   casefold, collapse runs of whitespace.
 - ``_normalize_passphrase``  — BIP39 reference: NFKD only.
 
-These tests pin the split. The SPEC fixed vector at L355-362 of SPEC.md (ASCII
-inputs ``"test seed"`` / ``"test pass"`` / ``deadbeef00…``) remains valid
+These tests pin the split. The canonical SPEC vector (ASCII inputs
+``"test seed"`` / ``"test pass"`` / ``deadbeef00…``) remains valid
 because NFKD + casefold are no-ops on already-lowercase ASCII without
 combining marks.
 """
@@ -38,8 +38,8 @@ _JP_PASSWORD_PRECOMPOSED = "パスワード"  # パスワード, fully precompos
 _JP_PASSWORD_DECOMPOSED = "パスワード"  # パスワート゛, fully decomposed
 _JP_CAFE_PRECOMPOSED = "カフェ"  # カフェ (no combining marks; here only for completeness)
 
-# SPEC.md §Key generation and verification digest L355-362 (Phase 4 PR2
-# canonical regression anchor; ASCII inputs unaffected by split normalization).
+# SPEC.md §Key generation and verification digest canonical regression vector;
+# ASCII inputs are unaffected by split normalization.
 _SPEC_SEED = "test seed"
 _SPEC_PASS = "test pass"
 _SPEC_POW = bytes.fromhex("deadbeef") + bytes(28)
@@ -257,7 +257,7 @@ class TestSeedPhraseStripsFormatChars:
         assert api._normalize_seed_phrase("abandon ​abandon") == "abandon abandon"
 
     def test_spec_vector_unaffected_by_injected_zwsp_in_seed(self) -> None:
-        # SPEC L355-362 fixed vector: seed "test seed" + ZWSP between letters
+        # Canonical SPEC vector: seed "test seed" + ZWSP between letters
         # → after Cf strip, identical to canonical → digest matches.
         api.verify_digest("test​ seed", _SPEC_PASS, _SPEC_POW, expected=_SPEC_DIGEST)
 

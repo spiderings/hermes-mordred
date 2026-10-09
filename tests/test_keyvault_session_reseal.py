@@ -160,21 +160,29 @@ class _FakeCtx:
 
     def __init__(self, *, raise_on: set[str] | None = None) -> None:
         self.hooks: list[str] = []
+        self.registered: list[tuple[str, Any]] = []
         self._raise_on = raise_on or set()
 
     def register_hook(self, hook_name: str, callback: Any) -> None:
         if hook_name in self._raise_on:
             raise RuntimeError("host rejected hook")
         self.hooks.append(hook_name)
+        self.registered.append((hook_name, callback))
+
+    def callbacks_for(self, hook_name: str) -> list[Any]:
+        return [callback for name, callback in self.registered if name == hook_name]
 
 
 def _isolate_register(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub the two installers ``register()`` calls so the wiring test never reads
-    the real vault or patches the host writer."""
-    from mordred_hermes.keyvault import _runtime_env
+    """Stub the installers ``register()`` calls so the wiring test never reads the
+    real vault, patches the host writer, or wraps the upstream memory seam."""
+    from mordred_hermes import keyvault
+    from mordred_hermes.keyvault import _memory_hook, _runtime_env
 
     monkeypatch.setattr(_runtime_env, "install_vault_env_decrypt", lambda **_k: 0)
     monkeypatch.setattr(_env_write_guard, "install_env_write_guard", lambda **_k: False)
+    monkeypatch.setattr(_memory_hook, "install_memory_hook", lambda **_k: False)
+    monkeypatch.setattr(keyvault, "_install_journey_guard", lambda: None)
 
 
 class TestRegisterWiring:
@@ -185,8 +193,65 @@ class TestRegisterWiring:
         ctx = _FakeCtx()
         keyvault.register(ctx)
 
-        assert ctx.hooks.count("on_session_start") == 2
+        assert ctx.hooks.count("on_session_start") == 3
         assert "on_session_end" in ctx.hooks
+
+    def test_register_wires_the_memory_check_itself(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A count only proves *three* callbacks arrived. The sealed-but-locked
+        diagnosis is the one the operator never sees fail, so pin its identity."""
+        from mordred_hermes import keyvault
+
+        _isolate_register(monkeypatch)
+        ctx = _FakeCtx()
+        keyvault.register(ctx)
+
+        assert keyvault._on_session_memory_check in ctx.callbacks_for("on_session_start")
+        assert keyvault._on_session_reseal in ctx.callbacks_for("on_session_start")
+        assert keyvault._on_session_reseal in ctx.callbacks_for("on_session_end")
+
+    def test_register_installs_the_journey_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The import hook covers a process it engaged in; ``register()`` covers the
+        one the ``.pth`` gate never matched."""
+        from mordred_hermes import keyvault
+
+        _isolate_register(monkeypatch)
+        installed: list[str] = []
+        monkeypatch.setattr(keyvault, "_install_journey_guard", lambda: installed.append("journey"))
+
+        keyvault.register(_FakeCtx())
+
+        assert installed == ["journey"]
+
+    def test_journey_guard_installation_is_fail_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host without ``agent.learning_mutations`` must be a silent no-op."""
+        from mordred_hermes import keyvault
+        from mordred_hermes.keyvault import _memory_hook
+
+        def _boom(_module: Any) -> bool:
+            raise RuntimeError("upstream renamed everything")
+
+        monkeypatch.setattr(_memory_hook, "install_journey_guard", _boom)
+        keyvault._install_journey_guard()  # must not raise
+
+    def test_register_installs_the_memory_hook_before_the_vault_shim(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A fail-closed vault raise must not cost the memory seam its wrapper —
+        upstream would then truncate already-sealed files."""
+        from mordred_hermes import keyvault
+        from mordred_hermes.keyvault import _memory_hook, _runtime_env
+
+        installed: list[str] = []
+
+        def _boom(**_kwargs: Any) -> int:
+            raise RuntimeError("vault present but unverifiable")
+
+        monkeypatch.setattr(_runtime_env, "install_vault_env_decrypt", _boom)
+        monkeypatch.setattr(_env_write_guard, "install_env_write_guard", lambda **_k: False)
+        monkeypatch.setattr(_memory_hook, "install_memory_hook", lambda **_k: bool(installed.append("memory")))
+
+        with pytest.raises(RuntimeError, match="unverifiable"):
+            keyvault.register(_FakeCtx())
+
+        assert installed == ["memory"]
 
     def test_register_survives_hook_rejection(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from mordred_hermes import keyvault
@@ -197,6 +262,30 @@ class TestRegisterWiring:
 
         assert "on_session_start" in ctx.hooks
         assert "on_session_end" not in ctx.hooks
+
+
+class TestOnSessionMemoryCheck:
+    """Upstream's ``agent_init`` swallows a failed ``load_from_disk``, so a sealed
+    memory whose key is missing shows up as an empty memory with no signal."""
+
+    def test_callback_invokes_the_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mordred_hermes import keyvault
+        from mordred_hermes.keyvault import _memory_hook
+
+        seen: list[dict[str, Any]] = []
+        monkeypatch.setattr(_memory_hook, "warn_when_memory_is_locked", lambda **kw: bool(seen.append(kw)))
+        keyvault._on_session_memory_check(session_id="abc")
+        assert seen == [{}]  # the host payload is absorbed, not forwarded
+
+    def test_callback_swallows_a_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mordred_hermes import keyvault
+        from mordred_hermes.keyvault import _memory_hook
+
+        def _boom(**_kwargs: Any) -> bool:
+            raise RuntimeError("stat blew up")
+
+        monkeypatch.setattr(_memory_hook, "warn_when_memory_is_locked", _boom)
+        keyvault._on_session_memory_check()  # must not raise into the session boundary
 
 
 class TestOnSessionResealCallback:

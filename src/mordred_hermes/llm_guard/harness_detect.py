@@ -1,10 +1,9 @@
-"""Detect agent-harness primaries that bypass Hermes hooks.
+"""Detect agent-harness primaries that bypass Hermes enforcement.
 
-SPEC.md L143: harnesses (Codex CLI, Claude CLI, Cursor, ACP clients)
-drive Hermes externally and run their own LLM call paths that ``pre_llm_call``
-never sees. Mordred cannot enforce strict policy on traffic it cannot
-observe, so under strict mode the session is refused at startup; under
-lenient mode it warns + audits and continues; under off mode it is a no-op.
+External harnesses (Codex CLI, Claude CLI, Cursor, and ACP clients) run their
+own LLM call paths outside Hermes, so neither Mordred's ``pre_api_request``
+hook nor its auxiliary-client guards observe that traffic. Strict mode refuses
+the session at startup; lenient mode warns and audits; off mode is a no-op.
 
 The harness identity is declared by the user in ``~/.hermes/config.yaml``:
 
@@ -41,7 +40,7 @@ from ._exceptions import MordredHarnessRefused
 _LOG = logging.getLogger("mordred.llm_guard.harness_detect")
 
 # Allowlist of harness-primary identifiers as compiled regexes.
-# Keep in sync with SPEC.md L143.
+# Keep in sync with SPEC.md §Threat Model & Accepted Limitations.
 #
 # Matching rules per harness:
 #   - codex / claude-cli / cursor: exact OR ``<harness>-<semver>``

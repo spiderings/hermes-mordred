@@ -9,8 +9,8 @@ Subprocess I/O is factored through an injectable runner so tests can
 replace it; production uses :func:`subprocess.run`.
 
 The Mullvad client is daemonized externally — we don't track a
-``Popen``. The handle records what *we* asked for so PR2 can decide
-whether to preserve lockdown on disconnect (TODO §3.1 L311).
+``Popen``. The handle records what *we* asked for so the runtime can decide
+whether to preserve lockdown on disconnect.
 
 Platform: macOS Apple Silicon + Ubuntu/Debian. Windows is out of scope
 for v1.
@@ -119,7 +119,7 @@ def detect_cli(*, which: Callable[[str], str | None] = shutil.which) -> str:
     """Resolve the path to the ``mullvad`` CLI.
 
     Checks ``$PATH`` first via the injected ``which``; falls back to the
-    macOS app bundle location (TODO §3.1 L306). Raises
+    macOS app bundle location. Raises
     :class:`BringupFailed` if neither is present so the caller can
     surface an actionable error.
     """
@@ -295,9 +295,8 @@ def disconnect(
 ) -> None:
     """Disconnect the tunnel; optionally clear the strict kill-switch.
 
-    Strict-mode sessions preserve lockdown so the user must explicitly
-    opt out next session — matches the TODO §3.1 L311 contract
-    ("strict 中は lockdown 維持").
+    Strict-mode sessions preserve lockdown so the user must explicitly opt out
+    in a later session.
 
     Mullvad CLI 2026.2 drift (2026-05-20): the ``always-require-vpn``
     rollback path (Codex round 9 P1-A) is gone — the subcommand was

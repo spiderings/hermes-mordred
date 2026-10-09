@@ -24,12 +24,14 @@ reuse it — see that module's docstring). So this module carries no dependency
 on the wizard-owned ``PromptIO`` machinery either.
 
 :func:`_open_hot_or_report` and :func:`_env_enrolled` are keyvault-local
-mirrors of ``wizard._vault_open._open_hot_path_or_report`` and
-``wizard.encryption_cli._enrolled_names`` (narrowed to ``.env``) —
-*duplicated*, not imported, so this module never reaches up into ``wizard``.
-Both wizard originals stay in place for wizard's own CLI commands (``vault
-add`` / ``migrate`` / ``status`` / ...); a little duplication here is the
-price of cutting the inverted edge.
+counterparts of ``wizard._vault_open._open_hot_path_or_report`` and
+``wizard.encryption_cli._enrolled_names`` (narrowed to ``.env``), so this
+module never reaches up into ``wizard``. Only the ``vault.open_vault`` call
+and its argument construction are duplicated; the fail-closed ``except``
+chain both openers share lives in :mod:`._vault_open_report` (keyvault-side,
+so ``wizard`` imports *down* into it). Both wizard originals stay in place
+for wizard's own CLI commands (``vault add`` / ``migrate`` / ``status`` /
+...); the little duplication left is the price of cutting the inverted edge.
 
 Heavy imports (the cryptography-backed vault modules) stay function-local so
 this module imports on any platform, matching ``_env_write_guard.py`` and the
@@ -102,32 +104,25 @@ def _open_hot_or_report(
     """Open the vault at ``root`` on the hot path (device key, no passphrase), or
     report a reason via :mod:`mordred_hermes._term` and return ``None``.
 
-    A keyvault-local mirror of ``wizard._vault_open._open_hot_path_or_report``
-    (duplicated, not imported — see module docstring); the two copies fail
-    closed on the same exception set with the same messages, so any drift
-    between them is not observable to an operator. ``backend`` / ``store``
+    Still a keyvault-local counterpart to
+    ``wizard._vault_open._open_hot_path_or_report`` — this module never reaches
+    up into ``wizard`` (see module docstring) — but the ``except`` chain each of
+    them used to carry its own copy of is now the single
+    :func:`._vault_open_report.report_hot_open_failure`, so they cannot drift
+    apart. Only the open *call* stays local, because tests pin it with
+    ``monkeypatch.setattr(vault, "open_vault", ...)``. ``backend`` / ``store``
     default to the production implementations; tests inject fakes. The caller
     owns closing the returned vault.
     """
-    from . import anchor, manifest, vault
-    from ._exceptions import WrapError
+    from . import vault
+    from ._vault_open_report import report_hot_open_failure
 
     key_id = anchor_label = vault_identity(root)
     backend = resolve_backend(backend)
     store = resolve_store(store)
 
-    try:
+    with report_hot_open_failure(root):
         return vault.open_vault(root, key_id=key_id, backend=backend, store=store, anchor_label=anchor_label)
-    except anchor.AnchorMissing:
-        _term.emit_error(f"no vault at {root} — run `vault init` first.")
-    except (anchor.AnchorMismatch, anchor.AnchorCorrupt) as exc:
-        # A freshness-pin mismatch is the anchor's whole purpose — surface it as
-        # possible tampering / rollback, not a generic open failure.
-        _term.emit_error(f"vault freshness check failed at {root} (possible tampering): {exc}")
-    except (anchor.AnchorError, vault.VaultError, manifest.ManifestError, OSError) as exc:
-        _term.emit_error(f"cannot open vault at {root}: {exc}")
-    except WrapError as exc:
-        _term.emit_error(f"cannot open vault at {root}: device key store error — {exc}")
     return None
 
 

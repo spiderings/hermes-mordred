@@ -14,21 +14,17 @@ Canonical algorithm is frozen in
     masked_pass[4:32] := pass_hash[4:32]
     digest          := H(seed_hash || masked_pass)        # 32 bytes
 
-Unicode normalization is the caller's responsibility. Phase 4 PR4
-step-A landed split normalization in :mod:`mordred_hermes.keyvault.api`:
+Unicode normalization is the caller's responsibility. The public API applies
+split normalization in :mod:`mordred_hermes.keyvault.api`:
 seed phrase uses ``NFKD + strip-Cf + casefold + whitespace-collapse``,
 passphrase uses ``NFKD only``. See :func:`mordred_hermes.keyvault.api.verify_digest`
-(step-A) and :func:`mordred_hermes.keyvault.api.prepare_generate` /
-:func:`mordred_hermes.keyvault.api.confirm_generate` (step-D), or SPEC.md
+and :func:`mordred_hermes.keyvault.api.prepare_generate` /
+:func:`mordred_hermes.keyvault.api.confirm_generate`, or SPEC.md
 §"PR4 API contract / Mordred normalization" for the canonical definitions.
 PoW is precomputed by the caller; this module does not re-hash it.
 
-Reachability note: this module imports :mod:`blake3` which is declared
-under the ``[macos]`` extra in ``pyproject.toml``. Phase 4 keyvault is
-macOS Apple Silicon only per SPEC §Platform Support L43, but ``blake3``
-itself ships prebuilt wheels for all major platforms — the import
-gating sits on :mod:`mordred_hermes.keyvault.crypto` (cryptography) and
-the Secure Enclave native module, not on this digest layer.
+This module imports :mod:`blake3` from the cross-platform ``keyvault`` extra.
+Platform-specific native-key selection happens outside this digest layer.
 """
 
 from __future__ import annotations

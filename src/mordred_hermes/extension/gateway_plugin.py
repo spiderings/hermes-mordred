@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 # an inbound message the plugin cannot decrypt (plaintext, or ciphertext whose
 # key we do not hold) is never handed to the agent in cleartext. Instead the
 # sender is told to set up / obtain an encryption key (see _notify_needs_key).
-_ENFORCE_ENCRYPTION_PLATFORMS = frozenset({"slack", "discord"})
+# Shared with the send path (e2e.outbound_must_encrypt): the two directions must
+# agree on which platforms are ciphertext-only, so the set has one definition.
+_ENFORCE_ENCRYPTION_PLATFORMS = e2e.MANDATORY_ENCRYPTION_PLATFORMS
 
 _NEEDS_KEY_NOTICE = (
     "🔒 暗号化されていないメッセージには応答できません。"
@@ -91,8 +93,17 @@ def _profile_name(event: Any) -> str | None:
 
 
 async def _safe_send(adapter: Any, chat_id: str, content: str, metadata: dict[str, Any] | None) -> None:
+    """Deliver a Mordred control notice through the (wrapped) live adapter.
+
+    Marked as a control notice so the send path's channel-binding rule does not
+    encrypt it: the notice exists to tell a sender who could not encrypt how to
+    obtain a key, so ciphertext would make it unreadable by its only audience.
+    It carries no agent or user content. Reply-in-kind is unaffected — a
+    conversation already marked encrypted still gets an encrypted notice.
+    """
     try:
-        await adapter.send(chat_id, content, reply_to=None, metadata=metadata)
+        with e2e.control_notice_send():
+            await adapter.send(chat_id, content, reply_to=None, metadata=metadata)
     except Exception as exc:
         logger.warning("mordred_e2e: needs-key notice send failed: %s", exc)
 
@@ -155,6 +166,77 @@ def _notify_needs_key(gateway: Any, event: Any, outbound: Any, profile: str | No
     # attempt must not silence the next message.
     _NEEDS_KEY_NOTICE_TIMES[(platform, profile, str(chat_id))] = time.time()
     return True
+
+
+def _scope_id(event: Any) -> str | None:
+    """The workspace/guild this event arrived from, when the host stamps one.
+
+    ``SessionSource.scope_id`` is Hermes' platform-neutral scope discriminator
+    (Slack team id / Discord guild id); ``guild_id`` is its deprecated alias,
+    read as a fallback for older events. The extension's composite channel-key
+    id embeds the same value, so a known scope tightens key binding
+    (:func:`e2e._channel_key_matches`).
+
+    Returns ``None`` — meaning "unknown, stay lenient" — whenever the field is
+    absent, blank, or not a string. Today the shipped Slack adapter stamps it
+    from the event's ``team_id`` while the Discord adapter never sets it, so
+    Discord binding is unchanged. Anything hostile-shaped is treated as unknown
+    rather than as a mismatch: a wrong value here would refuse a legitimate
+    command, and the lenient path is exactly the #83-verified behaviour.
+    """
+    try:
+        src = getattr(event, "source", None)
+        raw = getattr(src, "scope_id", None) or getattr(src, "guild_id", None)
+        if not isinstance(raw, str):
+            return None
+        return raw.strip() or None
+    except BaseException:
+        return None
+
+
+def _slack_connect_host_scope_ids(
+    event: Any,
+    gateway: Any,
+    outbound: Any,
+    profile: str | None,
+    *,
+    platform: str,
+    chat_id: str,
+    scope_id: str | None,
+) -> frozenset[str]:
+    """Trusted installing-team alternatives for an external Slack event.
+
+    Slack Connect's generic ``message`` event stamps the posting member's team
+    on ``SessionSource.scope_id``. The channel key, however, is normally stored
+    under the bot's installing team. Do not solve that by dropping scope checks:
+    prove that the source scope came from this raw Slack event, prove that it is
+    not one of this live adapter's authenticated installations, and then allow
+    only the adapter's ``auth_test``-backed ``_team_clients`` keys as alternate
+    composite scopes. A normal workspace event, slash command, DM, malformed
+    event, or adapter drift gets no relaxation and continues to fail closed.
+    """
+    if platform != "slack" or not scope_id or not chat_id.startswith(("C", "G")):
+        return frozenset()
+    try:
+        raw = getattr(event, "raw_message", None)
+        if not isinstance(raw, dict) or str(raw.get("channel") or "") != chat_id:
+            return frozenset()
+        raw_team: Any = raw.get("team_id") or raw.get("team")
+        if isinstance(raw_team, dict):
+            raw_team = raw_team.get("id")
+        if not isinstance(raw_team, str) or raw_team.strip() != scope_id:
+            return frozenset()
+
+        adapter = outbound.live_adapter_for(gateway, "slack", profile)
+        team_clients = getattr(adapter, "_team_clients", None)
+        if not isinstance(team_clients, dict):
+            return frozenset()
+        installed = frozenset(team.strip() for team in team_clients if isinstance(team, str) and team.strip())
+        if not installed or scope_id in installed:
+            return frozenset()
+        return installed
+    except BaseException:
+        return frozenset()
 
 
 def _thread_ctx(event: Any) -> tuple[str, str, str | None, str | None]:
@@ -382,12 +464,23 @@ def pre_gateway_dispatch(
         context = _thread_ctx(event)
         platform, chat_id, thread_root = _command_aad_ctx(event, context)
         parent_chat_id = context[3]
+        scope_id = _scope_id(event)
         decrypted, kid, replay = e2e.decrypt_gateway_envelope(
             text,
             platform,
             chat_id=chat_id,
             thread_root=thread_root,
             parent_chat_id=parent_chat_id,
+            scope_id=scope_id,
+            slack_connect_host_scope_ids=_slack_connect_host_scope_ids(
+                event,
+                gateway,
+                outbound,
+                profile,
+                platform=platform,
+                chat_id=chat_id,
+                scope_id=scope_id,
+            ),
         )
     except e2e.InvalidEncryptedEnvelope as exc:
         # The reason is a fixed identifier (never message text, keys or
@@ -431,6 +524,14 @@ def register(ctx: Any) -> None:
     ctx.register_hook("on_session_start", check_plugin_integrity)
     ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
     logger.debug("mordred_e2e: registered pre_gateway_dispatch hook")
+
+    # Read-only Telegram tools; offered only to a Venice/loopback Hermes model.
+    try:
+        from .telegram.hermes_tools import register_tools
+
+        register_tools(ctx)
+    except Exception as e:
+        logger.warning("mordred_e2e: Telegram tools not registered: %s", type(e).__name__)
 
     # Outbound: wrap each installed platform adapter's send (best-effort).
     try:

@@ -13,6 +13,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
+from ._audit_session import AuditProbe as AuditProbe
+from ._audit_session import AuditSession as AuditSession
+from ._audit_session import AuditSnapshot as AuditSnapshot
+from ._audit_session import audit_session as audit_session
+from ._audit_session import decode_audit_bytes as decode_audit_bytes
+from ._audit_session import read_audit_snapshot as read_audit_snapshot
+
 try:  # POSIX on every supported Phase 1-3 platform (macOS/Linux/WSL2).
     import fcntl
 except ImportError:  # pragma: no cover - Windows native is not supported yet

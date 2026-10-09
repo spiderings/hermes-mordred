@@ -11,8 +11,8 @@ Implements the :class:`mordred_hermes.network.api.Runtime` Protocol with:
   tests can swap in fakes without monkey-patching the path modules.
 - ``os.environ`` mutation per :mod:`.proxy_env`. The runtime snapshots
   the keys it manages on first apply and restores them on
-  :meth:`Runtime.stop`. This is the only writer of those keys inside
-  the plugin (M3: TODO.md §3.1 L335).
+  :meth:`Runtime.stop`. This is the only writer of those keys inside the
+  plugin.
 - An M9 liveness worker (daemon thread): probes the current path on a
   configurable interval; ``liveness_failure_threshold`` consecutive
   failures flip a sticky ``_dropped`` flag and emit

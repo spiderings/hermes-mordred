@@ -1,5 +1,9 @@
 """``hermes mordred upgrade`` -- Story 1 (idempotent migration) + Story 1.5 dispatch.
 
+Before either story, ``plugins.enabled`` / ``plugins.disabled`` are switched
+from the pre-0.2.0a0 per-component plugin names to the single ``mordred``
+plugin (:meth:`PolicyWriter.migrate_plugin_identity`).
+
 Story 1 covers the simple case: a Hermes-only install whose ``config.yaml``
 either has no ``mordred_privacy_check`` section yet, or has one that
 already matches the target snapshot. The flow:
@@ -14,8 +18,8 @@ Story 1.5 (OpenClaw migration) is dispatched to
 directory exists. Phase E lands the dispatch + report wiring; the actual
 migrator implementation lives in that sibling module.
 
-The :class:`UpgradeOptions` flag rules per PATHS.md §OpenClaw migration
-L286 H5 table:
+The :class:`UpgradeOptions` flag rules follow PATHS.md §Migration from legacy
+OpenClaw paths:
 
 - ``--reset`` overrides every other policy and forces overwrite.
 - ``--non-interactive`` requires ``--policy-conflict`` to be pre-specified
@@ -71,6 +75,9 @@ class UpgradeReport:
 
     story1_action: Story1Action
     story1_5_action: Story1_5Action
+    #: Notes from switching ``plugins.enabled`` / ``plugins.disabled`` to the
+    #: single ``mordred`` plugin (empty = nothing to migrate).
+    plugin_notes: tuple[str, ...] = ()
 
 
 #: Human phrases for the Story 1 (config.yaml) outcome shown by render_report.
@@ -99,13 +106,15 @@ def render_report(report: UpgradeReport) -> str:
     # .get with the raw action as fallback: a Story action added to the
     # Literal but missed here must degrade to the raw token, not KeyError
     # (review 2026-06-12).
-    return "\n".join(
-        [
-            "Upgrade summary:",
-            f"  config.yaml        : {_STORY1_PHRASES.get(report.story1_action, report.story1_action)}",
-            f"  OpenClaw migration : {_STORY1_5_PHRASES.get(report.story1_5_action, report.story1_5_action)}",
-        ]
-    )
+    lines = [
+        "Upgrade summary:",
+        f"  config.yaml        : {_STORY1_PHRASES.get(report.story1_action, report.story1_action)}",
+        f"  OpenClaw migration : {_STORY1_5_PHRASES.get(report.story1_5_action, report.story1_5_action)}",
+    ]
+    if report.plugin_notes:
+        lines.append("  Hermes plugin      : migrated to the single 'mordred' plugin")
+        lines.extend(f"    {note}" for note in report.plugin_notes)
+    return "\n".join(lines)
 
 
 def _read_existing_section(config_path: Path) -> dict[str, Any] | None:
@@ -230,6 +239,10 @@ def run(
         policy_writer.policy_json_path,
     )
 
+    # Independent of the policy outcome (and first, so a policy conflict that
+    # aborts below cannot leave the pre-0.2.0a0 plugin names in place, which
+    # Hermes no longer loads).
+    plugin_notes = tuple(policy_writer.migrate_plugin_identity().notes())
     story1 = _resolve_story1(options, policy_writer, target_snapshot)
     story1_5 = _resolve_story1_5(options, policy_writer, openclaw_base)
-    return UpgradeReport(story1_action=story1, story1_5_action=story1_5)
+    return UpgradeReport(story1_action=story1, story1_5_action=story1_5, plugin_notes=plugin_notes)

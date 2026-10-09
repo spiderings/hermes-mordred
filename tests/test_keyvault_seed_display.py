@@ -1,6 +1,6 @@
-"""RED tests for Phase 4 PR7: ``keyvault.seed_display``.
+"""Tests for ``keyvault.seed_display``.
 
-SPEC.md §Seed phrase display security + TODO.md §4.1 L419-421:
+SPEC.md §Seed phrase display security requires:
 
 - :func:`display_seed` orchestrates the Seed display flow — network
   blackout assert → M4 warning banner → screen-capture pre-check → seed

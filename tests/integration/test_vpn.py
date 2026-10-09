@@ -98,7 +98,7 @@ def authenticated_cli() -> Iterator[str]:
 
 
 class TestMullvadConnectionRoundtrip:
-    """Acceptance gate row 2 (live verification — TODO §Phase 3 L379)."""
+    """Live Mullvad connection and teardown verification."""
 
     def test_bring_up_wait_connected_disconnect(self, authenticated_cli: str) -> None:
         """Connect, wait for handshake, disconnect — full happy path."""
@@ -186,7 +186,7 @@ class TestMullvadHandshakeFreshness:
 
 
 class TestMullvadIPv6Behaviour:
-    """IPv6 egress gate (TODO §3.1 L346 v1 caveat / Codex 2026-05-20 must-fix).
+    """Live IPv6 egress gate.
 
     ``RuntimeConfig.disable_ipv6`` is **advisory only** in v1: on the Tor
     path it renders ``ClientUseIPv6 0``, but it does not alter host routes or
@@ -275,8 +275,8 @@ class TestMullvadIPv6Behaviour:
                 f"IPv6 leak: egress address {baseline!r} reachable both "
                 f"before and during the Mullvad session, indicating IPv6 "
                 f"traffic is bypassing the WireGuard tunnel. v1 has no "
-                f"kernel-level IPv6 firewall (TODO §3.1 L346, v2-N2 "
-                f"deferred); until then set policy.json disable_ipv6=true "
+                f"kernel-level IPv6 firewall; until that boundary exists, "
+                f"set policy.json disable_ipv6=true "
                 f"or use strict mode + Mullvad lockdown-mode."
             )
         finally:

@@ -105,6 +105,10 @@ _CLOUD_ENDPOINT_HOSTS: Final[Mapping[str, tuple[str, ...]]] = {
     "stepfun": ("api.stepfun.ai", "api.stepfun.com"),
     "tencent-tokenhub": ("tokenhub.tencentmaas.com",),
     "upstage": ("api.upstage.ai",),
+    # Venice.ai is not a Hermes provider; the entry binds Mordred's own
+    # Telegram question client (extension/telegram/venice.py), which runs
+    # check_runtime_provider(active_provider="venice") before every request.
+    "venice": ("api.venice.ai",),
     "vertex": (),
     "xai": ("api.x.ai",),
     "xiaomi": ("api.xiaomimimo.com",),

@@ -1,7 +1,7 @@
 """mordred_keyvault.log_encryption — AES-GCM encryption layer for the audit log.
 
-Phase 4 PR6. SPEC.md §Audit log policy / §Audit-log encryption coupling +
-PLAN.md L549-555.
+The current format contract is documented in SPEC.md §Audit log policy and
+§Encrypted audit-log wire format.
 
 :class:`EncryptedWriter` is an AES-GCM-encrypting implementation of the
 Phase 1 ``Writer`` Protocol frozen in
@@ -37,15 +37,14 @@ stale DEK is wiped and the foreign file is rotated intact before a fresh
 header/DEK is created. A write-all loop completes the whole line even when
 ``os.write`` returns short.
 
-The DEK is unwrapped through the Secure Enclave authorization boundary
+The DEK is unwrapped through the selected native-key authorization boundary
 (:func:`mordred_keyvault.wrap.unwrap_dek`) only on the *read* side
-(:func:`decrypt_log_file`), which the ``hermes mordred audit decrypt`` CLI
-(PR8) drives. Writing never authorizes: :func:`~mordred_keyvault.wrap.wrap_dek`
-is an offline operation against the Enclave's public key.
+(:func:`decrypt_log_file`), which `hermes-mordred audit decrypt` drives.
+Writing never authorizes: :func:`~mordred_keyvault.wrap.wrap_dek` is an offline
+operation against the native key's public half.
 
-This module imports :mod:`cryptography` (via ``.crypto`` / ``.wrap``) and
-so, like its keyvault crypto siblings, is only importable where the
-``[macos]`` extra is installed.
+This module imports :mod:`cryptography` from the cross-platform ``keyvault``
+extra. Platform-specific custody stays behind ``NativeBackend``.
 """
 
 from __future__ import annotations
@@ -71,9 +70,6 @@ from .._audit_io import (
     audit_path_stat as _audit_path_stat,
 )
 from .._audit_io import (
-    compress_rotated_file as _compress_rotated_file,
-)
-from .._audit_io import (
     exclusive_audit_lock as _exclusive_audit_lock,
 )
 from .._audit_io import (
@@ -82,8 +78,7 @@ from .._audit_io import (
 from .._audit_io import (
     read_first_line as _read_first_line,
 )
-from .._log_rotation import next_rotation_target
-from .._log_rotation import sweep_retention as _sweep_retention
+from .._log_rotation import rotate_and_compress as _rotate_and_compress
 from .._log_rotation import today_utc_date as _today_utc_date
 from .._log_rotation import utcnow_iso as _utcnow_iso
 from . import _native_key_id, _storage
@@ -471,27 +466,16 @@ class EncryptedWriter:
     def _rotate(self, date_suffix: str) -> None:
         """Rename the active file to ``<name>.<date>[.N]`` and gzip it.
 
-        Mirrors :class:`mordred_hermes.privacy_check.audit.NDJSONWriter`'s
-        rotation: same-day collisions get an ``.N`` suffix; a gzip failure
-        keeps the un-gzipped rotated file rather than losing data.
+        No longer merely *mirrors*
+        :class:`mordred_hermes.privacy_check.audit.NDJSONWriter`'s rotation —
+        the two byte-for-byte identical bodies are now the one
+        :func:`mordred_hermes._log_rotation.rotate_and_compress`: same-day
+        collisions get an ``.N`` suffix; a gzip failure keeps the un-gzipped
+        rotated file rather than losing data. This module's own ``_LOG`` is
+        passed in, so that warning still reports under
+        ``mordred.keyvault.log_encryption``.
         """
-        before = _audit_path_stat(self.path)
-        if before is None:
-            return
-
-        target = next_rotation_target(self.path, date_suffix)
-        os.replace(self.path, target)
-        moved = _audit_path_stat(target)
-        if moved is None or (moved.st_dev, moved.st_ino) != (before.st_dev, before.st_ino):
-            raise OSError("audit path changed during rotation")
-
-        gz_target = target.with_suffix(target.suffix + ".gz")
-        try:
-            _compress_rotated_file(target, gz_target)
-        except Exception as e:
-            _LOG.warning("audit gzip rotation failed; raw rotated file kept at %s: %s", target, e)
-
-        _sweep_retention(self.path, self.retention_days)
+        _rotate_and_compress(self.path, date_suffix, retention_days=self.retention_days, log=_LOG)
 
 
 def _reject_duplicate_header_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:

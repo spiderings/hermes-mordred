@@ -2,7 +2,9 @@
 
 > **Note**: This document summarizes the local environment setup steps for Mordred plugin developers.
 
-This guide is intended for **developers starting work on the Mordred plugin**. If you want to install Mordred as an end user, refer to the future package README (to be added after Phase 0.5 is complete).
+This guide is intended for **developers starting work on Mordred**. End users
+should start with the repository [`README.md`](../../README.md) or the
+[`Quickstart`](../user/QUICKSTART.md).
 
 This is the operational source for building and verifying the editable
 development environment. [`PLAN.md`](./PLAN.md) describes the implementation
@@ -12,31 +14,35 @@ shape, and [`TODO.md`](./TODO.md) lists only open work.
 
 ## Prerequisites
 
-- Python 3.11 or later (`requires-python = ">=3.11"`, `pyproject.toml` L10 + the Hermes upstream root `pyproject.toml` is pinned to the same). The CI matrix covers both 3.11 / 3.12 (see `CI.md` §`ci.yml` details)
+- Python 3.11 or later. The CI matrix covers Python 3.11–3.13 on Ubuntu and
+  macOS (see [`CI.md`](./CI.md) §`ci.yml` details)
 - [uv](https://docs.astral.sh/uv/) — used to create the dev venv (`.venv/`) and reproduce `uv.lock`
 - git 2.30+
 - macOS / Linux (`mordred_keyvault` uses Secure Enclave/login Keychain on
-  macOS and the fail-closed TPM 2.0 helper on Linux; see `SPEC.md` Phase 4)
+  macOS and the fail-closed TPM 2.0 helper on Linux; see
+  [`SPEC.md`](./SPEC.md) §Platform Support (v1))
 - `hermes-agent` is **installed automatically from PyPI by `uv sync`** (it's a dependency in `pyproject.toml`; no adjacent clone is needed)
 
 ## Repository layout
 
-This repository is a **standalone Mordred plugin package repository** — it is not a fork of Hermes upstream (see `UPSTREAM.md` §Repository position). It was split out of the monorepo (`Mordred-Hermes-monorepo`) on 2026-07-01, and the full package set is laid out flat at the repository root.
+This repository is a **standalone Mordred plugin package repository**. It is
+not a fork of Hermes upstream (see `UPSTREAM.md` §Repository position), and the
+full package is laid out at the repository root.
 
 ```
-mordred-hermes-plugin/
-├── pyproject.toml                    # hermes-mordred package config (6 entry points)
+hermes-mordred/
+├── pyproject.toml                    # hermes-mordred package config (1 entry point: mordred)
 ├── uv.lock                           # uv lockfile (for local dev use; CI resolves the latest from PyPI via pip)
-├── src/mordred_hermes/               # plugin body (6 entry points + shared helpers)
+├── src/mordred_hermes/               # plugin body (plugin.py = the mordred entry point; components + shared helpers)
 │   ├── privacy_check/
 │   ├── wizard/
 │   ├── llm_guard/
 │   ├── network/
 │   ├── keyvault/
-│   └── extension/                    # mordred_e2e + extension server
+│   └── extension/                    # e2e component (gateway_plugin.py) + extension server
 ├── tests/                            # default suite + integration/ (opt-in) + fixtures/
 ├── docs/dev/                         # SPEC / PLAN / TODO / ROADMAP / CI / setup, etc.
-├── docs/user/                        # QUICKSTART / USAGE
+├── docs/user/                        # QUICKSTART / USAGE / EXTENSION
 ├── tools/                            # bump_version.py / check_hook_payload_drift.py
 ├── scripts/                          # keyvault_offline_digest.py (air-gapped verification)
 ├── native/                           # sekey-helper (Swift) / tpmkey-helper (Rust)
@@ -69,7 +75,7 @@ before judging the running code.
 
 ```sh
 # 1. Get the repository
-git clone https://github.com/InternetMaximalism/hermes-mordred.git
+git clone https://github.com/mordredagent/hermes-mordred.git
 cd hermes-mordred
 
 # 2. Create the dev venv. This one command installs everything:
@@ -102,14 +108,14 @@ The extras defined by `[project.optional-dependencies]` in `pyproject.toml`. `uv
 | `ethereum` | `eth-keys` / `eth-account` / `rlp` / `eth-hash` | keyvault signing feature (`extension_sign.py`) |
 | `tor-control` | `stem` (Tor ControlPort cookie auth + liveness probe) | Tor liveness in strict mode |
 | `messaging` | `qrcode` | Device QR display for `extension pair` (falls back to plaintext if absent) |
-| `integration` | SOCKS5h client library + provider SDK | `pytest -m integration` §0.8 verification suite |
+| `integration` | SOCKS5h client library + provider SDK | `pytest -m integration` network verification suite |
 
 > **CI uses two dependency profiles**: the main strict lane intentionally runs with only `.[dev,keyvault,extension]`, while `feature-extras` installs `ethereum` / `messaging` / `tor-control`, requires their imports, and runs the focused feature suites so `importorskip` cannot hide missing coverage. Use `uv sync --all-extras` when developing those optional features, and also reproduce the main profile before pushing (see `CI.md`).
 
-> **Verifying discovery**: `hermes plugins list` does not show entry-point plugins (upstream's `_discover_all_plugins` is designed to scan directory-based plugins only). The loader side (`PluginManager.discover_and_load`) performs discovery + `register()`. To confirm that all Mordred plugins actually load:
+> **Verifying discovery**: older Hermes releases' `hermes plugins list` does not show entry-point plugins (their `_discover_all_plugins` scanned directory-based plugins only). The loader side (`PluginManager.discover_and_load`) performs discovery + `register()`. To confirm that the Mordred plugin is discovered (`hermes-mordred plugins list` also shows per-component status):
 > ```sh
 > .venv/bin/python -c "from hermes_cli.plugins import PluginManager; m=PluginManager(); m.discover_and_load(force=True); print(sorted(k for k,p in m._plugins.items() if p.manifest.source=='entrypoint'))"
-> # → ['mordred_e2e', 'mordred_keyvault', 'mordred_llm_guard', 'mordred_network', 'mordred_privacy_check', 'mordred_wizard']
+> # → ['mordred']
 > ```
 
 ---
@@ -172,11 +178,32 @@ uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
 ~/.hermes/hermes-agent/venv/bin/python3 -c "import mordred_hermes; print(mordred_hermes.__file__)"
 ```
 
-**Make sure to revert to the PyPI release** (if you forget, unreleased dev code keeps running as production indefinitely):
+**Make sure to revert to the PyPI release** (if you forget, unreleased dev code
+keeps running as production indefinitely). Reinstall the same extras used for
+the editable swap so the production feature set is re-resolved against the
+released package:
 
 ```sh
 uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
-  --reinstall "hermes-mordred[macos]==0.1.0a16"   # ← substitute the current PyPI version here
+  --reinstall "hermes-mordred[macos,extension,ethereum]==0.2.0a1"
+
+uv pip check --python ~/.hermes/hermes-agent/venv/bin/python3
+~/.hermes/hermes-agent/venv/bin/python3 -c \
+  "import mordred_hermes; print(mordred_hermes.__file__)"
+# The import must now resolve under .../site-packages/, not the checkout's src/.
+```
+
+Substitute the current PyPI version and the exact extras your production
+process uses. Then stop and restart the Hermes gateway or standalone
+`extension serve` process through its normal deployment mechanism; replacing
+files in the venv does not change an already-running process. Confirm the new
+PID owns the expected port and that the local endpoint responds before treating
+the rollback as complete:
+
+```sh
+# If production runs the standalone Extension gateway on its default port:
+lsof -nP -iTCP:7788 -sTCP:LISTEN
+curl -fsS http://127.0.0.1:7788/ >/dev/null
 ```
 
 ## (Optional) Hermes upstream remote
@@ -197,9 +224,9 @@ Run everything via `uv run` (= uses the repo `.venv`). Invoking `.venv/bin/…` 
 
 | Purpose | Command | Notes |
 |---|---|---|
-| Run tests | `uv run pytest -q` | Excludes the integration marker by default (`addopts` in `pyproject.toml`). For coverage use `uv run pytest --cov=src/mordred_hermes` (same as CI, floor 80%) |
+| Run tests | `uv run pytest -q` | Excludes the integration marker by default (`addopts` in `pyproject.toml`). For coverage use `uv run pytest --cov=src/mordred_hermes` (same as CI, floor 80%). The root `tests/conftest.py` defaults `HERMES_HOME` to a fresh temp directory before anything imports `mordred_hermes`, so a bare run never touches your real `~/.hermes`; an explicit `HERMES_HOME` set beforehand still wins untouched |
 | Integration tests | `uv run pytest -m integration` | Requires Docker / a real Mullvad account / a real network. `integration` extra required |
-| Lint | `uv run ruff check src tests scripts` | `PLAN.md` §0.6 |
+| Lint | `uv run ruff check src tests scripts` | Blocking in CI |
 | Format check | `uv run ruff format --check src tests scripts` | Blocking in CI |
 | Shell lint | `shellcheck scripts/*.sh native/*/build.sh` | Blocking in CI (one Linux cell). Not a Python dependency — install via `brew install shellcheck` / `apt install shellcheck` |
 | Type-check | `uv run mypy --strict src tools scripts/keyvault_offline_digest.py` | The main strict lane omits feature extras; the separate feature lane exercises them at runtime. The digest script ships in the wheel, so it is type-gated; the other `scripts/*.py` are dev-era PoCs and are not |
@@ -215,18 +242,23 @@ normal CI suite and can block an incompatible change.
 
 ## Mordred-owned filesystem paths
 
-When observing local state during development, look under `~/.hermes/mordred/` (see `PATHS.md`):
+When observing local state during development, start under the active Hermes
+home (normally `~/.hermes`; see [`PATHS.md`](./PATHS.md)):
 
-- `~/.hermes/mordred/audit.log` — audit log for all plugins (Phase 1 owner)
-- `~/.hermes/mordred/policy.json` — written by `mordred_wizard`, read by other plugins (Phase 1)
+- `~/.hermes/mordred/audit.log` — audit log for all plugins
+- `~/.hermes/mordred/policy.json` — written by `mordred_wizard`, read by other plugins
 - `~/.hermes/mordred/credentials/` — `mordred_network`'s Mullvad relay/killswitch references (written by `network init`)
-- `~/.hermes/mordred/keyvault/` — `mordred_keyvault`'s wrapped DEK etc. (Phase 4)
+- `~/.hermes/mordred/keyvault/` — `mordred_keyvault`'s wrapped DEK and metadata
+- `~/.hermes/mordred/vault/` — the encrypted at-rest file vault
+- `~/.hermes/extension/` — pairing, E2E history, WebAuthn, and wallet state
 
-The paths each plugin owns and its internal Python API are documented in that plugin's own `README.md` (`PLAN.md` §0.4).
+Mordred also intentionally manages selected Hermes-owned targets such as
+`~/.hermes/.env`, `config.yaml`, and memory settings. `PATHS.md` is the sole
+path/ownership inventory; package-local plugin READMEs are not maintained.
 
 ## Offline verification digest (`keyvault init` step 4)
 
-Partway through `hermes-mordred keyvault init`, the operator needs to independently recompute the 32-byte verification digest on an **air-gapped second device** and re-enter it on the primary machine (SPEC §`keyvault init` flow, steps 6-7). `scripts/keyvault_offline_digest.py` provides a standalone tool for this.
+Partway through `hermes-mordred keyvault init`, the operator needs to independently recompute the 32-byte verification digest on an **air-gapped second device** and re-enter it on the primary machine (see [`SPEC.md`](./SPEC.md) §`keyvault init` flow). `scripts/keyvault_offline_digest.py` provides a standalone tool for this.
 
 **Design invariant**: this script has no dependency on the `mordred_hermes` package (stdlib + `blake3` only). It's built to be carried to the second device via USB / printed-and-retyped / QR. The algorithm and Unicode normalization are a verbatim copy from `mordred_hermes.keyvault.{digest,api}`, and `--self-test` pins regressions against the SPEC fixed vector (`test_keyvault_digest.py:SPEC_*`).
 
@@ -275,7 +307,7 @@ Re-enter the output 64-character hex string at the primary machine's `Verificati
 
 ### Common pitfalls
 
-- **Whether a blake3 wheel is available**: ARM Mac / x86 Linux have wheels. Older ARM Linux / 32-bit devices trigger a source build, so if `pip install` fails at that step, switch devices
+- **Whether a blake3 wheel is available**: ARM Mac / x86 Linux normally have wheels. Older ARM Linux / 32-bit devices may trigger a source build; install the required build toolchain or use another supported offline device
 - **Cf-character clipboard injection**: pasting the seed phrase via the OS clipboard can introduce a ZWSP. `_normalize_seed_phrase` absorbs this via NFKD + Cf-strip, but typing it by hand is recommended
 - **Passphrase case sensitivity**: `_normalize_passphrase` is NFKD only. Uppercase/lowercase and spaces remain entropy as-is, so make sure the keyboard layout (US / JIS) used when entering it on the primary matches the one on the second device
 
@@ -284,17 +316,19 @@ See `SPEC.md §Key generation and verification digest` for the detailed algorith
 ## Development workflow guidelines
 
 - One-plugin-one-PR principle: don't touch `mordred_privacy_check` and `mordred_wizard` in the same change. If a cross-plugin change is needed, PR the SPEC/PLAN side first
-- Don't send PRs to Hermes upstream (zero-PR commitment, `MIGRATION.md` §5). If hard-enforcement looks necessary, that's a candidate for the v2 vendored fork extra — in v1 it's absorbed on the plugin side
+- Don't send PRs to Hermes upstream. [`UPSTREAM.md`](./UPSTREAM.md)
+  owns the zero-PR commitment and the optional vendored-layer boundary.
 - Put operator documentation under `docs/user/`, current developer contracts and
-  procedures under `docs/dev/`, and upstream snapshots under
-  `docs/dev/hermes/`. Add new documents to the matching index.
+  procedures under `docs/dev/`. Link to current official Hermes documentation
+  or inspect the installed/upstream source instead of copying snapshots into
+  this repository. Add every maintained developer document to this index.
 
 ## Next steps
 
 - Pick an unchecked item from [`TODO.md`](./TODO.md), then read its behavior in
   [`SPEC.md`](./SPEC.md) and implementation boundary in [`PLAN.md`](./PLAN.md).
-- For an individual plugin, read its package README and focused tests before
-  changing code.
+- For an individual plugin, read the matching SPEC/PLAN sections and focused
+  tests before changing code.
 - AI coding agents and contributors should follow [`AGENTS.md`](../../AGENTS.md)
   at the repository root (`CLAUDE.md` is a thin include shim pointing at it).
 
@@ -309,5 +343,97 @@ See `SPEC.md §Key generation and verification digest` for the detailed algorith
 - `PATHS.md` — filesystem paths Mordred touches
 - `UPSTREAM.md` — relationship with Hermes upstream
 - `CI.md` — CI workflow details
-- `MIGRATION.md` — OpenClaw → Hermes migration strategy
-- `ROADMAP.md` — post-v1 plan (includes this doc's post-GA relocation target v2-X3)
+- `ROADMAP.md` — deferred candidates and release gates
+
+## Linux Private Telegram validation
+
+Use a TPM 2.0 device with P-256 ECDH and an isolated test home. The operator
+running Hermes needs access to `/dev/tpmrm0`; do not relax the device to
+world-readable. Install the same Mordred build into both the CLI and the
+actual Hermes/Desktop interpreter. `MORDRED_HERMES_RUNTIME_PYTHON` can select
+the latter explicitly. Stop existing gateways before enabling memory.
+
+```sh
+uv sync --extra dev --extra keyvault --extra extension --extra telegram
+export HERMES_HOME=/tmp/mordred-linux-telegram-acceptance
+export MORDRED_TPMKEY_HELPER=/path/to/mordred-hermes-tpmkey
+export MORDRED_LINUX_TELEGRAM_TEST=1
+unset TCTI MORDRED_TPM_TEST MORDRED_TPMKEY_STORE HERMES_MEMORY_KEY
+uv run pytest -v -o addopts='' tests/integration/test_linux_telegram_tpm.py
+```
+
+This explicit hardware gate creates fresh pytest-owned profiles, runs the real
+Hermes startup hook in new processes, and tests memory write/read, corrupted
+keys, unavailable TPM, disable/re-enable/purge, and synthetic Telegram
+sync/list/ask/cancel. Network clients are synthetic; wrapping, memory hooks,
+credentials and archive encryption are real. It never logs into Telegram.
+
+For hermetic CI, the same suite accepts `TCTI=swtpm:host=127.0.0.1,port=2321`
+against a separately started loopback emulator. Label this result **swtpm**;
+it does not establish device or EC2 support. The native TPM CI job runs this
+suite after building the helper. Live EC2/account tests remain manual only.
+
+For EC2, verify AMI NitroTPM support, UEFI, `/dev/tpmrm0`, and the actual helper
+probe before testing. Retain package paths, source hashes, interpreter versions,
+commands and sanitized results. Check the packaged Desktop's TPM labels,
+recovery limitation, memory enable action, and behavior after restart. Use
+loopback services over SSH and stop test instances afterwards.
+
+A separate operator-assisted acceptance gate uses the operator's own Telegram
+account: enter API credentials, OTP and 2FA directly in the login screen, then
+perform a small read-only sync, one query, cancellation and logout. Never put
+those credentials or real message content into logs or test fixtures. Report
+this gate as pending when it has not run.
+
+### Native Windows installer and helper validation (C4)
+
+This wizard slice provides installation and helper probes; full Windows product
+acceptance is still incomplete. Use a native PowerShell session and an isolated
+Hermes installation/profile. For unpublished code, build a wheel from the sdist
+and supply that exact wheel, rather than assuming a PyPI release contains it:
+
+```powershell
+$env:HERMES_HOME = Join-Path $env:TEMP ('mordred-test-' + [Guid]::NewGuid().ToString('N'))
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 `
+  -Python 'C:\test Hermes\venv\Scripts\python.exe' `
+  -Source 'C:\builds\hermes_mordred-<version>-py3-none-any.whl' -InstallOnly
+```
+
+`-Version <exact-version>` selects a pinned release instead of `-Source`.
+`-Uv <path>` selects uv explicitly; otherwise PATH or Desktop's bundled uv is
+used. The installer validates the selected interpreter, Hermes's entry-point
+loader and Mordred's Windows wizard code, prints actual module/interpreter paths,
+and preserves Hermes dependency pins. Installation-only mode skips canonical
+configuration, legacy plugin identity migration and setup. Without that flag,
+legacy identity migration uses the existing writer; `-Action configure` or
+`-Action setup` delegates the canonical CLI and propagates its failure. These
+writers depend on C3. `-Action uninstall -CommandArgs --dry-run` delegates the
+installed uninstall command. No production profile should be used for tests.
+
+The exposed PowerShell launcher lives in `<HERMES_HOME>\bin`; add that directory
+to PATH if desired. It receives a hash-bound ownership receipt. An unknown
+launcher/executable is preserved, and unsafe reparse destinations are refused.
+Windows helper installation uses the same ownership rules:
+
+```powershell
+& 'C:\test Hermes\venv\Scripts\hermes-mordred.exe' keyvault enable-winkey
+# Optional destination must be fully qualified; verification uses this exact file.
+& 'C:\test Hermes\venv\Scripts\hermes-mordred.exe' keyvault enable-winkey `
+  --install-dir 'C:\private helper Unicode\bin'
+```
+
+Install Rust's native MSVC toolchain and Visual C++ Build Tools first. Helper
+installation probes TPM/CNG under the existing user token. It does not enable
+memory encryption or provide per-use presence. A failed probe remains a failure
+with its native reason. Standalone `native/winkey-helper/build.ps1` retains its
+helper-only build contract; the wizard passes optional `-OwnedInstall` to create
+ownership receipts. Existing helpers without receipts are retained by uninstall.
+Custom helpers remain at their selected location; set `MORDRED_WINKEY_HELPER` to
+that absolute executable when using them, and inspect/remove owned custom files
+explicitly if they are outside the profile's default bin directory.
+
+Run `tests/test_windows_install_powershell.py` natively to exercise PowerShell 5.1
+and pwsh argument passing and exit codes with compiled fixture executables and
+temporary profiles, without network package installation. Native wheel installs,
+TPM probes and ordinary-user Windows 11 acceptance remain separate controller-run
+gates; macOS/Linux unit evidence does not establish those results.

@@ -27,8 +27,7 @@ Decision: TypeAlias = Literal["allow", "block", "warn"]
 
 VALID_NETWORK_REQUIREMENTS: Final[frozenset[str]] = frozenset({"tor", "vpn", "clearnet", "local-only"})
 
-# Phase 1 default strict-mode blocklist (PLAN.md §1.1, TODO.md §1.1 L157).
-# User can override via policy.json once Phase 1.3 wizard lands.
+# Default strict-mode clearnet blocklist (POLICY.md §Runtime (`pre_tool_call`)).
 DEFAULT_STRICT_CLEARNET_TOOL_BLOCKLIST: Final[frozenset[str]] = frozenset({"web_fetch", "web_search"})
 
 
@@ -49,7 +48,7 @@ def evaluate_install(
 ) -> PolicyOutcome:
     """Decide whether ``hermes mordred install <skill>`` should proceed.
 
-    Network decision matrix (TODO.md §1.1 L153-156, SPEC.md §Audit log policy):
+    Network decision matrix (POLICY.md §Install-time):
 
     ======= ========================== ============== ============================================
     mode    network_requirements       decision       reason
@@ -62,7 +61,7 @@ def evaluate_install(
     lenient *                          allow          None
     ======= ========================== ============== ============================================
 
-    Keyvault opt-in enforcement (TODO.md §4.1, SPEC.md §417). When the skill
+    Keyvault opt-in enforcement (POLICY.md §Install-time). When the skill
     declares ``metadata.mordred.requires_keyvault: true`` (``requires_keyvault``)
     and the Mordred keyvault holds no keys (``keyvault_initialized`` is False):
 

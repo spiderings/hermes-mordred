@@ -1,6 +1,6 @@
-"""RED tests for Phase 4 PR6: ``keyvault.log_encryption``.
+"""Tests for ``keyvault.log_encryption``.
 
-SPEC.md §Audit log policy / §Audit-log encryption coupling + PLAN.md L549:
+SPEC.md §Audit log policy and §Encrypted audit-log wire format require:
 
 - :class:`EncryptedWriter` is an AES-GCM-encrypting implementation of the
   Phase 1 ``Writer`` Protocol frozen in

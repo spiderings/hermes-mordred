@@ -5,7 +5,7 @@ This directory builds an **intentionally empty `0.0.0.dev0` package**.
 It is **not** the real Mordred privacy plugin bundle. Its only purpose is
 to claim the `mordred-hermes` name on TestPyPI and PyPI *before* the
 public documentation launch, so a third party cannot squat the name and
-ship a malicious package (Mordred `TODO.md` §0.5 L70, milestone "M7").
+ship a malicious package before the real distribution was released.
 
 The old project shipped the real bundle through `0.1.0a15`. From `0.1.0a16`,
 it is continued by the metadata-only compatibility package in

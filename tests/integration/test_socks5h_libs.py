@@ -1,4 +1,4 @@
-"""SOCKS5h library compatibility verification — TODO §0.8 L118-122.
+"""SOCKS5h library compatibility verification.
 
 Empirically proves that each HTTP client library on the Mordred /
 Hermes surface honours the ``socks5h://`` URL scheme: when told to use a

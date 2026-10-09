@@ -60,6 +60,69 @@ def test_runtime_pth_gate_matches_existing_hermes_matcher(argv0: str, expected: 
     assert engaged == _pth_bootstrap._looks_like_hermes([argv0])
 
 
+_FAKE_MEMORY_TOOL_SRC = '''\
+"""A shape-C ``tools.memory_tool`` stand-in, imported through the real machinery."""
+
+from pathlib import Path
+
+ENTRY_DELIMITER = "\\n\\u00a7\\n"
+
+
+class MemoryStore:
+    @staticmethod
+    def _write_file(path, entries):
+        Path(path).write_text(ENTRY_DELIMITER.join(entries) if entries else "", encoding="utf-8")
+
+    @staticmethod
+    def _read_file(path):
+        target = Path(path)
+        if not target.exists():
+            return []
+        return [e.strip() for e in target.read_text(encoding="utf-8").split(ENTRY_DELIMITER) if e.strip()]
+'''
+
+
+def test_install_registers_the_memory_import_hook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The keyvault plugin's ``register()`` is not reached in every Hermes process
+    (discovery can be skipped or fail), so the memory seam is armed from the
+    ``.pth`` bootstrap too — via a finder, never an eager import.
+
+    Behavioural on purpose: counting finders on ``sys.meta_path`` proves only that
+    an object was inserted, not that importing the seam actually wraps the class.
+    """
+    import importlib
+
+    from mordred_hermes.keyvault import _memory_hook
+
+    site = tmp_path / "site"
+    (site / "tools").mkdir(parents=True)
+    (site / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    (site / "tools" / "memory_tool.py").write_text(_FAKE_MEMORY_TOOL_SRC, encoding="utf-8")
+    saved = {name: mod for name, mod in sys.modules.items() if name.split(".")[0] == "tools"}
+    for name in saved:
+        del sys.modules[name]
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    importlib.invalidate_caches()
+
+    calls: list[str] = []
+    monkeypatch.setattr(_runtime_bootstrap, "ensure_loopback_proxy_bypass", lambda: calls.append("proxy"))
+    monkeypatch.setattr(_runtime_bootstrap, "_install_plugin_discovery_wrapper", lambda: calls.append("discovery"))
+    try:
+        _runtime_bootstrap.install()
+        assert calls == ["proxy", "discovery"]
+
+        memory_tool = importlib.import_module("tools.memory_tool")
+
+        assert _memory_hook.memory_hook_installed(memory_tool) is True
+    finally:
+        for name in [n for n in sys.modules if n.split(".")[0] == "tools"]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+        sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, _memory_hook._PostImportFinder)]
+        _memory_hook._IMPORT_HOOK = None
+
+
 def test_runtime_bootstrap_failure_aborts_startup() -> None:
     def fail() -> None:
         raise RuntimeError("synthetic bootstrap failure")

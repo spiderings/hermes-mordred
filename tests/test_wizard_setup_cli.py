@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from mordred_hermes.keyvault import _identity, _native_key_id, _storage
+from mordred_hermes.keyvault._memory_hook import memory_marker_path, memory_optout_marker_path
 from mordred_hermes.wizard import cli, configure, encryption_cli, network_cli, setup_cli
 from mordred_hermes.wizard._prompt_io import NonInteractiveAbort, _RefusingPromptIO
 from mordred_hermes.wizard.encryption_cli import WorkspacePaths
@@ -33,6 +34,7 @@ _STEP_NETWORK = setup_cli._STEP_NETWORK
 _STEP_HARDWARE_HELPER = setup_cli._STEP_HARDWARE_HELPER
 _STEP_KEYVAULT = setup_cli._STEP_KEYVAULT
 _STEP_ENV_ENCRYPTION = setup_cli._STEP_ENV_ENCRYPTION
+_STEP_MEMORY_ENCRYPTION = setup_cli._STEP_MEMORY_ENCRYPTION
 
 _ALL_STEPS = (
     _STEP_HERMES,
@@ -41,7 +43,18 @@ _ALL_STEPS = (
     _STEP_HARDWARE_HELPER,
     _STEP_KEYVAULT,
     _STEP_ENV_ENCRYPTION,
+    _STEP_MEMORY_ENCRYPTION,
 )
+
+_RESOLVER_BY_STEP = {
+    _STEP_HERMES: "_resolve_step_hermes",
+    _STEP_CONFIGURE: "_resolve_step_configure",
+    _STEP_NETWORK: "_resolve_step_network",
+    _STEP_HARDWARE_HELPER: "_resolve_step_hardware_helper",
+    _STEP_KEYVAULT: "_resolve_step_keyvault",
+    _STEP_ENV_ENCRYPTION: "_resolve_step_env_encryption",
+    _STEP_MEMORY_ENCRYPTION: "_resolve_step_memory_encryption",
+}
 
 # --------------------------------------------------------------------------- #
 # Test doubles + fixtures                                                     #
@@ -191,16 +204,8 @@ def _force_steps_done(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
     Isolates a later step's behaviour from the earlier steps' own decision
     logic -- those are covered by their own dedicated tests.
     """
-    attr_by_step = {
-        _STEP_HERMES: "_resolve_step_hermes",
-        _STEP_CONFIGURE: "_resolve_step_configure",
-        _STEP_NETWORK: "_resolve_step_network",
-        _STEP_HARDWARE_HELPER: "_resolve_step_hardware_helper",
-        _STEP_KEYVAULT: "_resolve_step_keyvault",
-        _STEP_ENV_ENCRYPTION: "_resolve_step_env_encryption",
-    }
     for name in names:
-        attr = attr_by_step[name]
+        attr = _RESOLVER_BY_STEP[name]
 
         def _resolve(name: str = name, **kwargs: object) -> setup_cli.StepResult:
             return setup_cli.StepResult(name, "done", "forced done for test isolation")
@@ -237,11 +242,13 @@ class TestRunSetupOrchestration:
         monkeypatch.setattr(setup_cli, "_probe_tpm_helper", lambda: True)
         monkeypatch.setattr(setup_cli, "_probe_keyvault", lambda **kw: ("initialised", "1 key"))
         monkeypatch.setattr(setup_cli, "_probe_env_encryption", lambda **kw: (True, "env ready"))
+        monkeypatch.setattr(setup_cli, "_probe_memory_encryption", lambda **kw: (True, "memory ready"))
 
         for seam in ("_run_configure", "_run_network", "_run_se_helper", "_run_tpm_helper"):
             monkeypatch.setattr(setup_cli, seam, _raiser(f"{seam} must not be called"))
         monkeypatch.setattr(setup_cli, "_run_keyvault_init", _raiser("_run_keyvault_init must not be called"))
         monkeypatch.setattr(setup_cli, "_run_env_encryption", _raiser("_run_env_encryption must not be called"))
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", _raiser("_run_memory_encryption must not be called"))
 
         rc = _run_setup(tmp_path, prompt_io=_RefusingPromptIO(), options=setup_cli.SetupOptions())
 
@@ -257,15 +264,7 @@ class TestRunSetupOrchestration:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         call_order: list[str] = []
-        attr_by_step = {
-            _STEP_HERMES: "_resolve_step_hermes",
-            _STEP_CONFIGURE: "_resolve_step_configure",
-            _STEP_NETWORK: "_resolve_step_network",
-            _STEP_HARDWARE_HELPER: "_resolve_step_hardware_helper",
-            _STEP_KEYVAULT: "_resolve_step_keyvault",
-            _STEP_ENV_ENCRYPTION: "_resolve_step_env_encryption",
-        }
-        for step, attr in attr_by_step.items():
+        for step, attr in _RESOLVER_BY_STEP.items():
 
             def _resolve(step: str = step, **kwargs: object) -> setup_cli.StepResult:
                 call_order.append(step)
@@ -345,6 +344,7 @@ class TestRunSetupOrchestration:
             return setup_cli.StepResult(_STEP_ENV_ENCRYPTION, "ran", "mock")
 
         monkeypatch.setattr(setup_cli, "_resolve_step_env_encryption", _env_step)
+        monkeypatch.setattr(setup_cli, "_probe_memory_encryption", lambda **kw: (True, "memory ready"))
 
         rc1 = _run_setup(
             tmp_path,
@@ -380,13 +380,13 @@ class TestRunSetupOrchestration:
         out = capsys.readouterr().out
         assert "hermes-mordred keyvault init" in out
 
-    def test_win32_platform_is_unsupported_and_stops_before_keyvault(
+    def test_unknown_platform_is_unsupported_and_stops_before_keyvault(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         _force_steps_done(monkeypatch, _STEP_HERMES, _STEP_CONFIGURE, _STEP_NETWORK)
         monkeypatch.setattr(setup_cli, "_resolve_step_keyvault", _raiser("keyvault step must not run"))
 
-        rc = _run_setup(tmp_path, platform="win32", prompt_io=_RefusingPromptIO(), options=setup_cli.SetupOptions())
+        rc = _run_setup(tmp_path, platform="freebsd", prompt_io=_RefusingPromptIO(), options=setup_cli.SetupOptions())
 
         assert rc == 1
         out = capsys.readouterr().out
@@ -820,8 +820,8 @@ class TestHardwareHelperStep:
         assert result.action == "ran"
         assert calls == [{"home": tmp_path}]
 
-    def test_win32_is_unsupported(self, tmp_path: Path) -> None:
-        result = setup_cli._resolve_step_hardware_helper(home=tmp_path, platform="win32")
+    def test_unknown_platform_is_unsupported(self, tmp_path: Path) -> None:
+        result = setup_cli._resolve_step_hardware_helper(home=tmp_path, platform="freebsd")
         assert result.action == "unsupported"
 
 
@@ -983,7 +983,13 @@ class TestKeyvaultStep:
         )
         assert result.action == "ran"
         assert calls == [
-            {"home": tmp_path, "prompt_io": calls[0]["prompt_io"], "store_seed_for_hd": False, "unattended": True}
+            {
+                "home": tmp_path,
+                "prompt_io": calls[0]["prompt_io"],
+                "store_seed_for_hd": False,
+                "unattended": True,
+                "flow_session": None,
+            }
         ]
 
     def test_absent_run_failure_is_failed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1198,6 +1204,148 @@ class TestNonInteractiveEnvGate:
         )
         assert result.action == "ran"
         assert "nothing to encrypt" in result.detail.lower() or ".env" in result.detail
+
+
+# --------------------------------------------------------------------------- #
+# Step 7 -- agent-memory encryption                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _arm_memory(home: Path) -> Path:
+    marker = memory_marker_path(home)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("armed\n", encoding="utf-8")
+    return marker
+
+
+def _pause_memory(home: Path) -> Path:
+    marker = memory_optout_marker_path(home)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("opt-out\n", encoding="utf-8")
+    return marker
+
+
+def _plaintext_memory(home: Path) -> Path:
+    path = home / "memories" / "MEMORY.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# still plaintext\n", encoding="utf-8")
+    return path
+
+
+class TestMemoryEncryptionProbe:
+    def test_not_enabled_without_markers(self, tmp_path: Path) -> None:
+        complete, detail = setup_cli._probe_memory_encryption(home=tmp_path, platform="darwin")
+        assert complete is False
+        assert detail == "not enabled"
+
+    def test_marker_is_complete(self, tmp_path: Path) -> None:
+        _arm_memory(tmp_path)
+        complete, detail = setup_cli._probe_memory_encryption(home=tmp_path, platform="darwin")
+        assert complete is True
+        assert detail == "enabled"
+
+    def test_operator_optout_is_complete_and_says_paused(self, tmp_path: Path) -> None:
+        """`encryption disable memory` is a deliberate pause; setup never reverses it."""
+        _pause_memory(tmp_path)
+        complete, detail = setup_cli._probe_memory_encryption(home=tmp_path, platform="darwin")
+        assert complete is True
+        assert "paused by operator" in detail
+
+    def test_plaintext_file_while_armed_is_incomplete(self, tmp_path: Path) -> None:
+        _arm_memory(tmp_path)
+        _plaintext_memory(tmp_path)
+        complete, detail = setup_cli._probe_memory_encryption(home=tmp_path, platform="darwin")
+        assert complete is False
+        assert "plaintext" in detail
+
+
+class TestMemoryEncryptionStep:
+    def _resolve(
+        self, home: Path, *, platform: str = "darwin", prompt_io: Any = None, options: Any = None
+    ) -> setup_cli.StepResult:
+        return setup_cli._resolve_step_memory_encryption(
+            home=home,
+            root=_vault_root(home),
+            platform=platform,
+            prompt_io=prompt_io if prompt_io is not None else _DefaultEchoPromptIO(),
+            options=options if options is not None else setup_cli.SetupOptions(),
+        )
+
+    def test_already_enabled_is_done_without_running(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _arm_memory(tmp_path)
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", _raiser("enable() must not be called"))
+        result = self._resolve(tmp_path)
+        assert result.action == "done"
+
+    def test_optout_is_done_and_enable_never_called(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _pause_memory(tmp_path)
+        monkeypatch.setattr(
+            setup_cli, "_run_memory_encryption", _raiser("enable() must not be called for a paused target")
+        )
+        result = self._resolve(tmp_path)
+        assert result.action == "done"
+        assert "paused" in result.detail.lower()
+        assert memory_optout_marker_path(tmp_path).exists()
+
+    def test_off_macos_is_skipped_and_never_runs(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The sealing shims are macOS-only; skipping keeps a Linux run clean."""
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", _raiser("enable() is macOS-only"))
+        result = self._resolve(tmp_path, platform="linux")
+        assert result.action == "skipped"
+        assert "macos" in result.detail.lower()
+
+    def test_manual_when_the_env_target_is_not_ready(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The key rides on the .env shim, so env must be sealed first."""
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", _raiser("enable() must not be called"))
+        result = self._resolve(tmp_path)
+        assert result.action == "manual"
+        assert "encryption enable env" in result.detail
+
+    def test_manual_under_non_interactive(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(encryption_cli, "_enrolled_names", lambda _root: {".env"})
+        monkeypatch.setattr(
+            setup_cli, "_run_memory_encryption", _raiser("enable() must not be attempted under --non-interactive")
+        )
+        result = self._resolve(
+            tmp_path, prompt_io=_RefusingPromptIO(), options=setup_cli.SetupOptions(non_interactive=True)
+        )
+        assert result.action == "manual"
+        assert "encryption enable memory" in result.detail
+
+    def test_runs_enable_when_env_is_ready(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(encryption_cli, "_enrolled_names", lambda _root: {".env"})
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", lambda **kw: (calls.append(kw), 0)[-1])
+
+        result = self._resolve(tmp_path)
+
+        assert result.action == "ran"
+        assert len(calls) == 1
+        assert calls[0]["platform"] == "darwin"
+
+    def test_run_failure_is_failed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(encryption_cli, "_enrolled_names", lambda _root: {".env"})
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", lambda **kw: 1)
+        result = self._resolve(tmp_path)
+        assert result.action == "failed"
+
+    def test_os_error_in_run_is_failed(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(encryption_cli, "_enrolled_names", lambda _root: {".env"})
+
+        def _boom(**kwargs: object) -> int:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", _boom)
+        result = self._resolve(tmp_path)
+        assert result.action == "failed"
+        assert "disk full" in result.detail
+
+    def test_prompt_abort_is_manual(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(encryption_cli, "_enrolled_names", lambda _root: {".env"})
+        monkeypatch.setattr(setup_cli, "_run_memory_encryption", _raise_non_interactive_abort)
+        result = self._resolve(tmp_path)
+        assert result.action == "manual"
+        assert "encryption enable memory" in result.detail
 
 
 # --------------------------------------------------------------------------- #

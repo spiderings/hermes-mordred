@@ -177,7 +177,7 @@ class TestProxyEnvRoundTrip:
 
 
 class TestTorSkillEndToEnd:
-    """Contract 4 (TODO §3.3 L380): a skill that declares
+    """A skill that declares
     ``network_requirements: tor`` routes its *own* traffic through Tor
     once the ``tor`` path is active.
 

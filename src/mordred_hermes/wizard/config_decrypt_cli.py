@@ -34,6 +34,7 @@ from ._vault_open import _vault_present
 if TYPE_CHECKING:
     from ..keyvault.anchor import AnchorStore
     from ..keyvault.wrap import NativeBackend
+    from ._flow_session import FlowSession
     from .configure import PromptIO
 
 __all__ = ["cli_disable", "cli_enable", "disable", "enable"]
@@ -41,12 +42,17 @@ __all__ = ["cli_disable", "cli_enable", "disable", "enable"]
 _CONFIG_NAME = "config.yaml"
 
 
-def _default_runtime_probe(*, home: Path) -> tuple[bool, str]:
+def _default_runtime_probe(*, home: Path, runtime_python: Path | None = None) -> tuple[bool, str]:
     """Production runtime probe: can the interpreter that runs ``hermes`` decrypt
-    a sealed ``config.yaml``? Imported lazily so this module stays import-light."""
+    a sealed ``config.yaml``? Imported lazily so this module stays import-light.
+
+    ``runtime_python`` pins a specific interpreter — the gate passes it when
+    probing an interpreter that is running a gateway *right now*; omitted, the
+    probe resolves the expected runtime itself.
+    """
     from ..keyvault._runtime_probe import runtime_config_decrypt_available
 
-    return runtime_config_decrypt_available(home=home)
+    return runtime_config_decrypt_available(home=home, runtime_python=runtime_python)
 
 
 def _runtime_gate(
@@ -59,11 +65,13 @@ def _runtime_gate(
     """Fail-closed macOS gate for arming the config.yaml seal.
 
     Returns 1 (after printing actionable guidance) when the interpreter that runs
-    ``hermes`` cannot materialize a sealed ``config.yaml`` at startup, else 0. A
-    no-op (0) off macOS — the plaintext is kept there anyway — and when
-    ``force_runtime_unverified`` is set. The gate core is shared with
-    ``env_decrypt_cli`` via :func:`._runtime_gate.runtime_gate`; only the
-    config.yaml-specific guidance text lives here.
+    ``hermes`` — or one that is running a gateway right now — cannot materialize
+    a sealed ``config.yaml`` at startup, else 0. A no-op (0) off macOS — the
+    plaintext is kept there anyway — and when ``force_runtime_unverified`` is
+    set. The gate core is shared with ``env_decrypt_cli`` via
+    :func:`._runtime_gate.runtime_gate`; only the config.yaml-specific guidance
+    text lives here (it is reused for both the expected-runtime and the
+    running-gateway refusal).
     """
     return runtime_gate(
         home=home,
@@ -99,6 +107,7 @@ def enable(
     prompt_io: PromptIO | None = None,
     runtime_probe: RuntimeProbe | None = None,
     force_runtime_unverified: bool = False,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Enroll ``<home>/config.yaml`` into the vault and write the opt-in marker.
 
@@ -114,9 +123,15 @@ def enable(
     it probes the interpreter that actually runs ``hermes`` (see
     :mod:`...keyvault._runtime_probe`) and refuses (rc 1) when that runtime lacks
     the config-decrypt ``.pth`` hook — otherwise the marker would arm reseal-on-exit
-    and strand Hermes with a config it cannot materialize at startup.
-    ``runtime_probe`` is injectable for tests; ``force_runtime_unverified``
-    bypasses the check (advanced; arms the seal anyway).
+    and strand Hermes with a config it cannot materialize at startup. The same
+    probe is then run against every *running* ``hermes gateway`` interpreter from
+    a different environment, because that is the process which must materialize
+    the config in practice. ``runtime_probe`` is injectable for tests;
+    ``force_runtime_unverified`` bypasses both checks (advanced; arms the seal
+    anyway).
+
+    ``flow_session`` (``encryption enable all``) shares the flow's passphrase,
+    open vault and key policy (see :mod:`._flow_session`).
     """
     from . import vault_cli
 
@@ -137,11 +152,15 @@ def enable(
     if gate != 0:
         return gate
 
-    rc = vault_cli.ensure_initialised(root=root, prompt_io=prompt_io, backend=backend, store=store)
+    rc = vault_cli.ensure_initialised(
+        root=root, prompt_io=prompt_io, backend=backend, store=store, flow_session=flow_session
+    )
     if rc != 0:
         return rc  # could not create the vault (reason already printed)
 
-    rc = vault_cli.add(root=root, name=_CONFIG_NAME, source=config_path, backend=backend, store=store)
+    rc = vault_cli.add(
+        root=root, name=_CONFIG_NAME, source=config_path, backend=backend, store=store, flow_session=flow_session
+    )
     if rc != 0:
         return rc  # vault_cli.add already printed the reason; do NOT write the marker
 
@@ -153,7 +172,10 @@ def enable(
         print(
             "  The decrypt hook is installed here: each Hermes run materializes config.yaml\n"
             "  and reseals it (removes the plaintext) on exit. The marker is now set, so the\n"
-            "  next `hermes` / `hermes-mordred` run seals the current plaintext on exit."
+            "  next `hermes` / `hermes-mordred` run seals the current plaintext on exit.\n"
+            "  Next: run `hermes-mordred encryption status` once. When it exits, the current\n"
+            "  plaintext config.yaml will be resealed and removed. Do not re-run\n"
+            "  `encryption enable config` for this first seal or delete config.yaml manually."
         )
     else:
         print(
@@ -170,13 +192,15 @@ def disable(
     root: Path,
     backend: NativeBackend | None = None,
     store: AnchorStore | None = None,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Remove the opt-in marker and guarantee a readable plaintext config.yaml.
 
     If a managed session had sealed the plaintext away (reseal-on-exit removed it),
     it is decrypted back from the vault first so Hermes keeps a usable config. The
     vault copy is left intact. Returns 0 on success, 1 if the plaintext is missing
-    and the vault cannot be opened to recover it.
+    and the vault cannot be opened to recover it. ``flow_session`` (``uninstall``)
+    lends the flow's already open vault.
     """
     marker = _marker_path(home)
     config_path = home / _CONFIG_NAME
@@ -188,7 +212,7 @@ def disable(
         from ..keyvault import _storage
         from . import vault_cli
 
-        opened = vault_cli._open_hot_path_or_report(root, backend=backend, store=store)
+        opened = vault_cli._open_hot_path_or_report(root, backend=backend, store=store, flow_session=flow_session)
         if opened is None:
             return 1
         with opened:

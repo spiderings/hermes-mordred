@@ -20,22 +20,17 @@ Contract (mirrors PATHS.md §193 "credentials directory"):
 from __future__ import annotations
 
 import errno
-import os
 import re
-import stat
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import NoReturn, Protocol, runtime_checkable
 
-from .policy_writer import _atomic_write_text, _ensure_real_directory, _read_regular_text
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
-    fcntl = None  # type: ignore[assignment]
+from .._config_io import DOTENV_LIMIT, CanonicalPaths, canonical_session
+from .._file_lock import private_flock
+from .policy_writer import _atomic_write_text, _bounded_utf8, _ensure_real_directory, _read_regular_text, _windows
 
 # POSIX env-var name: start with letter/underscore, followed by alnum/underscore.
 # We also require at least one uppercase letter -- Mordred owns the
@@ -43,39 +38,47 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 # names. Restricting at this layer makes the file shell-injection-safe.
 _VALID_ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _ENV_THREAD_LOCK = threading.RLock()
-_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _reject_unopenable_dotenv_lock(lock_path: Path, exc: OSError) -> NoReturn:
+    """Wrap an ``os.open`` failure on the dotenv lock as a tagged ``EPERM``."""
+    raise OSError(errno.EPERM, "dotenv lock is unsafe or unavailable", str(lock_path)) from exc
+
+
+def _reject_unsafe_dotenv_lock(lock_path: Path) -> NoReturn:
+    """Fail closed when ``.env.lock`` is not a private regular file."""
+    raise OSError(errno.EPERM, "dotenv lock must be a mode-0600 regular file", str(lock_path))
 
 
 @contextmanager
 def _dotenv_lock(path: Path) -> Iterator[None]:
-    """Stable sibling lock shared by every Mordred ``.env`` RMW writer."""
+    """Stable sibling lock shared by every Mordred ``.env`` RMW writer.
+
+    The descriptor lifecycle is :func:`mordred_hermes._file_lock.private_flock`;
+    the in-process ``RLock``, the parent-directory check, and both raises stay
+    here so the tagged ``EPERM`` :exc:`OSError`\\ s (and the ``from exc``
+    chaining on the open failure) are unchanged.
+    """
     with _ENV_THREAD_LOCK:
         _ensure_real_directory(path.parent)
-        lock_path = path.with_name(path.name + ".lock")
-        flags = os.O_RDWR | os.O_CREAT | _O_CLOEXEC | _O_NOFOLLOW | _O_NONBLOCK
-        try:
-            fd = os.open(lock_path, flags, 0o600)
-        except OSError as exc:
-            raise OSError(errno.EPERM, "dotenv lock is unsafe or unavailable", str(lock_path)) from exc
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-                raise OSError(errno.EPERM, "dotenv lock must be a mode-0600 regular file", str(lock_path))
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with private_flock(
+            path.with_name(path.name + ".lock"),
+            on_unsafe=_reject_unsafe_dotenv_lock,
+            on_open_error=_reject_unopenable_dotenv_lock,
+        ):
+            yield
 
 
 def update_dotenv_file(path: Path, transform: Callable[[str], str]) -> None:
     """Atomically transform a regular dotenv file under the shared RMW lock."""
+    if _windows():
+        if path.name != ".env":
+            raise ValueError("canonical dotenv filename must be .env")
+        with canonical_session(CanonicalPaths(path.parent), scope="home", create=True) as session:
+            source = session.read_home(".env", max_bytes=DOTENV_LIMIT)
+            updated = transform(source.data.decode("utf-8") if source is not None else "")
+            session.write_home(".env", _bounded_utf8(updated, DOTENV_LIMIT))
+        return
     with _dotenv_lock(path):
         existing = _read_regular_text(path)
         updated = transform(existing if existing is not None else "")
@@ -98,13 +101,16 @@ class DotEnvFileWriter:
     """
 
     def upsert(self, path: Path, *, key: str, value: str) -> None:
-        if not _VALID_ENV_KEY.match(key):
+        if not _VALID_ENV_KEY.fullmatch(key):
             raise ValueError(
                 f"refusing to write env var key {key!r}: must be uppercase, start with letter/underscore, "
                 "and contain only alnum/underscore"
             )
         if "\n" in value or "\r" in value:
             raise ValueError(f"refusing to write env var value with newline in key {key!r}")
+
+        if _windows():
+            _bounded_utf8(value, DOTENV_LIMIT)
 
         def transform(existing: str) -> str:
             new_lines, found = _replace_or_strip_key(existing.splitlines(), key, value)
@@ -133,9 +139,10 @@ def _replace_or_strip_key(lines: list[str], key: str, value: str) -> tuple[list[
     found = False
     prefix = f"{key}="
     for line in lines:
-        if line.startswith(prefix):
+        export = "export " if line.startswith("export " + prefix) else ""
+        if line.startswith(prefix) or export:
             if value and not found:
-                out.append(f"{key}={value}")
+                out.append(f"{export}{key}={value}")
             # subsequent matches dropped (or all matches dropped when value is empty)
             found = True
             continue

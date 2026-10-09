@@ -5,7 +5,7 @@ skill declares ``network_requirements: tor``, and this probe is the
 network operation that declaration is *about*. It exists so the
 integration test ``tests/integration/test_tor.py::TestTorSkillEndToEnd``
 can prove — end to end — that a Tor-declared skill's traffic actually
-exits through Tor once ``hermes mordred network use tor`` is active.
+exits through Tor once ``hermes-mordred network use tor`` is active.
 
 It is a **test fixture**, not shipped Mordred code. It deliberately lets
 :mod:`httpx` read proxy configuration from the process environment

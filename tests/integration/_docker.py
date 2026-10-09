@@ -114,8 +114,8 @@ def skip_reason_if_unavailable() -> str | None:
 
     The order matters — we check the explicit opt-out first so dev
     machines with docker installed but no daemon running can still
-    short-circuit, then OS (Windows is not in the v1 Mordred matrix
-    per TODO §3.1 L317), then the binary itself.
+    short-circuit, then OS (Windows is outside the supported matrix), then the
+    binary itself.
     """
     if os.environ.get(_SKIP_ENV_VAR) == "1":
         return f"{_SKIP_ENV_VAR}=1"

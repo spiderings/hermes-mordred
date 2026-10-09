@@ -60,9 +60,7 @@ class TestDigestMatchSucceeds:
 
 class TestDigestMismatchRefuses:
     def test_off_by_one_byte_digest_raises_recovery_digest_mismatch(self, valid_blob: bytes) -> None:
-        """PLAN.md L579 cross-machine recovery test: a 1-byte off
-        passphrase / PoW transcription produces an off-by-one digest
-        that must reject."""
+        """A one-byte transcription error produces a digest mismatch."""
         from mordred_hermes.keyvault import recovery
 
         with pytest.raises(recovery.RecoveryDigestMismatch):

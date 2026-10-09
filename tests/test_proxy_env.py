@@ -1,6 +1,6 @@
 """Tests for ``mordred_hermes.network.proxy_env``.
 
-Pure function module — no ``os.environ`` mutation here; PR2 ``runtime`` is
+Pure function module — no ``os.environ`` mutation here; the network runtime is
 the sole writer. Tests cover:
 
 - Clearnet/VPN: no proxy variables set (HTTPS_PROXY etc. absent from returned dict).
@@ -12,10 +12,8 @@ the sole writer. Tests cover:
   while preserving insertion order.
 - Tor uses the supplied port (shift 9050 → 9150 is honored).
 - The ``socks5h://`` (DNS server-side) scheme is used, not ``socks5://``.
-- ``managed_var_names()`` enumerates every env var the module touches —
-  PR2 ``runtime`` uses it to know which keys to remove on path switches.
-
-See TODO §3.1 L315-317.
+- ``managed_var_names()`` enumerates every env var the module touches so the
+  runtime knows which keys to remove on path switches.
 """
 
 from __future__ import annotations
@@ -211,7 +209,7 @@ class TestSocks5hLibraryAllowlist:
             assert lib in SOCKS5H_LIBRARY_REQUIREMENTS, f"baseline missing {lib}"
 
     def test_every_entry_is_verified(self) -> None:
-        """TODO §0.8 L118-122: every allowlist entry is empirically backed by
+        """Every allowlist entry is empirically backed by
         ``tests/integration/test_socks5h_libs.py`` — the live SOCKS5h
         verification clears ``unverified_baseline`` once a library is covered."""
         from mordred_hermes.network.proxy_env import SOCKS5H_LIBRARY_REQUIREMENTS

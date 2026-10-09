@@ -51,7 +51,8 @@ from mordred_hermes.wizard.network_cli import (
     handle_init,
     run_init,
 )
-from mordred_hermes.wizard.policy_writer import PolicyWriter
+
+from ._helpers import _writer
 
 # --------------------------------------------------------------------------- #
 # Test doubles                                                                #
@@ -145,14 +146,6 @@ class _SpyCredentialsWriter:
         mullvad_killswitch: bool,
     ) -> None:
         self.calls.append((path, mullvad_account_id_env, mullvad_relay_country, mullvad_killswitch))
-
-
-def _writer(tmp_path: Path) -> PolicyWriter:
-    return PolicyWriter(
-        config_path=tmp_path / "config.yaml",
-        policy_json_path=tmp_path / "mordred" / "policy.json",
-        mordred_dir=tmp_path / "mordred",
-    )
 
 
 # Per-route scripted answer sets, in prompt order. Prompts are gated on the
@@ -454,8 +447,8 @@ class TestRunInitPersistsConfig:
         assert section["tor_socks_port"] == 9050
         assert section["mullvad_relay_country"] == "jp"
         assert section["mullvad_killswitch"] is True
-        # Atomic-write contract: PolicyWriter adds the Mordred plugin names.
-        assert "mordred_network" in data["plugins"]["enabled"]
+        # Atomic-write contract: PolicyWriter enables the Mordred plugin.
+        assert "mordred" in data["plugins"]["enabled"]
 
     def test_merge_preserves_unrelated_fields(self, tmp_path: Path) -> None:
         config = tmp_path / "config.yaml"

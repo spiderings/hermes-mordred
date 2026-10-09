@@ -76,3 +76,59 @@ def test_clear():
     extension_history.save_messages([{"role": "user", "content": "x"}])
     extension_history.clear()
     assert extension_history.load_messages() == []
+
+
+def test_no_history_is_reported_as_empty_not_undecryptable(monkeypatch):
+    monkeypatch.setattr(extension_history, "_undecryptable_warned", False)
+
+    loaded = extension_history.load_history()
+
+    assert loaded.messages == []
+    assert loaded.status == "empty"
+    assert loaded.undecryptable is False
+    assert extension_history.load_messages() == []
+
+
+def test_readable_history_is_reported_as_ok(monkeypatch):
+    monkeypatch.setattr(extension_history, "_undecryptable_warned", False)
+    extension_history.save_messages([{"role": "user", "content": "hello"}])
+
+    loaded = extension_history.load_history()
+
+    assert loaded.messages == [{"role": "user", "content": "hello"}]
+    assert loaded.status == "ok"
+    assert loaded.undecryptable is False
+
+
+def test_undecryptable_history_is_distinguishable_and_warned_once(tmp_path, monkeypatch, caplog):
+    """After re-pairing the stored blob no longer decrypts. That is a different
+    outcome from "no history" and must not be silently rendered as an empty
+    conversation."""
+    monkeypatch.setattr(extension_history, "_undecryptable_warned", False)
+    extension_history.save_messages([{"role": "user", "content": "secret-text"}])
+    history_file = tmp_path / "extension" / "history.enc"
+    history_file.write_text(history_file.read_text("utf-8")[:-8] + "AAAAAAAA", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="mordred_hermes.extension.history"):
+        first = extension_history.load_history()
+        second = extension_history.load_history()
+
+    assert first.messages == [] and second.messages == []
+    assert first.status == "undecryptable" and second.status == "undecryptable"
+    assert first.undecryptable is True
+    assert extension_history.load_messages() == []  # legacy callers unchanged
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "undecryptable" in warnings[0].getMessage()
+
+
+def test_projection_reports_the_load_status(monkeypatch, tmp_path):
+    monkeypatch.setattr(extension_history, "_undecryptable_warned", False)
+    extension_history.save_messages([{"role": "user", "content": "q"}])
+    history_file = tmp_path / "extension" / "history.enc"
+    history_file.write_text("🔒ENC:v1:not-a-real-envelope", encoding="utf-8")
+
+    projection = extension_history.projected_history()
+
+    assert projection.turns == []
+    assert projection.status == "undecryptable"

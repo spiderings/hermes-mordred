@@ -1,8 +1,8 @@
 """Phase 4 PR4 step-E RED — ``api.export_backup`` / ``api.import_backup``.
 
 Implementation lands in step-E GREEN. The ciphertext-rewrap manifest
-contract is frozen in SPEC.md §"export_backup / import_backup
-(ciphertext-rewrap manifest, codex BLOCKER #1)" (L768-897):
+contract is defined in SPEC.md §"export_backup / import_backup
+(ciphertext-rewrap manifest, codex BLOCKER #1)":
 
 - ``export_backup`` walks every ``.gcm`` envelope, unwraps each DEK,
   re-encrypts the plaintext under a *portable* manifest AAD (no per-device

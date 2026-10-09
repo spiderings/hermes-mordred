@@ -1,14 +1,7 @@
-"""Phase 3 step-0 freeze of ``network.*`` audit reason codes.
+"""Tests for the ``network.*`` audit reason codes.
 
-Per ``docs/dev/TODO.md`` L13:
-
-    "Phase 3/4 codes (``network.*``, ``keyvault.*``) are intentionally NOT
-    included [in the Phase 1 12-code freeze] — each phase's step-0 freeze
-    adds its own codes alongside the SPEC.md update."
-
-Phase 3 PR1 adds 4 codes to the central ``privacy_check._audit_reasons.ReasonCode``
-``Literal`` (single source of truth, referenced from every plugin's audit
-emit site):
+The central ``privacy_check._audit_reasons.ReasonCode`` Literal is the typed
+source of truth used by every plugin's audit emit sites. Network reasons cover:
 
 - ``network.use`` — successful path switch via ``api.use(path)``. Decision
   ``override``. Fields: ``prev_path`` / ``new_path`` / ``live_subprocess_count``
@@ -23,11 +16,8 @@ emit site):
   failures. Decision ``block`` (strict) / ``warn`` (lenient). Fields:
   ``path`` / ``consecutive_failures`` / ``last_health_at``.
 
-Naming normalized to dotted form (``network.use`` rather than ``network_use``
-as in TODO.md L331) to match the existing ``policy.*`` / ``mordred.*``
-convention. The deviation is documented in POLICY.md.
-
-Total freeze after PR1: 12 (Phase 1) + 4 (Phase 3) = 16 codes.
+Names use dotted form (``network.use``, not ``network_use``), consistently with
+the ``policy.*`` and ``mordred.*`` families documented in POLICY.md.
 """
 
 from __future__ import annotations
@@ -96,7 +86,8 @@ def test_total_freeze_size_after_transport_gate_followup() -> None:
     (mordred.degraded.audit_encryption_unavailable) + 2 prompt-once
     (policy.strict.cloud_prompted_allow / _deny) + 1 Phase 3 transport-gate
     follow-up (network.transport_incompatible) + 1 strict cloud endpoint
-    binding follow-up (policy.strict.cloud_endpoint_mismatch) = 31.
+    binding follow-up (policy.strict.cloud_endpoint_mismatch) + 1 tool-egress
+    levels (policy.egress.tool_blocked) = 32.
 
     The §4.1 codes graduated into the freeze because their emit site —
     ``install_wrapper.run``'s ``requires_keyvault`` enforcement — exists.
@@ -110,12 +101,11 @@ def test_total_freeze_size_after_transport_gate_followup() -> None:
     """
     from mordred_hermes.privacy_check._audit_reasons import ReasonCode
 
-    assert len(get_args(ReasonCode)) == 31
+    assert len(get_args(ReasonCode)) == 32
 
 
 def test_no_underscore_typo_legacy_name() -> None:
-    """Catch the TODO.md L331 ``network_use`` form (deviates from dotted
-    convention). PR1 normalized to ``network.use``."""
+    """Reject the old underscore spelling; dotted names are canonical."""
     from mordred_hermes.privacy_check._audit_reasons import ReasonCode
 
     members = set(get_args(ReasonCode))

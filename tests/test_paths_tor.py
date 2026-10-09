@@ -10,9 +10,8 @@ Subprocess is fully mocked — no real ``tor`` binary touched. Tests cover:
 - ``stop()`` calls ``terminate()``, waits grace, then ``kill()``
 - ``health()`` reports ``False`` once the subprocess has exited
 
-PR1 keeps ``health()`` deliberately shallow (process alive vs not).
-The richer control-port circuit-status probe lands in PR2 alongside the
-``stem`` dependency (TODO §3.1 L300).
+The shallow `health()` process check and the richer optional ControlPort
+circuit-status probe are tested separately.
 """
 
 from __future__ import annotations

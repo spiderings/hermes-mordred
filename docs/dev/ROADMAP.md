@@ -220,8 +220,13 @@ session, bound by QR and a short expiry.
 
 ### v2-F8: `config.yaml` at-rest transparent decryption
 
-Complete. Transparent config decryption ships as an explicit opt-in and will
-not become the default. Future work belongs in bug fixes, not this roadmap item.
+Complete; the current opt-in contract and plaintext working-file limitation
+live in [`SPEC.md`](./SPEC.md) and [`PATHS.md`](./PATHS.md).
+
+### v2-F9: agent-memory at-rest encryption
+
+Complete; the shipped runtime contract lives in [`SPEC.md`](./SPEC.md), and its
+live Apple Silicon result is recorded in [`CI.md`](./CI.md).
 
 ## v3+ candidates: Payment layer
 

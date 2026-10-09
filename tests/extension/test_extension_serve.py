@@ -85,11 +85,6 @@ assert "extension` extra" not in stderr.getvalue()
 """
 
 
-@pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))

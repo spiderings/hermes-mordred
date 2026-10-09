@@ -1,6 +1,6 @@
-"""Phase E tests -- Story 1.5 OpenClaw migration (H5 conflict resolution).
+"""Tests for Story 1.5 OpenClaw migration conflict resolution.
 
-H5 row policy table (PATHS.md §OpenClaw migration L286):
+Row policy (PATHS.md §Migration from legacy OpenClaw paths):
 
 | OpenClaw path | New path | Conflict policy |
 |---|---|---|

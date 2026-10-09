@@ -21,8 +21,10 @@ from . import _term
 __all__ = [
     "cli_enable_se",
     "cli_enable_tpm",
+    "cli_enable_winkey",
     "enable_se",
     "enable_tpm",
+    "enable_winkey",
 ]
 
 
@@ -370,3 +372,125 @@ def cli_enable_tpm(args: argparse.Namespace) -> int:
     """
     install_dir = Path(args.install_dir) if getattr(args, "install_dir", None) else None
     return enable_tpm(install_dir=install_dir)
+
+
+# Windows CNG/TPM helper: installation is separate from key provisioning.
+def _missing_winkey_build_tools() -> list[str]:
+    import shutil
+
+    missing = [name for name in ("cargo", "rustc") if shutil.which(name) is None]
+    if shutil.which("powershell.exe") is None and shutil.which("pwsh.exe") is None:
+        missing.append("PowerShell")
+    return missing
+
+
+def _locate_winkey_source() -> Path | None:
+    """Only this installed package, or its exact editable checkout, may supply source."""
+    import importlib.resources
+
+    packaged = Path(str(importlib.resources.files("mordred_hermes"))) / "_native" / "winkey-helper"
+    module = Path(__file__).resolve()
+    checkout = module.parents[3]
+    candidates = [packaged]
+    # No unbounded ancestor search: bind native sources to this package's src tree.
+    if module == checkout / "src" / "mordred_hermes" / "wizard" / "keyvault_native_cli.py":
+        candidates.append(checkout / "native" / "winkey-helper")
+    for candidate in candidates:
+        if all((candidate / name).is_file() for name in ("build.ps1", "Cargo.toml", "Cargo.lock", "src/main.rs")):
+            return candidate
+    return None
+
+
+def _run_winkey_build(src: Path, *, install_dir: Path) -> tuple[int, str]:
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    from .._windows_runtime import scrubbed_environment
+
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    if powershell is None:
+        return 1, "PowerShell executable not found"
+    env = scrubbed_environment(os.environ)
+    env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                # Applies only to this bound-script child process; no host
+                # execution policy is persisted or changed.
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(src / "build.ps1"),
+                "-OwnedInstall",
+                "-InstallDir",
+                str(install_dir),
+                "-Python",
+                sys.executable,
+            ],
+            cwd=str(src),
+            env=env,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, f"winkey-helper build failed: {exc}"
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def _verify_winkey_helper(*, install_dir: Path) -> tuple[bool, str]:
+    """Probe precisely the newly installed file, never an ambient old helper."""
+    from ..keyvault import _seckey_helper
+
+    binary = install_dir / _seckey_helper._WIN_HELPER_NAME
+    if not binary.is_file():
+        return False, "freshly installed helper is missing"
+    try:
+        _seckey_helper._HelperSecKeyOps(str(binary)).probe()
+    except Exception as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def enable_winkey(*, install_dir: Path | None = None, home: Path | None = None) -> int:
+    """Build and probe Windows TPM custody under the existing user token."""
+    import sys
+
+    from .._home import hermes_home
+
+    if sys.platform != "win32":
+        _term.emit_error("Windows CNG TPM helper requires native Windows.")
+        return 1
+    missing = _missing_winkey_build_tools()
+    if missing:
+        _term.emit_error(f"missing build tools: {', '.join(missing)}. Install Rust MSVC and Visual C++ Build Tools.")
+        return 1
+    src = _locate_winkey_source()
+    if src is None:
+        _term.emit_error("could not locate packaged native/winkey-helper sources; reinstall a source-complete wheel.")
+        return 1
+    target = install_dir if install_dir is not None else (home if home is not None else hermes_home()) / "bin"
+    rc, output = _run_winkey_build(src, install_dir=target)
+    if rc:
+        _term.emit_error(f"winkey-helper build failed (exit {rc}):\n{output}")
+        return 1
+    ok, reason = _verify_winkey_helper(install_dir=target)
+    if not ok:
+        _term.emit_error(f"Windows TPM probe failed: {reason}. No hardware readiness or software fallback is claimed.")
+        return 1
+    print(
+        "Windows TPM helper installed and hardware probe succeeded under the current user token. "
+        "Machine-bound custody has no per-use presence; memory encryption requires its own enable flow."
+    )
+    return 0
+
+
+def cli_enable_winkey(args: argparse.Namespace) -> int:
+    install_dir = Path(args.install_dir) if getattr(args, "install_dir", None) else None
+    return enable_winkey(install_dir=install_dir)

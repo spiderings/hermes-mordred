@@ -1,1328 +1,1978 @@
 # Mordred — Specification (Hermes-base)
 
-> **Note**: This SPEC is the specification for Mordred, built on `Hermes (NousResearch/hermes-agent)`.
-> The previous OpenClaw-based spec remains at `../../mordred/mordred-mvp-docs/SPEC.md` (deprecated).
-> See `MIGRATION.md` for the rationale behind the move to Hermes and the terminology mapping.
+This document defines the behavior shipped by `hermes-mordred`. It describes
+the current contract, not the sequence of pull requests that produced it.
+Implementation details may evolve, but security boundaries, persistent wire
+formats, and public behavior must stay consistent with this specification or
+change here in the same patch.
 
 ## Vision
 
-**Provide a privacy-enhancement layer on top of Hermes as a plugin bundle**.
+Mordred adds privacy-oriented policy, route selection, local-LLM enforcement,
+hardware-backed key handling, at-rest protection, and an end-to-end browser
+extension gateway to an ordinary Hermes installation. It is a cooperative
+control layer inside the Hermes process, not an operating-system sandbox and
+not a claim that every program run by the same user is contained.
 
-Mordred is built on the principle of fully leveraging Hermes's plugin SDK and existing capabilities (4 plugin source types, 16 lifecycle hooks, and the registration API via `PluginContext`) without modifying core (independent as a plugin development repository). The privacy layer is distributed as **6 plugins + 1 skill-metadata convention**.
-
-Users can install it with just `pip install hermes-mordred`, and configure/operate it via the `hermes-mordred ...` subcommands.
-
-Privacy concerns addressed:
-
-1. **network-path observability** (Phase 3, macOS / Linux / WSL2)
-2. **cloud LLM dependency** (Phase 2, macOS / Linux / WSL2)
-3. **local secret custody at rest** (Phase 4: Secure Enclave with a
-   login-Keychain software fallback on macOS; packaged TPM 2.0 helper on
-   Linux. Linux deliberately has no software-key fallback and fails closed
-   when the TPM helper is unavailable. Windows-native protection remains
-   deferred)
-
-The backend-specific guarantees and remaining platform limitations are made
-explicit at the Vision level. Read them together with §Platform Support and
-§Threat Model (H2).
+The default experience remains usable: an operator can install the package,
+run `hermes-mordred setup`, inspect the resulting state, and opt into
+stricter controls. When a strict boundary cannot establish the evidence it
+needs, it refuses rather than silently claiming protection.
 
 ## Project Identity
 
 ### Relationship to Hermes
 
-- **Upstream**: github.com/NousResearch/hermes-agent (MIT License)
-- **Current repo**: `hermes-mordred/` (the Mordred plugin development repository; not a fork/clone of Hermes upstream)
-- **Strategy**: **Option C + Vendored-fork escape hatch** (zero-PR commitment, finalized in MIGRATION.md §10 row 1 / §5 on 2026-05-07) — Hermes core is left unmodified, and 6 plugins are distributed via `pip install hermes-mordred`. **No PRs are submitted to Hermes upstream**
-  - `hermes-mordred/` requires no upstream rebase (a pure plugin development repository + vendored modules when needed)
-  - The plugins are developed under `src/mordred_hermes/` and exposed via `[project.entry-points."hermes_agent.plugins"]` in `pyproject.toml`; `mordred_e2e` uses the `extension/` package rather than a directory matching its entry-point suffix
-  - What the old SPEC called a "core seam" is instead handled by **plugin-side wrapper + audit log** (the `mordred.degraded.*` family) for defense-in-depth (Tier A, v1 default)
-  - Items that truly need hard enforcement fall under the **vendored fork extra** (Tier B, v2): a patched version of Hermes core modules is redistributed via e.g. `pip install hermes-mordred[hard-lock]`. Out of scope for v1
-- **Compatibility goal**: Existing Hermes users can add the privacy layer with just `pip install hermes-mordred && hermes-mordred upgrade`. Users migrating from OpenClaw follow 3 steps: `hermes claw migrate` → `pip install hermes-mordred` → `hermes-mordred upgrade`
+`hermes-mordred` is a standalone MIT-licensed package that depends on
+`hermes-agent`. It is not a fork or a copy of the upstream repository. It
+ships one `hermes_agent.plugins` entry point, `mordred`
+(`mordred_hermes.plugin`), which registers the components listed under
+[What Mordred Adds](#what-mordred-adds-one-plugin-six-components). Releases up
+to 0.1.0a20 shipped each component as its own entry point (`mordred_network`,
+`mordred_privacy_check`, `mordred_llm_guard`, `mordred_keyvault`,
+`mordred_wizard`, `mordred_e2e`); config writers migrate those names in
+`plugins.enabled` / `plugins.disabled` to `mordred`.
+
+Hermes core stays unmodified and Mordred does not submit upstream pull
+requests. [`UPSTREAM.md`](./UPSTREAM.md) owns that relationship and the
+compatibility policy.
 
 ### Platform Support (v1)
 
-| Phase | Platform |
-|-------|-------------------|
-| Phase 1-3 (network/privacy-check/llm-guard/wizard) | **macOS / Linux / WSL2** (every environment Hermes runs on) |
-| Phase 4 (keyvault, macOS) | Secure Enclave on supported Macs, with a software P-256 key in the login Keychain as the fail-safe fallback |
-| Phase 4 (keyvault, Linux) | **TPM 2.0 MVP complete** via the packaged `mordred-hermes-tpmkey` helper; machine-bound and fail-closed, with no software fallback |
-| Phase 4 (keyvault, Windows native) | Deferred (DPAPI / TPM; ROADMAP `v2-OS2`) |
-
-iOS / Android: Hermes itself has Termux support, but Mordred Phase 4
-(keyvault) remains out of scope there. Only Phase 1-3 can run under Termux
-(Tor requires additional verification).
+- Python 3.11 or newer is required. CI exercises Python 3.11 through 3.13.
+- macOS and Linux support the policy, network, CLI, and extension layers.
+- On macOS, the preferred native key backend is the installed Secure Enclave
+  helper. An entitled in-process Security-framework backend and a
+  login-Keychain software P-256 namespace remain ordered compatibility
+  fallbacks.
+- On Linux, the keyvault requires the installed TPM 2.0 helper and fails
+  closed if it is absent or unusable. There is no Linux software-key fallback.
+- Transparent `.env` injection, `config.yaml` materialize/reseal, agent-memory
+  at-rest encryption, and the encrypted workspace integration are active only
+  on macOS. Off macOS they may be enrolled, but status reports them inactive
+  and plaintext remains the runtime source.
+- Arming those macOS seals is fail-closed on the runtime: before removing a
+  plaintext, the CLI probes the interpreter that should run `hermes` and also
+  the interpreter of each `hermes gateway run` process it can identify in the
+  process table, refusing when either cannot run the startup shim. Identifiable
+  means: this user's process whose argv is `<python> -m hermes_cli… gateway
+  run`, `<python> <launcher> gateway run`, `<launcher> gateway run`, or
+  `<shell> <launcher> gateway run`, with an absolute launcher path. Gateways
+  running under another account, or argv shapes outside that set, are not
+  probed. A scan that finds nothing is not a refusal, and
+  `--force-runtime-unverified` seals without either check.
+- The `config` target protects `config.yaml` between managed process runs, not
+  throughout a run. Its startup hook materializes a mode-`0600` plaintext file
+  for the managed process lifetime and reseals it on clean exit; an unclean
+  exit can leave that working copy until the next managed start and exit.
+- File-vault `vault recover` is supported only on macOS. The Linux TPM helper
+  implements native wrapping, but the file vault has no Linux device-anchor
+  store and must not claim a working recovery hot path there.
+- Windows product support is in development under the completion contract
+  below; it is not yet a supported end-to-end workflow. Mobile support remains
+  deferred. Injected-backend tests alone do not establish platform support.
 
 ### License Note
 
-Hermes is MIT-licensed. Forking, commercial use, and derivative products are permitted. Mordred itself is distributed under MIT as well.
+This repository is MIT licensed. Dependencies and optional native tooling keep
+their own licenses; release review must preserve attribution and avoid copying
+Hermes source into this package.
 
 ## Threat Model & Accepted Limitations
 
-Mordred defends against:
+Mordred is designed for a cooperative Hermes process on a host whose operator
+controls the account. It protects policy decisions and stored material against
+common misconfiguration, accidental clearnet use through integrated routes,
+and loss of plaintext files at rest. It does not create a hostile-code
+security boundary.
 
-- **Network observers** (ISP, hostile Wi-Fi, local-network adversaries) — addressed by `mordred_network` (Tor / VPN paths)
-- **Cloud LLM operators** seeing prompts and outputs — addressed by `mordred_llm_guard` redirecting to a local-only provider under strict policy
-- **Accidental cloud egress** when a user thinks they are local-only — addressed by `mordred_llm_guard` unconditional override under strict policy
-- **At-rest secret theft** — addressed by `mordred_keyvault`: local seeds,
-  backups, audit logs, and signing material are encrypted with AES-GCM
-  data-encryption keys (DEKs). The wrapping key is protected by Secure Enclave
-  or the login-Keychain fallback on macOS, and by a non-extractable TPM P-256
-  key on Linux. These backends protect key unwrapping; they do not run AES
-  itself. Windows-native DPAPI/TPM support remains deferred
+Current defenses include:
 
-Mordred does **not** defend against:
+- policy-gated skill installation through `hermes-mordred install`;
+- generic strict runtime blocking for known network tools on clearnet;
+- Tor/VPN route lifecycle and provider-transport compatibility checks;
+- strict LLM identity and endpoint checks immediately before primary egress,
+  plus dedicated guards for Hermes auxiliary LLM clients;
+- strict startup refusal when a required Mordred sibling plugin is disabled;
+- purpose-bound envelope encryption and native-key authorization;
+- encrypted audit records when a keyvault-backed writer is available; and
+- loopback-only, paired, encrypted browser-extension transport; and
+- a read-only Telegram importer (see [Telegram import](#telegram-import)); and
+- tool-egress levels (`lockdown` / `search` / `ask` default / `blocklist` / `off`)
+  enforced in `privacy_check`'s `pre_tool_call`: free-form code tools are
+  refused below `blocklist` except exact first-party read-only commands,
+  unknown tools count as internet-capable, and a session that read private
+  data is locked down (taint).
 
-- **Malicious skills with truthful metadata** — a skill declaring `network_requirements: clearnet` and being allowed by lenient policy can exfiltrate freely
-- **Malicious skills with lying metadata** — Mordred has no skill-metadata signing or integrity verification in v1
-- **Local malware / co-resident processes** — `HTTPS_PROXY` env injection is bypassable by direct `connect()` from any process on the same machine. Closing this requires OS-level process isolation (seccomp / sandbox-exec / Endpoint Security), out of reach for the plugin layer (v2)
-- **`PATH` hijack of the sekey/tpmkey/winkey helper binary** — `_seckey_helper._find_named_helper()`'s third resolution tier (`shutil.which(name)`, after the `MORDRED_*_HELPER` env override and `~/.local/bin`) trusts whatever the process's `PATH` resolves to. An attacker who can already prepend a writable directory to the user's `PATH` could plant a binary that intercepts the JSON-over-stdio protocol. This requires the same "attacker can already alter the victim's shell environment" precondition as the co-resident-process item above, and the two supported install paths (env var, `~/.local/bin`) are unaffected; kept as v1 accepted risk rather than removing the documented `PATH` fallback (2026-07-07 security review)
-- **Skills Hub / agentskills.io registry compromise** — Mordred trusts the registry; no separate signature chain
-- **Side-channel timing / traffic analysis** even on Tor
-- **Silent plugin-disable** (H3, a v1 mitigation under the zero-PR strategy) — because the policy is to submit no PRs to Hermes upstream (MIGRATION.md §10 row 4), the v1 default is defended via plugin-side **strict-mode startup refusal** (Tier A, see §Plugin-disable protection below). Since the design is to "block at next session start," editing the disable state while a session is running has no effect until the next startup (on the premise that Hermes does not reflect dynamic disablement live, verified in Phase 0.8). Hard enforcement (refusing the disable operation itself) is handled by the v2 `[hard-lock]` extra (vendored fork)
-- **Audit-log tampering by attacker with write access as the user** — file mode `0600` is access control, not tamper evidence. Any process running as the user can rewrite history with no detectable trace until Phase 4's HMAC-chain upgrade (v2; PATHS.md §Audit log policy)
-- **Air-gap enforcement beyond the standard network stack** — `mordred_network.api.blackout_assert()` detects routable interfaces only; physical air-gap (Bluetooth/USB tethering, hotspot, kernel-level adversaries) remains user responsibility (M4)
-- **Screen recording during Seed display** — the 60-second Seed window can be captured by macOS `screencapture`, Loom, Zoom share, OBS, etc. v1 does best-effort screenshot detection only; screen-recording detection is out of scope (M5)
+Accepted limitations include:
 
-These limitations are explicit; mitigation work is v2+ scope.
+- tool-egress control acts on tool calls, not sockets: under `blocklist` a
+  `terminal` command can still reach any host not named in the blocklist, and
+  a Hermes feature that sends data without a tool call (cron `no_agent`
+  scripts, platform delivery, external ACP delegates) is outside the hook;
+
+- a skill can open a direct socket or invoke an unwrapped executable;
+- Hermes does not provide trusted `origin_skill` provenance to
+  `pre_tool_call`, so runtime policy is tool-based rather than per-skill;
+- provider or transport metadata supplied by an untrusted component can lie;
+- same-UID malware can inspect process memory, modify local files, or remove
+  audit history;
+- plaintext necessarily exists while a secret is in use, and screen-capture
+  detection cannot defeat a physical camera;
+- traffic emitted by a parent harness such as Codex CLI, Claude CLI, Cursor,
+  or an ACP client bypasses Hermes plugin hooks;
+- if the Mordred plugin and the packaged interpreter-startup guard are
+  removed, plugin-only enforcement no longer runs;
+- helper discovery through writable PATH locations is not equivalent to
+  signed-distribution attestation; and
+- wallet signing and payment authorization are not isolated into a separate
+  privilege domain; and
+- the Telegram session is a full MTProto account credential (Telegram has no
+  scoped or read-only token). Read-only behavior is enforced by the client,
+  not by Telegram, and same-UID malware that can open the vault hot path can
+  use the session.
+
+### Telegram import
+
+Linux enablement is proposed in the
+[Linux private Telegram design](#linux-private-telegram-design).
+That draft does not change the current macOS-only agent-memory requirement;
+the TPM credential backend alone is not full Linux Telegram support.
+
+The optional `telegram` extra lets the operator import their **own** Telegram
+account (MTProto user session via Telethon) and ask questions over it from the
+browser extension, using a Venice.ai private model.
+
+- **Custody (TEE).** API credentials, the Telethon `StringSession`, the
+  archive key and the LLM API key are sealed in `credentials.sealed` under a
+  data key wrapped (keyvault ECIES, `wrap.wrap_dek`) by a P-256 key inside the
+  Secure Enclave (Linux: TPM). The backend is the signed hardware helper only
+  — no software-key namespace, no legacy fallback — so without
+  `keyvault enable-se` every read and write fails with `tee_unavailable`.
+  Every unseal is a fresh Enclave ECDH (nothing decrypted is cached); the key
+  requires Touch ID / passcode per use unless created with `--no-touch-id`.
+  The sealed file is not the vault `.env`, so nothing is ever injected into a
+  Hermes process environment. The 2FA password is never stored.
+- **Plaintext in memory only.** Messages are AES-256-GCM encrypted on disk;
+  processes that unseal credentials disable core dumps, deny debugger attach
+  (`PT_DENY_ATTACH`), and cap Telethon logging at WARNING. Status polls use a
+  non-secret flags file and never unseal.
+- **Destinations.** Imported text goes only to Venice (fixed
+  `https://api.venice.ai/api/v1`, `private` models) or to a loopback model
+  (`telegram local-llm`, literal `127.0.0.1`/`::1`, no proxy). Redirects are
+  never followed. No other endpoint is configurable.
+- **Read-only.** Every request is checked against an allowlist of reads before
+  Telethon resolves or queues it, both at `TelegramClient._call` and at the
+  MTProto sender's `send`. Sending, editing, deleting, reacting,
+  `messages.ReadHistory`, `account.UpdateStatus`, media download (`upload.*`)
+  and cross-DC exported senders are refused. Auth requests are unlocked only
+  inside the interactive `telegram login`; `auth.LogOut` only inside
+  `telegram logout`. Telethon's update machinery is disabled (`_on_login`
+  seeds state from `updates.GetState` only; no update loop), so no
+  `updates.GetDifference` traffic is needed. A second `telegram login` is
+  refused while a session exists, and a login that fails after Telegram
+  accepted it revokes the new authorization.
+- **At rest.** `<home>/mordred/telegram/` holds an index plus AES-256-GCM
+  segment files of up to 2000 messages per chat (a sync rewrites only the last
+  segment). Separate HKDF subkeys of `store_key` encrypt and name files; the
+  AAD binds each blob to its logical name and file names are an HMAC of chat id
+  and segment number. File counts and sizes remain observable.
+- **Egress.** Telegram and Venice resolve one explicit route through
+  `extension.egress` (shared with Discord): Tor requires a loopback SOCKS proxy
+  with remote DNS; VPN without a live runtime is refused.
+- **Questions.** Only Venice models whose live catalog entry has
+  `model_spec.privacy == "private"` are used; `anonymized` models, unknown
+  models and an unreadable catalog fail closed. The request carries no tools,
+  disables web search and Venice's system prompt, and runs the llm_guard
+  `check_runtime_provider(active_provider="venice")` gate first. Only a
+  bounded selection is sent, pseudonymized by default (sender names, chat
+  titles, e-mail addresses, phone numbers become aliases mapped back locally;
+  alias brackets in message text are neutralized so text cannot forge one),
+  inside a delimiter message text cannot close. Names mentioned inside message
+  text and the question itself are sent as written.
+- **Wire.** Account label, chat titles and answer chunks are sealed with
+  `K_extchat`; the question must arrive sealed. Numeric chat ids, counts and
+  dates travel unsealed over the loopback socket. Each question runs as its
+  own task (at most two per socket) and `telegram_ask_cancel` or a closed
+  socket stops it. Page sessions cannot reach the Telegram handlers.
+- **Hermes tools.** The `mordred` plugin's e2e component registers `telegram_chats` / `telegram_ask`
+  (toolset `mordred_telegram`). `check_fn` offers them only when the
+  configured Hermes model is Venice or loopback; each call re-checks the
+  running agent's `model`/`base_url` and, for Venice, requires
+  `model_spec.privacy == "private"` from the public catalog before unsealing
+  anything. Results carry an untrusted-content note.
+- **Not covered.** Secret chats (device-bound E2EE), media contents, and
+  sending messages. Venice E2EE (TEE-attested) models are a planned follow-up.
+
+The remaining hardening work is tracked as release gates in
+[`ROADMAP.md`](./ROADMAP.md), especially OS1 and P1. Documentation must not
+describe those gates as current protection.
 
 ### Newly defended via Hermes plugin hooks (no core seam needed)
 
-Because Hermes has a broader hook palette than OpenClaw, many items that the old SPEC said "require a core seam" are **achievable with plugins alone**:
+Hermes hooks provide useful cooperative boundaries:
 
-- **Per-tool gating** (e.g. blocking `web_fetch` under strict mode without VPN/Tor active) → implementable via `pre_tool_call`
-- **LLM provider rewrite under strict mode** → **not implementable** via ~~`pre_llm_call`~~ (Phase 0.8 verify complete, [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) §5). Its return value is context-injection only. v1 instead treats `on_session_start` as an audit-only disk pre-check and uses the resolved `provider` in `pre_api_request` for the authoritative refusal (see §Story 4 / §Plugin: `mordred_llm_guard`)
-- **Gateway dispatch policy** → implementable via `pre_gateway_dispatch` (an additional defense layer not present in the old SPEC)
-- **Approval lifecycle observability** → implementable via `pre_approval_request` / `post_approval_response` (strengthened audit for dangerous tool execution)
+- `on_session_start` checks plugin integrity, declared harness state,
+  persisted provider state, auxiliary-guard installation, and route startup;
+- `pre_tool_call` receives `tool_name` and applies the generic clearnet guard;
+- `pre_api_request` receives the resolved `provider` and `base_url` for the
+  primary request, allowing endpoint-bound LLM and transport checks;
+- `on_session_end` performs best-effort route teardown and secret resealing;
+  and
+- `pre_gateway_dispatch` receives `event` and `gateway` for the E2E gateway.
+
+[`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) and
+`tools/hook_payload_contract.json` own the exact consumed fields.
 
 ### Defended via plugin-side strict-mode startup refusal (zero-PR strategy)
 
-- **Silent disablement via `hermes plugins disable mordred_*`** → the v1 default is **plugin-only**: `privacy_lock: true` is a declarative marker on the five manifest-backed plugins, mirrored by the fixed six-entry `SIBLING_PLUGINS` canonical list (including `mordred_e2e`). Each runtime plugin's shared `on_session_start` integrity callback aborts strict-mode startup with `MordredIntegrityRefused(BaseException)` as soon as it detects a disabled entry (see §Plugin-disable protection below). No code discovers or expands the list from the marker. No PR is submitted to Hermes upstream (MIGRATION.md §10 row 4 zero-PR commitment). If hard enforcement is needed, it is handled in v2 via the `[hard-lock]` extra (vendored fork)
+Each runtime sibling registers the shared integrity check. In strict mode, a
+known Mordred plugin recorded as disabled causes
+`MordredIntegrityRefused`, a `BaseException` subclass, at the next session
+start. This deliberately escapes Hermes's ordinary hook error wrapper.
+
+The check is a startup boundary, not a live lock on configuration edits.
+Changing disable state during an already-running session takes effect on the
+next startup. Hard prevention of the disable operation itself is not shipped.
 
 ### Plugin-only fallback for missing seams
 
-When the equivalents of the old SPEC's S2 (`originSkill` in tool_call) and S3 (`resolvedProvider` in model_resolve) are not present in Hermes's payloads, the plugin runs in degraded mode (recording `mordred.degraded.*` in the audit log, and falling back to a generic tool-name allowlist and unconditional override). Because of the zero-PR commitment (`MIGRATION.md` §5, 2026-05-07), **no PR is sent to Hermes upstream**. If it's judged that plugin-only cannot achieve this, we re-evaluate whether to escalate to the v2 vendored fork extra (Tier B, `[hard-lock]`) or make the fallback behavior permanent.
-
-**Out-of-band agent harnesses** (Codex, Claude CLI, Cursor, Copilot, ACP adapter): since Hermes has an ACP adapter, some of these can be handled. Under strict mode, if a harness that Mordred cannot enforce is configured as primary, `hermes-mordred` startup is refused.
+Where Hermes supplies no trusted skill origin, Mordred records
+`mordred.degraded.no_origin_skill` and uses the generic strict tool-name rule.
+Where provider identity cannot be resolved, strict mode blocks/refuses and
+records the relevant degraded and policy reasons. Mordred never treats missing
+evidence as permission and does not claim that these fallbacks contain direct
+network access.
 
 ## Plugin-Only Architecture (zero Hermes core modifications, zero-PR strategy)
 
-The old SPEC's "Core Minimal-Change Policy" was redefined as **zero upstream PR** per **MIGRATION.md §10 row 1 / §5, finalized on 2026-05-07**. No modifications to Hermes core are submitted at all in v1:
+All integration occurs through installed entry points, the standalone
+`hermes-mordred` console script, supported Hermes hooks, narrowly targeted
+runtime guards, and the packaged `.pth` startup files. The `.pth` guards engage
+only for Hermes invocations (or their explicit opt-in environment variables)
+and do not turn Mordred into a replacement Python runtime.
 
-| Old modification proposal | v1 strategy | v2 escape hatch |
-|----------|---------|-------------------|
-| ~~HSeam-1: add `privacy_lock: boolean` to `plugin.yaml` in Hermes upstream~~ | **plugin-side only**: `privacy_lock: true` is kept as a declarative marker, while a fixed six-plugin canonical list drives the shared integrity callback. Strict refusal raises `MordredIntegrityRefused(BaseException)` (§Plugin-disable protection) | Redistribute a vendored fork (a patched version of `hermes_cli/plugins_cmd.py`) via `pip install hermes-mordred[hard-lock]`. Introduced in v2 if hard enforcement becomes necessary |
+`hermes-mordred` is the canonical CLI spelling. The registered Hermes-host
+subcommand is a compatibility alias on versions that discover plugin CLI
+commands; it is not available before the `mordred` plugin is loaded on older
+supported hosts.
 
-**Items that would seem to need core modification run on a plugin-side fallback in v1** (no PRs will be sent in the future either; escape to the v2 vendored fork if necessary):
+### What Mordred Adds (one plugin, six components)
 
-- ~~extension to include `provider_id` / `model_id` in the `pre_llm_call` payload~~ → **Phase 0.8 verify (2026-05-10) complete**: `pre_llm_call` carries only `model`, not `provider`, and its return value is **context-injection only** (provider rewrite is structurally impossible). `pre_api_request` carries provider/model/base_url and discards callback return values, but a `BaseException`-derived refusal still stops egress through Hermes's hook wrapper. See [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) §5. v1 therefore performs an audit-only disk pre-check in `on_session_start`, then authoritatively validates the actual runtime provider in `pre_api_request`
-- ~~extension to include `origin_skill` in the `pre_tool_call` payload~~ → the current consumed Hermes contract does not include `origin_skill` (see [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) §4). Since per-skill policy cannot be implemented via `pre_tool_call`, the install-time `hermes-mordred install` guard that inspects SKILL.md frontmatter is the sole per-skill enforcement path. The runtime hook provides only a generic tool-name guard
-- A pre-install hook at skill install time (`hermes_cli/skills_hub.py`) → create new if needed; until then, substitute with the `hermes-mordred install` wrapper
-- agent process init / shutdown hook → network setup uses plugin `register()` plus an `atexit` finalizer so the process route exists before provider clients and outlives turn/session hooks; other plugins continue to use the existing session hooks where process ownership is not required
+The distribution is `hermes-mordred`; imports remain under `mordred_hermes`.
+Hermes sees one plugin, `mordred`. Its `register()` first installs the shared
+integrity gate on `on_session_start`, then registers the components in this
+order (the table order):
 
-The fields Mordred consumes are defined in `tools/hook_payload_contract.json`
-and explained in [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md). The local compatibility
-test and `.github/workflows/upstream-check.yml` verify both hook names and those
-payload fields against the installed Hermes release and upstream `main`.
+| Component | Module | Current responsibility |
+|---|---|---|
+| `keyvault` | `mordred_hermes.keyvault` | native-key envelopes, recovery primitives, audit encryption, macOS runtime secret lifecycle |
+| `llm_guard` | `mordred_hermes.llm_guard` | `mordred-local` registration, strict provider/endpoint refusal, harness and auxiliary-client guards |
+| `network` | `mordred_hermes.network` | Tor/VPN/clearnet route lifecycle, proxy evidence, health checks, transport gating |
+| `privacy_check` | `mordred_hermes.privacy_check` | install policy, generic runtime tool policy, audit writer, plugin integrity |
+| `e2e` | `mordred_hermes.extension.gateway_plugin` | gateway-side encrypted extension dispatch, signing integration, read-only Telegram tools |
+| `wizard` | `mordred_hermes.wizard` | configuration, migration, status, policy, network, keyvault, vault, encryption, and plugin CLI |
 
-### What Mordred Adds (6 plugins)
-
-All plugins live under `src/mordred_hermes/` and use only the Hermes plugin SDK (`PluginContext`). Distribution is as a single pip package `hermes-mordred`, supporting loading via the `hermes_agent.plugins` entry point.
-
-> **Naming convention — read before copying any code path from this document.**
-> Throughout this SPEC, `mordred_network`, `mordred_keyvault`, … are **entry-point
-> names**, not importable modules. They are the plugin identities Hermes sees (and
-> what you list under `plugins.enabled` in `config.yaml`). The **import path is
-> different** — everything ships inside the single `mordred_hermes` package. So a
-> reference like `mordred_keyvault.api.encrypt(...)` or
-> `mordred_llm_guard/local_adapter.py` designates the *keyvault plugin's* `api`
-> module, importable as `mordred_hermes.keyvault.api`. `import mordred_keyvault`
-> raises `ModuleNotFoundError`.
->
-> | Entry-point name | Import path (`pyproject.toml` `[project.entry-points."hermes_agent.plugins"]`) |
-> |---|---|
-> | `mordred_network` | `mordred_hermes.network` |
-> | `mordred_privacy_check` | `mordred_hermes.privacy_check` |
-> | `mordred_llm_guard` | `mordred_hermes.llm_guard` |
-> | `mordred_keyvault` | `mordred_hermes.keyvault` |
-> | `mordred_wizard` | `mordred_hermes.wizard` |
-> | `mordred_e2e` | `mordred_hermes.extension.gateway_plugin` |
-
-1. **`mordred_network`** — process-scoped route selection across Tor / VPN / Clearnet. Activates and freezes the route before provider construction, then manages child-process lifecycle (`tor`/`arti`/Mullvad WireGuard CLI) via Python `subprocess` until process exit. Provides proxy environment-variable injection (`HTTPS_PROXY`, `ALL_PROXY`, etc.) and an internal Python API (`mordred_network.api.use`, `status`, `blackout_assert`); changing a frozen route requires restart.
-2. **`mordred_privacy_check`** — privacy policy enforcement at two checkpoints:
-   - **Skill install guard**: while there's no pure hook available, policy is decided by reading `metadata.mordred.network_requirements` from the frontmatter via the `hermes-mordred install <skill>` wrapper CLI. Migrates to a hook-based approach once Hermes adds an install hook in the future
-   - `pre_tool_call` — generic per-tool policy (e.g. blocking `web_fetch` over Clearnet under strict mode). Per-skill policy too if `origin_skill` is present in the payload; otherwise just a tool-name allowlist
-3. **`mordred_llm_guard`** — registers `mordred_llm_guard/local_adapter.py` as a Hermes provider adapter + provider override under strict mode via the `pre_llm_call` hook. Turns a local OpenAI-compatible endpoint (LM Studio / Ollama / vLLM) into a synthetic provider as `mordred-local`
-4. **`mordred_keyvault`** — AES key wrapping backed by Secure Enclave or the
-   login Keychain on macOS and TPM 2.0 on Linux. Operated from the
-   `hermes-mordred keyvault ...` CLI subtree
-5. **`mordred_wizard`** — owns the canonical `hermes-mordred ...` command tree
-   and registers the same handlers with Hermes as an optional compatibility
-   surface. Oversees all CLI for configure / upgrade / install / network /
-   policy / audit / keyvault
-6. **`mordred_e2e`** — gateway messaging E2E enforcement from the `extension/` package: decrypts authenticated inbound envelopes, records reply context, and re-encrypts outbound Slack/Discord replies
+A component whose `register()` raises an ordinary exception is contained: its
+registrations are disposed, the others still register, and the integrity gate
+reports it as `mordred/<component>` (strict: refuse the session; lenient/off:
+warn), exactly as a failed separate plugin was reported before. Deliberate
+fail-closed refusals (`BaseException`) propagate and stop startup. Settings
+stay in the `plugins.mordred_network`, `plugins.mordred_privacy_check`, and
+`plugins.mordred_llm_guard` sections of `config.yaml`.
 
 ### Conventions (not plugins)
 
-- **Mordred skill metadata** — additive privacy fields under the `metadata.mordred.*` namespace (e.g. `metadata.mordred.network_requirements`, `metadata.mordred.requires_keyvault`). Since the namespace is separate from Hermes/agentskills.io's standard frontmatter, there's no conflict. Hermes's own skill loader does not interpret `metadata.mordred.*` (the privacy-check plugin re-parses SKILL.md to make the determination).
+`<home>` means the active profile-aware Hermes home, normally `~/.hermes`.
+Policy values, audit reason strings, filesystem ownership, and hook payloads
+are shared contracts rather than independent plugins. Their canonical maps
+are [`POLICY.md`](./POLICY.md), [`PATHS.md`](./PATHS.md), and
+[`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md).
 
 ### What Mordred Inherits from Hermes (never modified)
 
-- Full CLI surface: `hermes`, `hermes model`, `hermes tools`, `hermes config`, `hermes gateway`, `hermes setup`, `hermes claw migrate`, `hermes update`, `hermes doctor`, `hermes plugins`, `hermes skills`, `hermes logs`, etc.
-- The `~/.hermes/config.yaml` configuration format (YAML) and `~/.hermes/.env` (API keys)
-- Profile-aware path resolution via `get_hermes_home()`
-- Messaging gateway (Telegram, Discord, Slack, WhatsApp, Signal, iMessage, Email, ACP, etc.)
-- Skills Hub (built-in) and the agentskills.io standard
-- Plugin loader (4 sources: bundled / user / project / pip entry-point)
-- Plugin lifecycle hooks (16 types, `hermes_cli/plugins.py:VALID_HOOKS`)
-- Provider adapter system (`agent/anthropic_adapter.py`, `bedrock_adapter.py`, etc.)
-- Subagent system (`subagent_stop` hook + `delegate_task` tool)
-- Cron scheduler (`cron/`)
-- Memory system (`plugins/memory/`, honcho/mem0/supermemory)
-- Context engine (`plugins/context_engine/`)
-- Terminal backends (local/docker/ssh/singularity/modal/daytona/vercel)
+Mordred uses Hermes's agent loop, provider registry, skills, tools, memory,
+gateway framework, configuration home, plugin manager, and hook dispatcher.
+Compatibility code may read those surfaces and refuse when they drift, but it
+does not patch the upstream repository or redistribute a modified Hermes.
 
 ### Conditionally inherited (lenient mode only)
 
-- **Agent harnesses** (Codex / Claude CLI / Cursor / ACP clients): inherited under lenient mode. Under strict mode, `mordred_llm_guard` refuses startup if a non-local harness is the configured primary, because harnesses bypass `pre_llm_call` for their own daemon traffic.
+Lenient mode permits operation when metadata or protection evidence is
+incomplete, while warning and auditing the downgrade. It may therefore inherit
+Hermes's ordinary provider, skill, and clearnet behavior. Strict mode must not
+be described as providing the same permissive fallback.
 
 ### Naming Convention
 
-- Project name: **Mordred**
-- CLI command name: **`hermes-mordred ...`** (the standalone console script;
-  canonical in documentation and operator guidance)
-- Plugin Python module IDs: `mordred_network`, `mordred_privacy_check`, `mordred_keyvault`, `mordred_llm_guard`, `mordred_wizard`, `mordred_e2e` (snake_case, following Python module naming conventions)
-- pip distribution: **`hermes-mordred`** from `0.1.0a16` (single real package,
-  all Mordred plugins included). The previous **`mordred-hermes`** PyPI project
-  becomes a metadata-only compatibility shim after the new name is reserved;
-  see `MIGRATION.md` §6
-- Configuration topology: per-plugin config under `plugins.mordred_<plugin-id>` in `~/.hermes/config.yaml`. Mordred plugins coordinate shared state (effective policy, active network path) via an internally-imported shared module within Hermes, **not** via a single `mordred:` top-level key
-- Skill metadata: `metadata.mordred.*` (same as the old SPEC, maintaining compatibility)
-- Mordred-owned filesystem paths: `~/.hermes/mordred/` (audit log, policy snapshot, keyvault state)
+The canonical distribution name is `hermes-mordred`; `mordred-hermes` is a
+metadata-only compatibility shim. Python imports use `mordred_hermes`, the one
+Hermes entry point is `mordred`, config sections keep the pre-0.2.0a0
+per-component names (`plugins.mordred_network`, ...), and audit reasons use
+stable dotted names. The `### Plugin: mordred_*` sections below describe the
+components by those historical names. The browser-facing gateway component
+(formerly the `mordred_e2e` entry point) lives under `mordred_hermes.extension`.
 
 ## Target User (v1)
 
-**Privacy-focused individual developers**
-
-Persona:
-
-- macOS or Linux / WSL2 users. Phase 1-3 is multi-platform; Phase 4 key
-  custody supports macOS and Linux TPM 2.0, while transparent startup
-  injection and the direct OS blackout fallback retain the macOS-only
-  limitations documented below
-- Already using Hermes, or a user migrating from OpenClaw (via `hermes claw migrate`)
-- Comfortable with the Python ecosystem
-- Has experience or willingness to learn local LLM operation (Ollama / LM Studio / vLLM)
-- _Nice-to-have, not required_: Web3 / cryptocurrency familiarity (relevant only when v2+ Payment skills land)
-
-Out of scope (v2+): journalists, enterprise IT teams, GUI-only users, Windows native (use WSL2), iOS native.
+The primary user runs Hermes locally, accepts that plugins are cooperative
+controls, and wants explicit choices for network paths, cloud LLM use, local
+secret storage, and browser-extension access. Strict mode is intended for an
+operator willing to resolve missing evidence instead of accepting automatic
+fallback.
 
 ## User Stories (v1)
 
 ### Story 1: Adding the privacy layer for existing Hermes users
 
-As an existing Hermes user, I want to add the privacy layer with `pip install hermes-mordred && hermes-mordred upgrade`, reusing my existing `~/.hermes/config.yaml` and skills unchanged.
-
-Behavior:
-
-- Idempotent: re-running is a no-op when state already matches
-- If the `plugins.mordred_*` section already exists, show a diff and prompt for overwrite
-- Existing skills without `metadata.mordred.*` are treated as `network_requirements: unknown`. Lenient mode (default for upgrade) gives a one-time warning; strict mode blocks, listed in `hermes-mordred policy explain`
-- Comments and key order in `~/.hermes/config.yaml` are preserved (round-trip writer via `ruamel.yaml`)
-- The existing `~/.hermes/mordred/` is preserved unless `--reset` is specified
+An existing Hermes user installs the appropriate extras, runs
+`hermes-mordred setup`, reviews `hermes-mordred status`, and continues to run
+the upstream agent. Setup is re-runnable and skips completed steps.
+Configuration writes preserve unrelated Hermes keys and install Mordred's
+six-plugin set without modifying upstream source.
 
 ### Story 1.5: Migration from OpenClaw + Mordred-OpenClaw
 
-Users who were using the old Mordred in an OpenClaw environment follow these 3 steps:
-
-1. `hermes claw migrate` — migrate to Hermes (workspace, config migration)
-2. `pip install hermes-mordred` — obtain the Mordred plugin suite
-3. `hermes-mordred upgrade` — enable the privacy layer
-
-`hermes-mordred upgrade` has an assist feature that, when it detects the OpenClaw-era `~/.openclaw/mordred/`, migrates policy / audit log / keyvault state to `~/.hermes/mordred/` (see PLAN.md §1.3 for details).
+`hermes-mordred upgrade` detects a legacy `~/.openclaw` tree, applies explicit
+row-level conflict policies, and remains idempotent. It never overwrites an
+existing conflicting Mordred configuration silently. The exact source,
+destination, and conflict ownership are in [`PATHS.md`](./PATHS.md).
 
 ### Story 2: New user setup
 
-As a new user, I want `hermes-mordred configure` to:
-
-1. Optionally spawn `hermes setup` as a child process when `--with-hermes-setup` is passed (run Hermes's standard setup first — opt-in, skipped by default since 2026-07-16)
-2. Ask Mordred-specific questions (network policy strict/lenient/off, local LLM endpoint, keyvault initialization opt-in)
-
-This allows Hermes and Mordred to be configured with a single command by passing `--with-hermes-setup`. No Hermes core modifications.
+A new user installs Hermes plus this distribution and runs the Mordred wizard.
+The wizard defaults to lenient policy, writes `config.yaml` and the derived
+`policy.json` transactionally, and explains which optional backend or route
+setup is still required.
 
 ### Story 3: Skill execution and automatic path selection
 
-At skill install time (via the `hermes-mordred install <skill>` wrapper), `mordred_privacy_check` parses `metadata.mordred.network_requirements` from the SKILL.md frontmatter and checks it against user policy. Install is blocked on mismatch. At process registration, `mordred_network` activates one route and injects its proxy environment before provider clients are constructed; child processes spawned later inherit it where Hermes permits. The active path is process-wide and frozen: same-path reuse is idempotent, while a conflicting path requires a restart.
-
-> **Note**: Once an install hook is added to Hermes core, the wrapper CLI will be retired in favor of going directly through the hook. Until then, the wrapper is the only policy-enforcement path.
+Installation through `hermes-mordred install` evaluates the skill's
+`metadata.mordred` declaration before delegating to Hermes. At runtime,
+configured Tor/VPN routes are selected before provider-client construction and
+kept stable for the session. This story does not imply per-skill runtime
+provenance or direct-socket containment.
 
 ### Story 4: Local LLM enforcement (strict-mode override)
 
-> **Phase 0.8 verify (2026-05-10) complete — redefining Story 4's mechanism**: Hermes's `pre_llm_call` payload cannot support provider rewrite. `pre_api_request` does carry the provider/model/base_url resolved for the actual primary request; although its return value is observer-only, a `BaseException` refusal escapes the hook wrapper. v1 therefore uses `on_session_start` for disk-state pre-checks and enforces primary strict policy authoritatively in `pre_api_request`. A non-allowlisted runtime provider or a provider/endpoint mismatch is refused immediately before egress (`policy.strict.session_refused`). Hermes 0.19 auxiliary LLM calls bypass that hook, so Mordred guards their resolver seams and validates each concrete client before use. Automatic swapping to `mordred-local` remains structurally impossible and is deferred to the v2 vendored fork (Tier B, `[hard-lock]`). The zero-PR commitment (`MIGRATION.md` §5) is maintained.
+The heading is retained as a stable documentation anchor; current behavior is
+refusal, not override. In strict mode, `mordred-local` is allowed only when its
+runtime endpoint exactly matches the pinned loopback endpoint and resolves
+only to loopback addresses. A cloud provider is allowed only when cloud use is
+enabled, the provider is allowlisted (or interactively granted by
+`prompt-once`), and the actual HTTPS endpoint matches that provider's accepted
+shape. Otherwise Mordred stops the request before egress.
 
-When policy is `strict`, `mordred_llm_guard` validates Hermes's request-resolved provider in **every `pre_api_request`**. A provider outside `cloud_provider_allowlist` is refused before egress; an allowlisted cloud provider also requires an actual, provider-owned HTTPS `base_url` without userinfo/query/fragment. Azure Foundry remains strict-unsupported until policy can pin an exact resource endpoint; accepting the vendor suffix would allow a different tenant/resource destination. Missing, malformed, or mismatched endpoints are refused before any `prompt-once` decision and audited as `policy.strict.cloud_endpoint_mismatch` followed by `policy.strict.session_refused`. Audit/log endpoint displays are bounded, origin-only values with credential-bearing components removed. `mordred-local` is revalidated as a loopback endpoint and its runtime URL must equal the configured `local_llm_endpoint` apart from a trailing slash. Swapping providers remains deferred to v2.
-
-Hermes 0.19 auxiliary tasks (compression, vision, title generation, and
-fallbacks) call clients outside `pre_api_request`. Their declared routes are
-checked at session start, and the concrete clients returned by Hermes's
-`_get_cached_client`, `_get_provider_chain`, `resolve_provider_client`, and
-`resolve_vision_provider_client` seams pass through the same provider/endpoint
-guard. Strict startup fails closed if a required seam is missing or replaced.
-
-Under `strict`, `mordred-local` is loopback-only. Both the configured
-`local_llm_endpoint` and the resolved runtime `base_url` must be HTTP(S), must
-not contain userinfo/query/fragment, must match apart from a trailing slash, and
-must use either the exact loopback IP literal
-`127.0.0.1` / `::1` or `localhost`; every current DNS result for `localhost`
-must itself be loopback. When a process proxy is active, both `NO_PROXY`
-spellings gain those exact hosts before the model client is used, and the
-health probe independently sets `trust_env=False`. This boundary is checked
-before the probe. An invalid endpoint or failed probe is audited as
-`policy.strict.session_refused` and aborts via `MordredSessionRefused`.
-Lenient/off and other non-strict compatibility modes do not apply the
-loopback boundary.
+The primary boundary is `pre_api_request`. Hermes auxiliary clients that do
+not emit that hook are guarded at their resolver/client-construction seams.
+Mordred does not rewrite an already resolved provider to `mordred-local`.
 
 ### Story 5: Key management
 
-For skills that declare `metadata.mordred.requires_keyvault: true`, `mordred_keyvault` provides `Security.framework` (via pyobjc) backed AES key wrapping. Keyvault initialization requires physically hand-transcribing the Seed Phrase + Passphrase + PoW, and is not finalized unless the verification-digest flow matches. See SPEC §Plugin: `mordred_keyvault` for details.
+The user initializes one profile-scoped keyvault, verifies a digest through an
+offline workflow, and stores secret material only in purpose-bound envelopes.
+macOS prefers the Secure Enclave helper with compatibility fallbacks; Linux
+requires the TPM helper. Seed display is short-lived and capture-aware where
+the OS exposes the signal.
+
+The Python API can export and import a recoverable encrypted manifest. The
+operator CLI exposes `keyvault export --output` and `recover --blob` for the
+corresponding portable snapshot workflow. Exported snapshots are point-in-time
+artifacts and must be recreated after Keyvault contents change.
 
 ### Story 6: Coexistence with Hermes's existing features
 
-Mordred plugins can coexist with Hermes's memory plugin, context engine, and
-observability integrations. Hook callbacks run in registration order and Hermes
-exposes no priority API that Mordred relies on. Each Mordred plugin orders its
-own callbacks explicitly; cross-plugin safety uses readiness checks and must not
-depend on entry-point enumeration order. See [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md)
-§1.
+Mordred preserves unrelated Hermes configuration and uses profile-aware paths.
+Mordred owns agent-memory at-rest encryption as a runtime wrapper around the
+memory tool's read/write seam in `tools/memory_tool.py`: no Hermes release
+encrypts memories, and the zero-PR commitment means upstream cannot be asked
+to. Hermes still owns the entry format inside the plaintext and the memory
+tool itself. Extension state uses Hermes's established `<home>/extension/`
+directory rather than the private keyvault tree.
 
 ## Scope (In) — what we build in v1
 
 ### Plugin: `mordred_network`
 
-- **Tor connection (v1 default = official `tor` daemon)**:
-  - `arti` (Rust) remains a candidate for the v1 baseline, but the v1 default is the `tor` daemon — because it has the lowest entry barrier for the v1 baseline, with well-established package-manager installs on Linux/macOS
-  - **torrc isolation**: Mordred generates **its own torrc** at `~/.hermes/mordred/tor-data/torrc` and does not touch the system-wide `/etc/tor/torrc` or the user's Tor Browser configuration
-  - **SOCKS5 listener**: defaults to `127.0.0.1:9050`. If an existing listener (e.g. Tor Browser, the system tor service) is detected via `lsof -i :9050`, v1 shifts through alt port `9150` (colliding with the Tor Browser default) to the port **explicitly specified in `policy.json`'s `tor_socks_port`**. Collision-resolution order: 9050 -> 9150 -> user-specified -> abort with `MordredPathBringupFailed`
-  - **ControlPort**: enabled by default at `127.0.0.1:9051` (cookie auth). The cookie file is `~/.hermes/mordred/tor-data/control_auth_cookie`. **Required** for implementing the M9 liveness probe via `getinfo circuit-status`
-  - **Bridge / obfs4 / Snowflake**: out of scope for v1 (use in censored environments is v2 `v2-N3`). The startup banner warns that "the v1 default Tor may fail to connect in censorship environments"
-  - **Stream isolation (SOCKS auth)**: per-session and per-skill isolation are not implemented in v1. `proxy_env.isolation_token` remains an optional process-scoped building block: when supplied before route activation, it becomes the SOCKS credential used with torrc `IsolateSOCKSAuth` for the lifetime of that Hermes process. Session hooks never replace it, because provider clients snapshot proxy configuration at construction. Changing the token after activation therefore requires a process restart. Per-session/per-skill isolation remains deferred pending a client/runtime architecture that can provide independent transports (and `origin_skill` for per-skill routing, v2-H2)
-- **Mullvad VPN integration (v1 = official `mullvad` CLI)**:
-  - **CLI choice**: v1 uses the Mullvad **official client** (`mullvad` binary; on macOS `/Applications/Mullvad VPN.app/Contents/Resources/mullvad`, on Linux a package such as `apt install mullvad-vpn`). Running `wg-quick` directly ourselves is out of scope for v1 (handling `CAP_NET_ADMIN`/sudo is complex across OSes)
-  - **Permissions**: the official client runs in the background as a system service (Linux: systemd unit; macOS: LaunchDaemon), and user commands request the daemon via IPC, so **no additional sudo is required**
-  - **Killswitch (lockdown mode)**: under strict mode, `mullvad lockdown-mode set on` is enforced at bring-up (in Mullvad CLI 2026.2 the `always-require-vpn` subcommand was removed and folded into `lockdown-mode`). The OS creates no clearnet route at all when the VPN drops. Under lenient/off, the user's setting is respected (if lockdown is off, only a warning is issued)
-  - **DNS leak prevention**: since the Mullvad client forces resolution through the in-tunnel resolver, there is no DNS leak in v1 (mitigated, unlike the M8 IPv6 leak)
-  - **Relay selection**: defaults to `auto` (Mullvad picks the geographically nearest relay). User override via e.g. `mullvad_relay_country: "jp"` in policy.json. Multihop / wireguard-over-tor are out of scope for v1
-  - **Tear-down**: `mullvad disconnect` is run by the process-exit finalizer, not `on_session_end`. Under strict mode, `mullvad lockdown-mode set off` is **not** run at the same time (lockdown is kept in place); the user exits it by starting the next process or disabling manually
-  - **Platform**: macOS and Ubuntu/Debian baseline. Windows is out of scope for v1
-- Clearnet (no-op path)
-- **`provider_transport_flagger` v1 baseline allowlist** (verified on real hardware in Phase 0.8):
-  - **Known compatible (respects HTTPS_PROXY + SOCKS5h)**: `anthropic` SDK (httpx), `openai` SDK (httpx), `gemini` (`google-genai` SDK, httpx baseline — corrected from the older `google-generativeai`/requests by the Phase 0.8 real-hardware verify; see the live-verify results in [`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) §Out of scope)
-  - **conditional**: the `mordred-local` localhost provider — excluded from proxy routing by the NO_PROXY default and works that way, though SOCKS5h is irrelevant here
-  - **Known partial / needs monitoring**: `bedrock` (boto3) — respects HTTPS_PROXY but has a quirk in botocore's DNS-resolution path, with possible DNS leak under strict + tor. `vertex` (google-cloud SDK) — some transports bypass HTTPS_PROXY; under strict mode a warning is shown and the decision is left to the user
-  - **Known incompatible (candidates for startup abort under v1 strict mode when active)**: any provider beyond the above that holds a raw socket / its own transport is enumerated by the Phase 0.8 verify
-  - The above is **finalized via real-hardware testing in the Phase 0.8 task before v1 ships**. The actual allowlist is distributed as a Python dict (a declarative module) bundled with the plugin. `policy.json provider_overrides` may add transport facts for internal providers, but cannot replace a bundled baseline entry; missing safety facts default conservatively
-  - **Fail-closed gate integrity**: strict + Tor refuses providers that are incompatible, unverified, unknown, or unresolved. `on_session_start` checks persisted `config.yaml model.provider` / `auth.json active_provider`, and `pre_api_request` repeats the gate against the provider Hermes resolved for that exact request; CLI, environment, one-shot, and gateway overrides therefore cannot evade the transport evidence check. `pre_api_request` also refuses when configured Tor/VPN does not match the active route or that protected route is not ready. Malformed `provider_overrides` and internal errors while reading runtime state or evaluating either gate are audited as `network.transport_incompatible` and raise `MordredPathBringupFailed`. Every provider refusal preserves the process-scoped route so each later event and concurrent gateway session remains protected instead of falling through to clearnet. Lenient/off warn and continue
-- Subprocess lifecycle: `mordred_network.register()` starts the configured Tor/VPN/clearnet route and freezes it before returning, which is before provider clients snapshot proxy settings. `on_session_start` only validates and reuses that route; `on_session_end` never owns it. A single process-exit finalizer tears it down
-- Stable route API: `mordred_network.api.use(path)` is a no-op when the requested path is already ready. Once registration has frozen the route, a different path (or a different SOCKS isolation token) is refused with restart-required semantics; persist the desired setting and restart Hermes so provider clients and the process route are rebuilt together
-- Path injection: sets `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` on spawned child processes. **NO_PROXY default**: `localhost,127.0.0.1,::1` (required to exclude Phase 2's `mordred-local` localhost communication from proxy routing). User-added entries are appended from policy.json's `no_proxy: [...]`
-- **Transport coverage (M8, v1)**: proxy_env tunnels **HTTP(S) traffic only**. The following are out of the v1 defense scope, as stated explicitly in SPEC §Threat Model:
-  - **DNS resolution**: with a normal `HTTPS_PROXY=http://...`, Python/curl and similar tools **resolve the name via the system resolver before** connecting to the proxy, so even over Tor the DNS query leaks to the ISP. v1's enforced mitigation: over the Tor path, use `HTTPS_PROXY=socks5h://127.0.0.1:9050` (`socks5h` performs server-side resolution). Libraries that don't respect SOCKS5h (some older HTTP clients) get a warning from provider_transport_flagger. Over the VPN path this is mitigated because the tunnel itself handles the DNS query. v2: full defense via bundled DNS-over-Tor / `mordred-dns-resolver`
-  - **IPv6 traffic**: many HTTP clients bypass proxy_env for IPv6 endpoints. In v1, if a provider has an IPv6-only endpoint, traffic may **not go through the proxy** (a clearnet leak). `disable_ipv6: true` renders Tor's `ClientUseIPv6 0`, but that does not disable host IPv6 or constrain provider SDK sockets. Therefore strict + Tor aborts for providers without verified IPv6 proxy support regardless of this advisory setting; lenient warns. This is mitigated over the VPN path since the tunnel handles IPv6. Full host-level enforcement is deferred to v2-N2.
-  - **Non-HTTP transport (raw TCP, UDP, QUIC, gRPC, WebSocket)**: whether HTTPS_PROXY takes effect depends on the client library. SSE / standard WebSocket (WS-over-HTTP upgrade) usually respect it, but provider plugins holding a raw socket bypass it. Warned via provider_transport_flagger's static allowlist; under strict mode, startup aborts if a known-incompatible provider is active
-- **Path failure semantics (M9, v1)**:
-  - **Bring-up failure** (Tor bootstrap timeout / VPN handshake fail): strict aborts the session with `MordredPathBringupFailed`; lenient shows a user-visible warning + clearnet fallback (emits audit `network.bringup_failed`); off falls back silently
-  - **Liveness probe**: an internal worker thread runs `mordred_network.api.health()` at a 30s interval (Tor: SOCKS5 reachability + circuit-established check; VPN: WireGuard handshake recency + interface up). Judged path-dropped after 2 consecutive failures
-  - **Mid-session drop**: strict raises `MordredPathDropped` on the next `pre_tool_call` (blocking tool execution); lenient warns + continues while keeping the path-dropped state. There is **no automatic clearnet fallback**. To choose clearnet, persist it with `hermes-mordred network use clearnet` and restart Hermes so provider clients are rebuilt on that route. Audit `network.path_dropped` is always emitted
-  - **`use(path)` failure**: raises `MordredNetworkError` (including `BringupFailed`, `AlreadySwitching`, `UnknownPath`, and `PathSwitchRequiresRestart`). Silent live switching after provider construction is prohibited
-- **Concurrency model (v1)**:
-  - Active path is **process-wide single state**, activated before provider construction and frozen for the process lifetime. Same-path reuse is idempotent; a conflicting path requires a restart rather than applying last-write-wins
-  - **Path mismatch for parallel tool_calls**: runtime per-skill path-mismatch detection is **not done in v1** — since the Phase 0.8 verify confirmed that `origin_skill` is **absent** from the `pre_tool_call` payload ([`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) §4), per-skill blocking at runtime is structurally impossible. Per-skill enforcement exists only at install-time (`hermes-mordred install <skill>`). Automatic path switching is likewise not done in v1 (to avoid the M3 transitive failure mode). Once the `origin_skill` payload extension lands upstream, runtime detection will be reconsidered in v2-H2
-  - **Parallel requests for the same path**: no restriction, executes in parallel as usual
-  - **Parallel requests for different paths**: a process cannot safely provide different routes because provider clients share the frozen transport. A conflicting request is blocked with restart-required semantics. Independent per-session/per-skill routes and SOCKS5 stream isolation are under consideration for v2
-- Provider transport flagging: resolves the active Hermes provider at startup and again from every `pre_api_request` payload, evaluates it against the immutable baseline plus additive `policy.json provider_overrides`, and applies the strict-Tor fail-closed behavior above
-- Strict-mode bootstrap order: `mordred_network.register()` activates and freezes the configured route before it registers session callbacks or returns control to Hermes. Provider clients are therefore constructed only after the route and proxy environment are ready; activation/configuration failures raise `MordredPathBringupFailed(BaseException)` and refuse process startup. Hook registration order and `wait_until_ready()` are no longer the security boundary for initial transport activation
+The network plugin provides:
+
+- `tor`, `vpn`, and `clearnet` route selection with one process-wide runtime;
+- Tor child-process ownership, a profile-scoped data directory, SOCKS5h proxy
+  environment, and optional ControlPort liveness through `stem`;
+- VPN provider support, including Mullvad account indirection through
+  `<home>/.env` and configurable external commands;
+- strict-vs-lenient route bring-up behavior and repeated health checks;
+- provider transport classification before client construction;
+- conservative handling of unknown transport facts, DNS behavior, IPv6, QUIC,
+  UDP, gRPC, and WebSocket limitations; and
+- audit events for use, failure, drop, bring-up failure, and incompatibility.
+
+Mordred's `disable_ipv6` option configures its Tor client; it does not disable
+host IPv6 or prevent an unwrapped process from opening a socket. A transport
+refusal does not tear down a shared route merely to fall back another session
+to clearnet. [`POLICY.md`](./POLICY.md) owns the matrices and provider evidence.
 
 ### Plugin: `mordred_privacy_check`
 
-- **Skill install guard** (via the `hermes-mordred install <skill>` wrapper):
-  - Reads SKILL.md from the install source path and extracts `metadata.mordred.network_requirements` from the frontmatter
-  - Strict + `clearnet` → block
-  - Strict + missing metadata → block with `policy.strict.unknown_metadata`
-  - Lenient + missing metadata → allow + warning
-- `pre_tool_call` — generic per-tool allowlist (configurable). Default strict-mode blocklist: builtin `web_fetch`, `web_search` when active network path is Clearnet. Per-skill determination too if `origin_skill` is present in the payload; otherwise just a tool-name allowlist
-- Policy state: loaded from `plugins.mordred_privacy_check` in `~/.hermes/config.yaml` at `on_session_start`, cached in memory. Reload is explicit via `hermes-mordred policy reload`
-- Audit logging: see §Operational Guarantees
+The privacy plugin parses `SKILL.md` frontmatter for
+`metadata.mordred.network_requirements`, `requires_keyvault`, and advisory
+`outbound_endpoints`. Its install decision is authoritative only when the user
+goes through `hermes-mordred install`; an ordinary Hermes install command does
+not traverse this wrapper.
+
+At runtime it checks plugin integrity, writes the one-shot missing-origin
+degradation marker, and blocks the default network-tool set on clearnet under
+strict policy. Audit records are bounded and must never contain secrets or raw
+untrusted documents.
 
 ### Plugin: `mordred_llm_guard`
 
-- Implements the synthetic provider `mordred-local` as `mordred_llm_guard/local_adapter.py` (an adapter bundled with the plugin). Follows the Hermes provider adapter pattern and delegates to a local OpenAI-compatible endpoint (LM Studio / Ollama / vLLM). Under strict policy, “local” is enforced as the exact HTTP(S) literal `127.0.0.1` / `::1`, or `localhost` whose DNS results are all loopback; the same check covers policy and runtime URLs before any probe or model request.
-- **Phase 0.8 verify (2026-05-10) complete**: `pre_llm_call` is context-injection only and cannot rewrite providers. `on_session_start` performs an audit-only disk pre-check; `pre_api_request` authoritatively enforces the actual runtime provider before egress ([`HOOK_PAYLOADS.md`](./HOOK_PAYLOADS.md) §5):
-  - strict policy + current provider **matches** `cloud_provider_allowlist` + `allow_cloud_llm: true` + concrete `base_url` is a provider-owned HTTPS endpoint -> request continues (passthrough)
-  - strict policy + missing/malformed/non-HTTPS/provider-mismatched `base_url` -> request is refused before prompting (audit `policy.strict.cloud_endpoint_mismatch` then `policy.strict.session_refused`)
-  - strict policy + current provider does not match cloud_provider_allowlist, or `allow_cloud_llm: false` -> session is refused and exits (v1 default, audit `policy.strict.session_refused`). The alternative of swapping the active provider to `mordred-local` via `register_provider` + a config patch (audit `policy.strict.provider_override_at_session_start`) was confirmed structurally impossible in v1 by the Codex B2 review, so it's **deferred to v2** (Tier B `[hard-lock]` vendored fork)
-  - lenient/off -> do nothing
-- Hermes 0.19 auxiliary LLM routes bypass `pre_api_request`; strict validates their declared config at session start and wraps the four resolver seams listed in Story 4. Resolver drift or an unbound returned client fails closed before auxiliary egress.
-- Local endpoint fail-fast: strict mode rejects invalid/non-loopback endpoints before probing, and translates health-check failure into `MordredSessionRefused`
-- Harness refusal: scans configured agents at `on_session_start`; aborts startup under strict mode when a harness-based primary (Codex/Claude CLI/Cursor/ACP client) is configured
+The LLM plugin registers the synthetic `mordred-local` provider, establishes a
+loopback proxy bypass, detects declared/known harness primaries, guards Hermes
+auxiliary clients, checks persisted provider state at session start, and
+checks the resolved primary request at `pre_api_request`.
+
+Strict enforcement is fail-closed and exception-based. `prompt-once` is
+process-local, keyed by normalized provider/route, and available only with an
+interactive terminal. A missing TTY denies without caching that denial.
 
 ### Plugin: `mordred_keyvault`
 
+The keyvault plugin owns native wrapping-key integration, verification
+digests, encrypted secret envelopes, recovery manifests, encrypted audit
+writers, Ethereum key envelopes, and the macOS startup/reseal integration for
+the at-rest vault. Public calls accept an injected backend for deterministic
+testing; production entry points resolve a platform backend centrally.
+
 #### Key hierarchy
 
-`mordred_keyvault` protects the combination of **Seed Phrase + Passphrase + PoW**. Complies with the BIP39 standard; the user physically hand-writes the 24-word Seed and Passphrase.
+Each logical key ID identifies a native non-exportable P-256 wrapping key. A
+random 32-byte data-encryption key (DEK) encrypts each secret with AES-256-GCM;
+the native public key wraps that DEK through P-256 ECDH, HKDF-SHA-256, and
+RFC 3394 AES Key Wrap. Only wrapped keys and ciphertext are persisted.
 
-```
-secret      = SeedPhrase (24 words) + Passphrase + PoW       ← protected (user transcribes by hand)
-dek         = random 256-bit AES-GCM data-encryption key     ← generated by keyvault
-ciphertext  = AES-GCM(secret, dek)                           ← stored on disk as backup/state
-wrappingKey = backend-protected P-256 key                    ← authorizes DEK unwrap only
-wrappedDek  = wrap(dek, wrappingKey)                         ← stored next to ciphertext
-```
+Logical key IDs and purposes are hashed before use as path components. The
+profile-scoped native ID binds the logical identity to the keyvault root so
+different Hermes homes cannot accidentally share a same-named native key.
 
-Design decisions:
-
-- **Withdrawn**: a design where the native hardware backend holds/derives the
-  wallet signing key is not adopted in v1
-- **Adopted**: the selected native backend protects only the P-256 key used
-  for wrapping/unwrapping the AES DEK (Secure Enclave or login Keychain on
-  macOS; TPM 2.0 on Linux)
-- `dek` is never stored in plaintext (exists in memory only during encryption/decryption)
-- `Passphrase + PoW` is part of `secret`, not derivation material for `dek` (if the Enclave is destroyed, the secret the user wrote down allows re-wrapping on a different machine)
-- Biometric authentication is only an authorization mechanism, not a cryptographic operation
-
-Limitations:
-
-- Local secrets at rest protection: guards against disk theft, backup exposure, and accidental plaintext disclosure
-- Cannot protect against a compromised running gateway handling the secret after it has been unwrapped
-- Runtime signing isolation is out of scope for v1; addressed by future Payment work (`v3-P1`)
+The separate at-rest file vault uses a random master key with two recovery
+paths: a device-wrapped master and an Argon2id passphrase-wrapped master. It
+lives at `<home>/mordred/vault/`, not inside the keyvault envelope tree.
 
 #### Key generation and verification digest
 
-Key generation is **mandatory and one-shot**. To prevent mis-transcription, it is not finalized until the verification digest matches.
+Let `H` be 32-byte BLAKE3, and let `top4` return the first four PoW bytes:
 
-Conceptual formula:
-
-```
-digest = hash( hash(SeedPhrase), hash(Passphrase) ⊕ top4(PoW) )
-```
-
-> **Notation note (code-reviewer LOW-1, 2026-05-14)**: the `⊕` here is shorthand for "XOR the 4 bytes of `top4(PoW)` into the **first 4 bytes** of `hash(Passphrase)`, leaving bytes `[4:32]` of `hash(Passphrase)` unchanged". Read as a full-width XOR (32-byte vs. 32-byte with zero-padding), the formula would be ambiguous and a naive implementation could end up XOR-padding `top4(PoW)` to 32 bytes. The Concrete algorithm below is canonical; the conceptual formula is for high-level intuition only.
-
-**Concrete algorithm (canonical, Phase 4 PR2 step-0 freeze 2026-05-14)**:
-
-```
-H               := BLAKE3 (32-byte digest mode)
-seed_hash       := H(SeedPhrase as UTF-8 bytes)            # 32 bytes
-pass_hash       := H(Passphrase as UTF-8 bytes)            # 32 bytes
-top4            := PoW_bytes[0:4]                          # PoW is a precomputed BLAKE3-based artifact;
-                                                           # caller passes the raw bytes, top4 = first 4 bytes
-masked_pass[0:4]  := pass_hash[0:4] XOR top4              # XOR affects ONLY the first 4 bytes
-masked_pass[4:32] := pass_hash[4:32]                       # remaining 28 bytes unchanged
-digest          := H(seed_hash || masked_pass)             # 32 bytes
+```text
+seed_hash      = H(normalized_seed UTF-8)
+pass_hash      = H(normalized_passphrase UTF-8)
+masked_pass    = (pass_hash[0:4] XOR top4(pow_bytes)) || pass_hash[4:32]
+digest         = H(seed_hash || masked_pass)
 ```
 
-Resolved ambiguities:
-- `top4(PoW)` is `PoW_bytes[:4]`; PoW is NOT re-hashed inside `compute_digest` (caller is responsible for PoW computation, see §`mordred_keyvault` PoW section)
-- `⊕` operates on **4 bytes only**, into the first 4 bytes of `pass_hash`. Bytes `[4:32]` of `pass_hash` pass through unchanged. (Rationale: SPEC notation explicitly says `top4`, not `pad_to_32(PoW)` — the masking is intentionally narrow so cross-machine recovery only requires transmitting the 4-byte mask, not 32 bytes.)
-- Outer hash combines via byte concatenation `seed_hash || masked_pass` (64 bytes total input)
-- All BLAKE3 invocations use the unkeyed, 32-byte default output (no `derive_key` / `keyed_hash` mode)
-- String inputs (`SeedPhrase`, `Passphrase`) are UTF-8 encoded **as-is** at this layer. Unicode normalization is the caller's responsibility — implemented by `mordred_keyvault.api` (Phase 4 PR4). PR4 step-0 freeze (2026-05-15, codex HIGH #1) splits normalization: seed phrase uses `NFKD + casefold + whitespace-collapse` (BIP39 word-list tolerance); passphrase uses `NFKD only` (preserves case and whitespace entropy). See §"PR4 API contract" below for the exact `_normalize_seed_phrase` / `_normalize_passphrase` definitions.
-
-**Fixed test vector** (Phase 4 PR2 baseline, BLAKE3 1.0.8):
-
-| Field         | Value (hex unless noted)                                              |
-| ------------- | --------------------------------------------------------------------- |
-| `seed_phrase` | `"test seed"` (UTF-8: `746573742073656564`)                           |
-| `passphrase`  | `"test pass"` (UTF-8: `746573742070617373`)                           |
-| `pow_bytes`   | `deadbeef` + `00` × 28 (32 bytes total)                               |
-| `seed_hash`   | `c18818fa275b46e46836d45540512fb2561a66924b2962d6675ef71c7cdcecf0`    |
-| `pass_hash`   | `734cedd9a49ec88207d0c58f757899bd2dc21cf65b6fa0958ff40c81e4ee08eb`    |
-| `top4`        | `deadbeef`                                                            |
-| `masked_pass` | `ade15336a49ec88207d0c58f757899bd2dc21cf65b6fa0958ff40c81e4ee08eb`    |
-| **`digest`**  | **`25c17b1e1b249dd278f6de52e6e0dddf855fe9943177c99c5428fc1c321b5c93`**|
-
-This vector is pinned in `tests/test_keyvault_digest.py::TestSpecFixedVector` and acts as the regression anchor for the digest algorithm. Any future change that perturbs the vector requires a SPEC update + reason in the PR description.
-
-**Operator tooling**: The standalone `scripts/keyvault_offline_digest.py` (stdlib + `blake3` only, no `mordred_hermes` import) is the canonical implementation an operator runs on the air-gapped second device. It reproduces the algorithm above plus the seed/passphrase normalization defined in §"PR4 API contract". The script's `--self-test` flag validates the same fixed vector pinned above. Operator preparation and step-by-step recipe live in `setup.md` §"Offline verification digest".
-
-Confirmation flow (PC = the machine running the Hermes process):
-
-| Input location                 | Input       | Output                                             |
-| ------------------------------ | ----------- | -------------------------------------------------- |
-| PC (Hermes process)            | SeedPhrase  | `hash(SeedPhrase)`                                 |
-| Separate offline medium/device | Passphrase  | `hash(Passphrase) ⊕ top4(PoW)`                     |
-| Combine                        | Both halves | verify `digest` matches the locally computed value |
-
-- The v1 default is offline/manual verification while PC is in network blackout. QR + local LAN pairing is v2 (`v2-F7`)
-- PoW (BLAKE3-based) deters real-time phishing replication — the concrete algorithm is frozen in the next section, §"Proof-of-Work (PoW) algorithm"
-- During cross-machine recovery, mis-transcription is detected by comparing against the first-generation digest embedded in the backup blob
+The expected value is exactly 32 bytes and comparison is timing-safe. Recovery
+parses the backup header and verifies this digest before running Argon2id or
+decrypting ciphertext. The offline tool shipped in the wheel implements the
+same algorithm without importing the live keyvault state.
 
 #### Proof-of-Work (PoW) algorithm (Phase 4 PR10 step-0 freeze, 2026-05-16)
 
-The `pow_bytes` input to `compute_digest` is prepared by the caller. Since PR10 required `keyvault init` to generate this artifact, the v1 algorithm is frozen here.
+The historical heading is retained because tests and external notes cite it.
+The current PoW contract is:
 
-**Purpose**: PoW is a **seed-bound computational artifact**, forcing a one-time fixed cost to be paid at init. Because it's bound to the seed, it can be deterministically recomputed from the same seed during recovery on a different machine, so there's no need to separately hand-transcribe the PoW (only the 4 bytes of `top4(PoW)` are passed to the offline medium — consistent with the rationale for the `⊕` narrow mask in §"Key generation and verification digest").
-
-**Concrete algorithm (canonical)**:
-
-```
-H                    := BLAKE3 (32-byte digest mode; unkeyed — same as digest.py)
-POW_PREFIX           := b"MRPOW\x01"          # 6 bytes: domain-separation tag ‖ version 1
-POW_DIFFICULTY_BITS  := 20                     # v1 baseline (tunable; see caveat below)
-
-preimage(n)  := POW_PREFIX ‖ normalized_seed_utf8 ‖ n.to_bytes(8, "little")
-                # normalized_seed is the output of api._normalize_seed_phrase (NFKD + casefold
-                # + whitespace-collapse). n is a uint64 counter starting from 0
-find smallest n such that leading_zero_bits(H(preimage(n))) >= POW_DIFFICULTY_BITS
-pow_bytes    := H(preimage(n))                 # 32 bytes — the BLAKE3 digest of the winning preimage
+```text
+prefix     = b"MRPOW\x01"
+preimage   = prefix || normalized_seed UTF-8 || nonce.uint64_little_endian
+condition  = BLAKE3(preimage) has at least 20 leading zero bits
+result     = the digest for the smallest nonce satisfying condition
 ```
 
-- `top4(PoW) = pow_bytes[:4]` (consistent with the digest formula). The higher the difficulty, the more leading zero bits `top4` has, but `top4` is for **mis-transcription detection** on the passphrase half, not a security boundary (the primary detection is the `hmac.compare_digest` over the full 32-byte digest).
-- Deterministic: `pow_bytes` is a function of the normalized seed only. Recovery recomputes the same value from the transcribed seed.
-- If `n` reaches `2**64` (astronomically unlikely), `PowExhausted` is raised.
-
-**Caveat (subject to codex step-0 review)**: `POW_DIFFICULTY_BITS = 20` (≈1.4M BLAKE3 hashes, under 1 second on modern hardware) is a conservative baseline. Rigorous difficulty analysis against real-time phishing is out of scope for v1 and deferred to security review / v2. The constant is consolidated in one place at module level in `mordred_keyvault.pow` so it can be tuned in the future. Note that since recovery also recomputes the PoW, raising the difficulty proportionally affects recovery time as well.
-
-**Fixed test vectors** (BLAKE3 1.x, pinned in `tests/test_keyvault_pow.py`):
-
-| Field                 | Value                                                              |
-| --------------------- | ------------------------------------------------------------------ |
-| `normalized_seed`     | `"test seed"` (UTF-8: `746573742073656564`)                        |
-| `POW_PREFIX`          | `4d52504f5701` (`MRPOW` ‖ `0x01`)                                  |
-| **difficulty 8** (human-checkable worked example) | `n = 519` |
-| → `pow_bytes`         | `00faa270f9d4a1047cd3f00002d6bd6c3ded6d151e2542ee21742a4665b56ac2` |
-| → `top4`              | `00faa270`                                                         |
-| **difficulty 20** (v1 production `POW_DIFFICULTY_BITS`) | `n = 1449850` |
-| → `pow_bytes`         | `00000df459e58f525449c530a547d48ba70e488f7ed15f9c810ae7a76bd0e7c9` |
-| → `top4`              | `00000df4`                                                         |
-
-The difficulty-8 vector is for hand-calculation verification (reached at `n = 519`); the difficulty-20 vector is the v1 production regression anchor. Any change that alters either requires a SPEC update + a reason in the PR.
+Only the first four result bytes mask the verification digest. Difficulty,
+prefix, byte order, and smallest-nonce rule are part of the compatibility
+contract.
 
 #### `keyvault init` flow (Phase 4 PR10)
 
-`hermes-mordred keyvault init` runs the one-shot key-generation flow in the following order:
+Initialization is an explicit ceremony:
 
-1. **Generate**: `keyvault` generates a 24-word BIP39 mnemonic (256-bit entropy + SHA-256 checksum) and computes the PoW via `pow.compute_pow(normalized_seed)`. The Passphrase is entered interactively by the user (not echoed to the PC screen).
-2. **prepare**: `api.prepare_generate(seed, passphrase, pow_bytes)` → `(SeedDisplayHandle, expected_digest)` (in-memory only, no disk mutation).
-3. **display**: `seed_display.display_seed(handle, surface)` — network blackout assert (fail-closed) → M4/M5 banner → displays **only the Seed** on the terminal with a 60s timer (the Passphrase is never rendered).
-4. **offline confirm**: the user transcribes the seed + passphrase + `top4(PoW)` onto an offline medium, independently computes the digest, and enters that digest into the CLI.
-5. **finalize**: `api.confirm_generate(handle, user_digest, backend=_SecKeyBackend())` — only on digest match does it durably persist the selected backend key + `meta.json`; on mismatch, zero state change and `keyvault.init_denied`.
+1. Probe the selected native backend and required crypto dependencies.
+2. Generate a BIP39 seed and collect a recovery passphrase without placing
+   either secret on a command line.
+3. Normalize the inputs, compute PoW and the expected digest, and prepare an
+   opaque, expiring seed-display handle without mutating durable state.
+4. Display the seed through the protected display flow and direct the user to
+   reproduce the digest on an offline device.
+5. Require the typed digest to match exactly.
+6. Only after confirmation, create the native wrapping key, commit metadata
+   and the digest, optionally store the seed for HD derivation, and emit the
+   completion event.
+
+Any mismatch emits `keyvault.init_denied` and leaves no committed keyvault.
+Interrupted native-key creation is reconciled through the lifecycle journal.
 
 #### Seed phrase display security
 
-1. **Network blackout (M4 caveat)**: before display,
-   `mordred_network.api.blackout_assert()` verifies the host is disconnected
-   and is the supported path on both macOS and Linux. When
-   `mordred_network` is absent, keyvault has a direct
-   `SCNetworkReachability` fallback on macOS only; a Linux `ip` / `nmcli`
-   direct fallback remains deferred and therefore fails closed
-   - **Detection scope limits (M4)**: `blackout_assert` detects only **paths visible to the OS's standard network stack**. The following cannot be detected, so physical air-gapping is the user's responsibility:
-     - Bluetooth / USB tethering / personal hotspot (when the OS does not, or is not made to, recognize it as WAN)
-     - NICs running outside a virtual machine / container, host-side VPNs, virtual switches
-     - Malicious kernel modules or ring-0 loaders (a root-compromised environment)
-     - Cases where an external NIC connected via Thunderbolt / DMA is hidden from the OS
-   - Before display, the `keyvault init` startup banner prompts the user to "visually confirm that Wi-Fi/Ethernet/Bluetooth/USB tethering is physically disconnected"
-2. **Show only the Seed on the PC**. The Passphrase is never rendered on the PC screen
-3. **Verification is offline by default in v1**: the Passphrase half is entered on a separate device or hand-written
-4. **Display timeout & capture caveats (M5)**: the Seed auto-clears after 60 seconds. The v1 defense scope regarding capture is as follows:
-   - **Screenshot detection**: best-effort only (polling macOS `CGDisplayRegisterReconfigurationCallback` + `CGScreenIsBeingCaptured`). The Seed display is cleared immediately upon detection + audit log `keyvault.seed_display_aborted_screenshot` (frozen in the Phase 4 reason enum)
-   - **Screen recording (M5, out of v1 detection scope)**: screen recording via macOS `screencapture -v`, Loom, Zoom share, OBS, QuickTime Player is **not detected**. Adoption of the `CGDisplayStream`-based detection API is deferred in v1 on API-stability grounds, to be re-evaluated in v2
-   - **Remote desktop (VNC / Screen Sharing / SSH X11 forwarding / `tmate` / `mosh`)**: not detected. The user is responsible for closing remote sessions before the Seed display
-   - **Camera / physical shoulder-surfing**: naturally out of detection scope
-   - The pre-display startup banner warns: "view the Seed only on the local machine's physical screen; stop any screen recorder / screen-sharing tool / remote desktop"
-   - The 60-second timer is based on a monotonic clock (`time.monotonic()`), resistant to wall-clock tampering
+The display handle has a 60-second monotonic deadline, redacted
+representation, no equality/hash/copy/pickle/state export, one-shot consume,
+and an in-place wipeable byte buffer. Display attempts a network blackout and,
+on macOS, aborts if screen capture is detected. These controls reduce
+accidental disclosure; they cannot defeat a physical camera, privileged
+capture, terminal scrollback outside the controlled flow, or memory inspection
+by the same user.
 
 #### Protection-tier hierarchy (fallback)
 
-1. **macOS Secure Enclave**: hardware-backed P-256 with the configured
-   authorization policy
-2. **macOS login-Keychain fallback**: software P-256, used when Secure
-   Enclave access is unavailable
-3. **Linux TPM 2.0**: non-extractable TPM P-256 key with on-chip ECDH;
-   no software fallback
-4. **Windows native / external HSM / master-password tiers**: deferred
+Production backend selection is ordered and platform-specific:
 
-> **Linux TPM 2.0 (MVP complete 2026-06-09)**:
-> `hermes-mordred keyvault enable-tpm` builds and installs the packaged
-> `mordred-hermes-tpmkey` helper. A copied key blob is useless on another
-> host, but this is machine binding rather than Touch-ID-equivalent presence:
-> the MVP has no per-use PIN/PCR prompt. Per-use gating remains a follow-up.
+1. macOS installed `mordred-hermes-sekey` helper (Secure Enclave);
+2. macOS legacy in-process Security-framework namespace when usable;
+3. macOS login-Keychain software P-256 namespace for compatibility when the
+   interpreter lacks the entitlement needed to persist an Enclave key;
+4. Linux installed `mordred-hermes-tpmkey` helper (TPM 2.0), with no software
+   fallback.
+
+Installing a helper does not migrate an existing key between namespaces.
+Committed metadata keeps enough backend identity to continue finding an older
+key. `enable-se` and `enable-tpm` build/install/probe helpers; they do not
+convert current key material.
 
 #### Implementation interface
 
-- Add `pyobjc-framework-Security` to `hermes-mordred`'s macOS extra (`pip install hermes-mordred[macos]`)
-- The `Security.framework` wrapper is implemented in `mordred_keyvault/native.py`, with lazy import (using the `_lazy_import` pattern so it doesn't raise `ImportError` at import time on Linux/WSL2)
-- Internal Python API (shared across Mordred plugins) — see §"PR4 API contract & MREN envelope wire format" for the canonical form frozen at PR4 step-0 (2026-05-15):
-  - `mordred_keyvault.api.prepare_generate(seed, passphrase, pow_bytes) -> (SeedDisplayHandle, expected_digest)` — in-memory only, no persistence
-  - `mordred_keyvault.api.confirm_generate(handle, user_confirmed_digest, *, ...) -> GenerateResult` — Keychain + meta.json mutation only on digest match; rollback on mismatch (codex BLOCKER #2)
-  - `mordred_keyvault.api.generate(seed, passphrase, pow_bytes, expected_digest, *, ...) -> GenerateResult` — non-interactive convenience (for tests / automation); the wizard CLI requires the two-phase form
-  - `mordred_keyvault.api.encrypt(key_id, plaintext, purpose, *, ...) -> envelope_id` — managed storage; AES-GCM encrypt + persist `.gcm` envelope; returns envelope_id
-  - `mordred_keyvault.api.decrypt(key_id, envelope_id, purpose, *, ...) -> bytes` — a caller-supplied `purpose` is required (defends against cross-purpose replay, codex HIGH #2); decrypts after unwrap authorization
-  - `mordred_keyvault.api.export_backup(key_id, passphrase, *, ...) -> bytes` — an MRKV blob containing a manifest with all ciphertext re-wrapped under an Argon2id-KEK (codex BLOCKER #1)
-  - `mordred_keyvault.api.import_backup(blob, passphrase, *, seed_phrase, pow_bytes, ...) -> str` — verifies the digest → decrypts the manifest → re-wraps each DEK under a new Enclave key
-  - `mordred_keyvault.api.verify_digest(seed, passphrase, pow_bytes, *, expected) -> None` — confirms digest match after applying split normalization
-- Skill opt-in: declares `metadata.mordred.requires_keyvault: true`; enforced by `mordred_privacy_check` at install time
+`NativeBackend` exposes generate, public-key lookup, delete, and ECDH
+operations. The public `keyvault.api` exposes two-phase generation, digest
+verification, `encrypt`, `decrypt`, `export_backup`, and `import_backup`.
+Secret encryption requires a non-empty purpose, and decryption requires the
+same logical key ID, envelope ID, and purpose.
+
+Exceptions distinguish structural corruption, missing keys, duplicate keys,
+native unavailability, authorization cancellation, and verification mismatch.
+Callers must not collapse an authorization denial into a corruption message.
 
 #### Backup wire format versioning (Phase 4 PR2 freeze, 2026-05-14)
 
-`mordred_keyvault.backup.export()` produces a self-describing blob with the layout
+`MRKV` v1 is a self-describing passphrase-wrapped blob:
 
+```text
+magic(4)="MRKV" | version(1)=1 | kdf_id(1)=Argon2id |
+m_cost(4 BE)=47104 KiB | t_cost(4 BE)=1 | p_cost(4 BE)=1 |
+salt(16) | verification_digest(32) | aes_blob_len(4 BE) |
+nonce(12) | ciphertext(N) | tag(16)
 ```
-magic(4)="MRKV" | version(1) | kdf_id(1) | m_cost(4 BE) | t_cost(4 BE) | p_cost(4 BE)
-                | salt(16) | verification_digest(32) | aes_blob_len(4 BE) | aes_blob(*)
-```
 
-with `HEADER_LEN = 70` for `version=1`. The AAD bound to the AES-GCM ciphertext is `magic ‖ version ‖ kdf_id ‖ m_cost ‖ t_cost ‖ p_cost ‖ salt ‖ verification_digest` (66 bytes). Tampered headers therefore fail `InvalidTag` at decrypt time, separately from `BackupCorrupt` structural rejects.
-
-> **Migration policy (code-reviewer LOW-2, 2026-05-14)**: a `version=2` blob is **not** required to keep `HEADER_LEN = 70`. Decoders must read the `version` byte first and dispatch on it; `parse_header` for `version=1` raises `BackupCorrupt` on any other version (the policy in PR2). When introducing `version=2`:
->
-> 1. Keep `magic = b"MRKV"` and `version` at byte offset 4 stable — these are the dispatch keys.
-> 2. Bump the SPEC table above with the version-2 layout, list which fields moved, and update any consumers reading `HEADER_LEN` as a constant.
-> 3. AAD construction may change but must remain field-set-deterministic so re-encrypting the same secret + parameters yields the same ciphertext under a fixed nonce.
-> 4. Migration tools should detect version=1 blobs and re-export as version=2 with a fresh nonce — never silently upgrade the blob in place (preserves the original verification digest's transcription evidence).
-
-DOS guards on parsed KDF params (Phase 4 PR2 integration finding): `parse_header` rejects `m_cost > 1 GiB`, `t_cost > 64`, or `p_cost > 16` (and any value ≤ 0). Without these caps a tampered cost-param byte can force `decrypt_body` into a multi-GiB Argon2 allocation before AAD authentication has a chance to fail. The caps must be re-evaluated when introducing a stronger KDF profile (a future "v2 profile" with `m_cost=256 MiB, t=4` for higher-security keyvaults stays within them).
+The first 66 bytes are AES-GCM AAD. Version 1 accepts only the canonical KDF
+profile and rejects malformed lengths and unsafe cost values before KDF work.
+A breaking layout or KDF-profile change requires a new version and compatible
+reader dispatch.
 
 #### Wrap wire format & algorithm (Phase 4 PR3 freeze, 2026-05-14)
 
-The Secure-Enclave-backed DEK wrap is the Tier-1 protection step from the [Protection-tier hierarchy](#protection-tier-hierarchy-fallback) above. `mordred_keyvault.wrap.wrap_dek(dek, key_id)` produces a self-describing 127-byte blob:
+`MRKW` v1 is exactly 127 bytes:
 
-```
-magic(4)="MRKW" | version(1) | alg_suite(1) | key_id_hash(16) | ephemeral_pub(65) | wrapped_dek(40)
-```
-
-Field reference for `version = 1`:
-
-| Offset | Length | Field | Notes |
-| --- | --- | --- | --- |
-| 0 | 4 | `magic` | ASCII `MRKW`. Dispatch key, never changes across versions. |
-| 4 | 1 | `version` | `1`. Dispatch key for future format bumps. |
-| 5 | 1 | `alg_suite` | `1` = `(P256_ECDH_RAW, HKDF_SHA256, AES256_KW_RFC3394)`. Reserved values: `0` invalid, `2-255` future. |
-| 6 | 16 | `key_id_hash` | First 16 bytes of `SHA-256(logical_key_id_bytes)`. Binds the portable wire object and identifies audit events; it is not the native-store selector for profile-scoped keys. |
-| 22 | 65 | `ephemeral_pub` | SEC1 uncompressed P-256 (`0x04 ‖ X(32) ‖ Y(32)`). Freshly generated by `wrap_dek` via `cryptography.hazmat.primitives.asymmetric.ec.generate_private_key(SECP256R1())` (which itself draws from the OS RNG via OpenSSL `BN_rand_range`) — wrap is **never** deterministic and never reuses the ephemeral key. Hand-rolled scalar generation via `secrets.token_bytes` is intentionally avoided (codex review-fix-2 NIT-1) because it would require a manual modular-reduction step against the curve order. |
-| 87 | 40 | `wrapped_dek` | RFC 3394 AES-KW output for a 32-byte DEK (`8 + 32 = 40` bytes; the fixed IV/AIV is internal to RFC 3394, so the blob has **no separate IV field** — codex review BLOCKER-2). |
-
-`HEADER_LEN = 127` for `version=1`. The parser rejects any other version with `WrapParseError`.
-
-The wire `key_id` is a portable **logical id**. Current profiles separately
-derive and persist a deterministic `native_key_id` from the absolute keyvault
-root and logical id. The native id selects the physical SE/TPM/Keychain item;
-it is deliberately excluded from MRKW and portable backup manifests. Metadata
-without `native_key_id` is legacy and continues to select the logical id for
-read/ECDH compatibility.
-
-**Algorithm — `wrap_dek(dek, key_id, native_key_id=...)`** (offline, no Enclave authorization, no user prompt):
-
-1. Lookup the native **public** key using `native_key_id` (or the logical `key_id` for a legacy row). Keychain tags hash that physical selector; file-backed helpers receive the resulting opaque tag.
-2. Generate an ephemeral P-256 keypair in software (`cryptography` library, never persisted).
-3. Raw ECDH: pass the ephemeral private key + Enclave public key to `SecKeyCopyKeyExchangeResult` with `kSecKeyAlgorithmECDHKeyExchangeStandard` (NOT `…X963SHA256` — codex review HIGH-1; we want raw ECDH output, then a single explicit HKDF, not double-derive).
-4. HKDF-SHA256 derive a 32-byte AES-KEK: `salt = b""`, `info = magic || version(1) || alg_suite(1) || key_id_hash(16) || ephemeral_pub(65)` (87 bytes; binds every non-secret blob field to the KEK — codex review HIGH-2).
-5. `wrapped_dek = AES-KW(KEK, dek)` per RFC 3394 (32-byte DEK → 40-byte output, integrity-protected by the AIV).
-6. Emit the blob; do NOT emit an audit-log entry (wrap is unauthorized, fast, no decision boundary).
-
-**Algorithm — `unwrap_dek(blob, key_id, native_key_id=...)`** (authorized, may prompt the user):
-
-1. `parse_header(blob)` — reject if `len(blob) != 127`, `magic != b"MRKW"`, `version != 1`, `alg_suite != 1`, or `key_id_hash != SHA-256(key_id)[:16]`. Each rejection raises `WrapParseError`.
-2. Lookup the native **private** key using the separately resolved physical selector. Missing → `WrapKeyNotFound`.
-3. Decode `ephemeral_pub` as SEC1 P-256; reject invalid curve points with `WrapParseError`.
-4. Call `SecKeyCopyKeyExchangeResult(enclave_private, ECDHKeyExchangeStandard, ephemeral_pub, params)`. This triggers the access-control prompt (Touch ID / Optic ID / passcode). On `errSecUserCancelled` / `errSecAuthFailed` / `errSecInteractionNotAllowed` / `errSecAuthorizationCanceled`, emit `keyvault.unwrap_denied` with translated `native_error_code` and raise `WrapAuthCancelled` (chains the native `NSError` via `__cause__`).
-5. HKDF-SHA256 with the same `info` constructed in wrap step 4 (binds blob fields to KEK; a tampered `ephemeral_pub` produces a different KEK → AES-KW unwrap fails AIV check).
-6. `dek = AES-KW-Unwrap(KEK, wrapped_dek)`. AIV mismatch → `WrapIntegrityError`.
-7. Emit `keyvault.unwrap_authorized` with `key_id_hash` (16-char hex prefix) and return `dek`.
-
-**Access-control attributes for the Enclave key** (set at `generate_wrapping_key` time, persisted in the Keychain):
-
-| Attr | Value | Rationale |
-| --- | --- | --- |
-| `kSecAttrKeyType` | `kSecAttrKeyTypeECSECPrimeRandom` | P-256, the only curve the Enclave supports. |
-| `kSecAttrKeySizeInBits` | `256` | Required by `ECSECPrimeRandom`. |
-| `kSecAttrTokenID` | `kSecAttrTokenIDSecureEnclave` | Bind the private key to the Enclave; the public key is freely exportable. |
-| `kSecAttrIsPermanent` | `True` | Survives reboot — `wrap` needs to look up the public key without re-prompting. |
-| `kSecAttrApplicationTag` | `b"mordred-hermes.wrap." + SHA-256(native_key_id)[:16]` | Namespaced, profile-isolated physical lookup. For legacy rows `native_key_id == logical key_id`. |
-| `kSecAttrLabel` | `"Mordred wrapping key " + SHA-256(native_key_id)[:8].hex()` | Human-readable in Keychain Access.app without exposing either id. |
-| `kSecAttrAccessControl` | `SecAccessControlCreateWithFlags(.privateKeyUsage \| .biometryCurrentSet, accessible: .whenPasscodeSetThisDeviceOnly)` | Touch/Optic ID required — `.biometryCurrentSet` is biometry-only with no passcode fallback; an Enclave-capable Mac without enrolled biometry cannot create or use the key (codex review MEDIUM-2; reaffirmed PR9). `.biometryCurrentSet` invalidates the key if the user adds/removes biometrics — protects against the "stolen device with attacker biometric enrolled" attack. `.whenPasscodeSetThisDeviceOnly` ensures the key cannot exist on a device without a passcode and never syncs to iCloud Keychain. |
-
-Capability detection (codex review MEDIUM-1): `is_secure_enclave_available()` does NOT check `platform.machine() == 'arm64'`. Intel Macs with the T2 chip also have a Secure Enclave reachable through the same API. Detection probes capability via a throwaway key-generate-then-delete cycle (with `.privateKeyUsage` only, no biometry, so it cannot prompt) — non-`Darwin` platforms short-circuit to `False` without touching pyobjc.
-
-**Internal Python surface (frozen for PR4 callers — codex review LOW-2)**:
-
-```python
-class WrapError(Exception): ...                 # base; all PR3 errors derive from here
-class WrapParseError(WrapError): ...            # malformed blob (length, magic, version, alg_suite, key_id_hash mismatch, invalid EC point)
-class WrapIntegrityError(WrapError): ...        # AES-KW AIV check failed (tampered wrapped_dek or ephemeral_pub)
-class WrapNativeUnavailable(WrapError): ...     # Security.framework not importable (non-macOS or pyobjc missing)
-class WrapAuthCancelled(WrapError): ...         # user denied biometry / passcode prompt; emit keyvault.unwrap_denied
-class WrapKeyNotFound(WrapError): ...           # Keychain has no item for this key_id (key revoked or wrong device)
-class WrapKeyAlreadyExists(WrapKeyNotFound): ...  # duplicate key_id at generation time; WrapKeyNotFound subclass so historical `except` sites keep catching it
-
-def generate_wrapping_key(key_id: str, *, backend: NativeBackend, native_key_id: str | None = None) -> bytes: ...
-def get_wrapping_key_public(key_id: str, *, backend: NativeBackend, native_key_id: str | None = None) -> bytes: ...
-def delete_wrapping_key(key_id: str, *, backend: NativeBackend, native_key_id: str | None = None) -> None: ...
-def wrap_dek(dek: bytes, key_id: str, *, backend: NativeBackend, native_key_id: str | None = None) -> bytes: ...
-def unwrap_dek(blob: bytes, key_id: str, *, audit_sink: AuditSink, backend: NativeBackend, native_key_id: str | None = None) -> bytes: ...
+```text
+"MRKW"(4) | version(1) | suite(1) | key_id_hash(16) |
+ephemeral P-256 public key(65) | AES-KW wrapped DEK(40)
 ```
 
-`api.py` (Phase 4 PR4) is the only callsite — internal API contract for `mordred_keyvault.api.generate` / `encrypt` / `decrypt` / `export_backup` / `import_backup` derives from this surface.
+Wrapping uses the cached native public key and a fresh software ephemeral
+P-256 key, derives a 32-byte KEK with HKDF-SHA-256 bound to the non-secret
+header fields, and applies RFC 3394 AES Key Wrap to a 32-byte DEK. It requires
+no private-key authorization and emits no successful unwrap event.
 
-**Migration policy** (mirrors PR2 backup wire format L428-433): a future `version=2` must keep `magic = b"MRKW"` and `version` at byte offset 4 stable as dispatch keys; bump the table above; do not silently upgrade existing blobs in place (preserves provenance evidence).
+Unwrapping invokes native ECDH and emits exactly one of
+`keyvault.unwrap_authorized` or `keyvault.unwrap_denied`. AES-KW has no
+separate IV field; its fixed integrity value is part of the 40-byte result.
 
 #### PR4 API contract & MREN envelope wire format (Phase 4 PR4 step-0 freeze, 2026-05-15)
 
-The planning-stage codex review of PR4 (BLOCKER × 3 + HIGH × 5 + MEDIUM × 3 + LOW × 1) is incorporated below. The freeze covers `api.py` public surface, MREN envelope format, normalization split, two-phase generation, opaque `SeedDisplayHandle`, managed storage, file-safety semantics, and the four new audit codes.
+The historical heading remains the stable anchor for the public keyvault API
+and `MREN` v1. Current behavior is defined by the following subsections.
 
 ##### Mordred normalization (split: seed phrase vs passphrase, codex HIGH #1)
 
-The PR2 freeze (L349) said "(NFKD + casefold + single-space collapse) is the caller's responsibility". Codex pre-implementation review flagged that applying this uniformly to passphrase weakens entropy (casefold conflates distinct Unicode strings; whitespace collapse drops information). PR4 splits normalization:
+Seed phrases use Unicode NFKD, remove Unicode format (`Cf`) characters,
+case-fold, split on whitespace, and rejoin with one ASCII space. This matches
+the tolerance expected for BIP39 words.
 
-```python
-def _normalize_seed_phrase(s: str) -> str:
-    # BIP39 + tolerance: NFKD decompose, strip Cf-category chars,
-    # casefold, collapse runs of whitespace.
-    # Seed phrases are word lists — casefold and whitespace tolerance are correct.
-    # Cf-strip handles invisible clipboard noise (ZWSP / ZWJ / BOM / soft hyphen);
-    # these are NFKD-stable and str.split() does not treat them as whitespace,
-    # so without an explicit drop they survive normalization and silently
-    # produce a different digest (code-reviewer MEDIUM-1, 2026-05-15).
-    decomposed = unicodedata.normalize("NFKD", s)
-    stripped = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Cf")
-    return " ".join(stripped.casefold().split())
-
-def _normalize_passphrase(s: str) -> str:
-    # BIP39 reference normalization: NFKD only. No casefold, no whitespace
-    # collapse, NO Cf strip — preserves the exact entropy of the input. A user
-    # who chose to embed an invisible char did so intentionally; recovery
-    # requires reproducing the same bytes. The verify-digest mismatch at
-    # recovery time surfaces any clipboard-injected invisible char visibly.
-    return unicodedata.normalize("NFKD", s)
-```
-
-Both apply at `api.py` boundaries (`prepare_generate` / `verify_digest` / `import_backup`). `digest.compute_digest` continues to receive already-normalized UTF-8 bytes as PR2 freeze. The existing fixed test vector (L355-362) remains valid for ASCII inputs (`"test seed"` / `"test pass"` have no NFKD decomposition and no casefold delta). PR4 adds new fixed vectors covering Japanese precomposed/decomposed equivalence on the seed side and entropy preservation on the passphrase side.
+Passphrases use Unicode NFKD only. Case, whitespace, and format characters are
+significant entropy and are not trimmed, folded, or removed. The two
+normalizers must not be merged.
 
 ##### Two-phase generate (codex BLOCKER #2)
 
-SPEC §Key generation and verification digest mandates that key generation be "mandatory and one-shot" and finalize only after the verification digest matches. A single-call `generate(seed, passphrase, pow)` cannot enforce that — Keychain state and `meta.json` would be created before the user has confirmed via the offline channel. PR4 splits into two phases:
+`prepare_generate(seed, passphrase, pow_bytes)` computes the digest and
+returns `(SeedDisplayHandle, expected_digest)` without disk, backend, or audit
+mutation. `confirm_generate(...)` consumes the confirmed state and performs
+the native/persistent transaction only after a timing-safe digest match.
+`generate(...)` is the composed public convenience entry point and preserves
+the same fail-before-mutation guarantee.
 
-```python
-def prepare_generate(
-    seed_phrase: str,
-    passphrase: str,
-    pow_bytes: bytes,
-) -> tuple[SeedDisplayHandle, bytes]:
-    # In-memory only. Computes digest from normalized inputs. Returns:
-    #   - handle: opaque SeedDisplayHandle consumed by seed_display.display_seed
-    #   - expected_digest: 32-byte digest for user to confirm via offline channel
-    # NO Keychain creation, NO meta.json write, NO digests/ commit, NO audit emit.
-    # Pure function with respect to disk state.
-    ...
-
-def confirm_generate(
-    handle: SeedDisplayHandle,
-    user_confirmed_digest: bytes,
-    *,
-    key_id: str | None = None,
-    backend: NativeBackend,
-    audit_sink: AuditSink,
-    home: Path | None = None,
-) -> GenerateResult:
-    # Reads the prepared digest via handle.expected_digest() — the
-    #   confirm-side egress: it does NOT consume the handle (consume() is
-    #   the display flow's egress, so prepare -> display-seed -> confirm
-    #   works), but on an expired deadline it wipes the seed payload before
-    #   raising SeedDisplayExpired.
-    # Verifies user_confirmed_digest matches that digest via hmac.compare_digest.
-    # On mismatch: emit keyvault.init_denied (sink failure chained as
-    #   __context__), raise VerificationDigestMismatch; NO mutation. The
-    #   handle is not consumed, so the caller may retry with a corrected
-    #   digest on the same handle.
-    # On match:
-    #   0. Re-init guard: v1 keyvault is single-key (Story 5). If meta.json
-    #      has any main key or any pending/committed native-key ownership
-    #      record (including audit-key records), raise RuntimeError. Checked
-    #      once unlocked (before init_started, to avoid a dangling audit
-    #      event) and again authoritatively under the lock (TOCTOU-safe).
-    #   1. Emit keyvault.init_started (audit-sink failure aborts; durability barrier).
-    #   2. Under the stable lifecycle + per-root lock: re-check the re-init
-    #      guard, derive the profile-scoped native_key_id, and durably write a
-    #      top-level pending_native_key ownership journal BEFORE native
-    #      generation. A helper may publish a key and then report a durability
-    #      error; reset can safely recover that deterministic physical id.
-    #   3. Generate through wrap.generate_wrapping_key(logical_key_id,
-    #      native_key_id=...). key_id=None resolves to logical "default".
-    #   4. Still under the same hold: write digests/<key_id_hash>.commit FIRST,
-    #      then durably save the meta row containing logical key_id +
-    #      native_key_id WHILE RETAINING pending_native_key (ownership commit).
-    #      Only a second durable meta save removes pending_native_key. A
-    #      first-save post-rename error plus failed native rollback therefore
-    #      leaves row+pending and every normal operation fails closed. Failure
-    #      of the second cleanup never rolls back the durably-owned key: a
-    #      visible valid row with no pending is safe; a visible pending remains
-    #      incomplete and requires reset.
-    #   5. Emit keyvault.init_completed (sink failure suppressed; init has already succeeded).
-    # ``backend`` is required (no None default) — matches encrypt/decrypt;
-    #   the production backend is a later step so there is no None fallback.
-    ...
-
-def generate(
-    seed_phrase: str,
-    passphrase: str,
-    pow_bytes: bytes,
-    expected_digest: bytes,
-    *,
-    key_id: str | None = None,
-    backend: NativeBackend,
-    audit_sink: AuditSink,
-    home: Path | None = None,
-) -> GenerateResult:
-    # Non-interactive convenience: prepare → confirm in one call.
-    # Tests and future automation use this. Wizard CLI MUST use the two-phase form.
-    # Delegates fully to confirm_generate (no in-generate digest pre-check):
-    # confirm_generate reads the handle's digest, compares, and emits
-    # keyvault.init_denied on mismatch — so a non-interactive mismatch gets
-    # the same audit trail as the interactive path.
-    handle, _prepared = prepare_generate(seed_phrase, passphrase, pow_bytes)
-    try:
-        return confirm_generate(handle, expected_digest, key_id=key_id, backend=backend,
-                                audit_sink=audit_sink, home=home)
-    finally:
-        # No display flow consumes the handle in the non-interactive path,
-        # so generate() wipes the seed itself (consume() under the lock) on
-        # both the success and the raise paths.
-        with contextlib.suppress(SeedDisplayExpired):
-            handle.consume()
-```
+The default logical key ID is `default`. A successful result reports the
+logical key ID, its hashed storage identity, and the committed UTC timestamp.
 
 ##### SeedDisplayHandle (opaque, codex BLOCKER #3)
 
-A frozen dataclass with `seed_phrase: str` would expose the seed via `repr`, equality comparison, hash-based memoization, and long-lived object retention. PR4 defines `SeedDisplayHandle` as an opaque class with:
+`SeedDisplayHandle` is intentionally not a dataclass or serializable secret
+container. Its observable representation is always redacted. It is unhashable,
+rejects equality/copy/deepcopy/pickle/state access, serializes consumption with
+a lock, and releases the normalized seed at most once. Expiry wipes before
+raising `SeedDisplayExpired`.
 
-```python
-class SeedDisplayHandle:
-    __slots__ = ("_payload", "_consumed", "_deadline", "_expected_digest", "_lock")
-
-    def __init__(
-        self,
-        normalized_seed: str,
-        deadline_monotonic: float,
-        expected_digest: bytes,
-    ) -> None:
-        self._payload = bytearray(normalized_seed.encode("utf-8"))  # wipeable
-        self._consumed = False
-        self._deadline = deadline_monotonic  # time.monotonic() + 60.0 by default
-        # 32-byte digest baked in by prepare_generate; confirm_generate
-        # uses this as the compare target for hmac.compare_digest against
-        # the user-typed value (defense-in-depth: even if the caller forgot
-        # to verify before calling confirm_generate, the handle still
-        # raises on mismatch). Coerced through bytes(...) and length-checked.
-        self._expected_digest = bytes(expected_digest)
-        self._lock = threading.Lock()  # serializes consume() across threads
-
-    def __repr__(self) -> str:
-        return "<SeedDisplayHandle redacted>"
-
-    def __eq__(self, other: object) -> bool:
-        raise TypeError("SeedDisplayHandle does not support equality (would leak via comparison oracle)")
-
-    __hash__ = None  # unhashable: cannot land in dict/set/cache by accident
-
-    # __copy__ / __deepcopy__ / __reduce__ / __reduce_ex__ / __getstate__
-    # / __setstate__ all raise TypeError — the default object machinery
-    # would otherwise duplicate or serialize the slotted _payload and leak
-    # the seed (or let a duplicate consume() it after the original wiped).
-
-    def consume(self) -> str:
-        # One-shot. Returns the normalized seed string, then zero-fills internal bytes.
-        # The whole body runs under self._lock so the one-shot guarantee holds
-        # even if the handle is shared across threads.
-        # After consume(): subsequent calls raise RuntimeError("handle already consumed").
-        # If time.monotonic() > self._deadline: raise SeedDisplayExpired, wipe, do not return.
-        # consume() is the DISPLAY FLOW's egress for the seed.
-        ...
-
-    def expected_digest(self) -> bytes:
-        # confirm_generate's read-only egress: returns the prepared
-        # verification digest WITHOUT consuming the handle. The deadline
-        # guard fires only while the seed is still live (not _consumed):
-        # an expired, never-consumed handle is wiped before raising
-        # SeedDisplayExpired; once consume() has wiped the seed the deadline
-        # is moot, so expected_digest() returns the digest even past the
-        # deadline (a slow user confirming after the display window still
-        # succeeds). Callable repeatedly.
-        ...
-```
-
-> **Step-D extension (2026-05-15, PR4c-1)**: the original step-0 freeze
-> listed 3 slots; this proved inconsistent with the `confirm_generate`
-> comment "Verifies user_confirmed_digest matches handle's prepared
-> digest" because the handle had no compare target. Two slots were
-> appended during PR4c-1 (the first three are preserved in SPEC order):
->
-> - `_expected_digest` (4th) — the BLAKE3 compare target. Coerced through
->   `bytes(...)` so a caller-passed `bytearray` / `memoryview` cannot
->   alias-mutate it post-construction, and length-validated (== 32) at
->   construction time.
-> - `_lock` (5th) — a per-handle `threading.Lock` serializing `consume()`;
->   without it two threads sharing a handle could both pass the one-shot
->   guard and release the seed twice.
->
-> PR4c-1 also added `__copy__` / `__deepcopy__` / `__reduce__` /
-> `__reduce_ex__` / `__getstate__` / `__setstate__` guards (all raise
-> `TypeError`) so the default copy / pickle / state-dump machinery
-> cannot duplicate or serialize the seed payload. CPython-level
-> introspection (`gc.get_referents`, `ctypes`, a debugger) remains out
-> of scope — defending it would require C-level work.
-
-Phase 4 PR7 `seed_display.py` layers the screen-blackout-assert + M4/M5 warning banner + 60s monotonic display loop + screenshot detection on top of this class. `SeedDisplayHandle` is **not** relocated — it stays in `api.py` and `seed_display.display_seed` consumes it, so api.py callers are unaffected (the original plan said "relocate", but keeping it in `api.py` keeps the contract narrow as PR4 intended). `display_seed(handle, surface, ...)`: blackout assert (`network_fallback.resolve_blackout_assert`, fail-closed) → `surface.banner(SEED_DISPLAY_BANNER)` → screenshot pre-check → `handle.consume()` → 60s `time.monotonic()` timer polling `CGScreenIsBeingCaptured` → `finally` auto-clear. A detected capture clears the surface, emits `keyvault.seed_display_aborted_screenshot`, and raises `SeedDisplayAborted`.
+The non-secret expected digest remains readable after a successful display so
+a slow confirmation does not resurrect or retain the seed.
 
 ##### MREN envelope (managed storage, decrypt requires purpose)
 
-```
-offset  bytes  field
-0       4      magic = b"MREN"
-4       1      version = 1
-5       16     key_id_hash = SHA-256(key_id)[:16]
-21      16     purpose_hash = SHA-256(purpose)[:16]
-37      127    wrapped_dek (RFC 3394 AES-KW under Enclave-derived KEK, PR3 MRKW prefix verbatim)
-164     4      aes_blob_len (uint32 big-endian)
-168     N      aes_blob = nonce(12) || ciphertext || tag(16)
+`MREN` v1 layout is:
+
+```text
+"MREN"(4) | version(1) | key_id_hash(16) | purpose_hash(16) |
+wrapped_dek/MRKW(127) | aes_blob_len(4 BE) |
+nonce(12) | ciphertext(N) | tag(16)
 ```
 
-AAD = bytes `[0:164]` (`magic || version || key_id_hash || purpose_hash || wrapped_dek`). Any header byte flip invalidates the GCM tag, mirroring PR2/PR3 integrity story. Total envelope size: `196 + len(plaintext)` bytes minimum (the 127-byte MRKW prefix is itself wrapped-dek-only; the +N bytes are ciphertext + tag).
-
-API surface (managed storage — keyvault owns persistence):
-
-```python
-def encrypt(
-    key_id: str,
-    plaintext: bytes,
-    purpose: str,
-    *,
-    backend: NativeBackend | None = None,
-    audit_sink: AuditSink,
-    home: Path | None = None,
-) -> str:
-    # Generates fresh DEK (secrets.token_bytes(32)); offline-wraps via wrap.wrap_dek;
-    # AES-GCM encrypts plaintext under DEK with AAD bound to header. Persists to
-    # ciphertexts/<key_id_hash_hex>/<purpose_hash_hex>/<envelope_id>.gcm via atomic
-    # tmp+rename+fsync under .lock, file mode 0600. Returns envelope_id
-    # (URL-safe base64 of 16 random bytes, ~22 chars).
-    ...
-
-def decrypt(
-    key_id: str,
-    envelope_id: str,
-    purpose: str,
-    *,
-    backend: NativeBackend | None = None,
-    audit_sink: AuditSink,
-    home: Path | None = None,
-) -> bytes:
-    # Reads envelope; verifies envelope.purpose_hash == SHA-256(purpose)[:16] via
-    # hmac.compare_digest BEFORE invoking wrap.unwrap_dek. Cross-purpose attempts
-    # raise WrapParseError without spending a biometric prompt or emitting audit
-    # (mirrors PR3 review-fix-1 HIGH-1 "no emit for parse errors"). On purpose match:
-    # unwraps DEK (PR3 wrap layer emits keyvault.unwrap_authorized or _denied via
-    # codes #19/#20 — api.decrypt does NOT double-emit), then AES-GCM decrypts.
-    ...
-```
-
-Per-ciphertext DEK rationale (codex OD-1 confirmed): each `encrypt` generates a fresh 32-byte DEK. AES-GCM nonce reuse across plaintexts is structurally eliminated. The 127-byte MRKW prefix per envelope is acceptable overhead; the biometric-prompt-per-decrypt UX cost is acceptable for Tier 1 posture (v2-F5 may add a configurable in-memory grace window).
+The first 164 bytes are AES-GCM AAD; the fixed header including the length is
+168 bytes. The parser verifies magic, version, framing, key hash, and purpose
+hash before native unwrap. Envelopes are stored beneath hashed key and purpose
+directories; clear purpose strings are not recoverable from their path.
 
 ##### export_backup / import_backup (ciphertext-rewrap manifest, codex BLOCKER #1)
 
-Codex flagged that an Enclave-only DEK wrap is unrecoverable across machines (Enclave keys are non-exportable). PR4 implements full ciphertext portability via a passphrase-derived KEK manifest: each envelope is unwrapped, the AAD is rebound from the per-device MRKW prefix to a portable form, and on import the envelope is reconstructed with a fresh Enclave wrap on the destination device. The DEK travels in the manifest (encrypted-at-rest by the passphrase-derived KEK), so the destination device never needs the source device's Enclave key.
+`keyvault.api.export_backup()` unwraps each stored DEK through the authorized
+native boundary, rewraps the manifest under an `MRKV` recovery blob, returns
+the bytes in memory, and emits `keyvault.backup_exported`. It does not choose a
+destination path or persist a temporary plaintext/export file.
 
-**Portable manifest AAD**: `manifest_aad = b"MRMN" || key_id_hash(16) || purpose_hash(16)` — exactly 36 bytes, fully reconstructible from `(key_id, purpose)` on the import side. It does NOT include the MRKW prefix because that prefix is per-device and changes on each machine.
+`keyvault.api.import_backup()` accepts an `MRKV` blob, verifies the embedded
+digest before KDF/decryption, provisions a fresh native key in an empty target
+keyvault, and reconstructs purpose-bound `MREN` envelopes for that device.
+Import refuses overwrite/merge conflicts and rolls back provisional state on
+failure.
 
-```python
-def export_backup(
-    key_id: str,
-    passphrase: str,
-    *,
-    backend: NativeBackend | None = None,
-    audit_sink: AuditSink,
-    home: Path | None = None,
-) -> bytes:
-    # 1. Walk ciphertexts/<sha256(key_id)[:16].hex()>/**/*.gcm.
-    # 2. For each envelope file, parse the MREN wire format (SPEC §MREN envelope above):
-    #    extract wrapped_dek_blob (offset 37, 127 bytes), aes_blob (offset 168, len from
-    #    aes_blob_len field), purpose_hash (offset 21, 16 bytes), envelope_id (filename
-    #    minus .gcm).
-    # 3. Reconstruct the envelope's original AAD = envelope_bytes[0:164]
-    #    (magic || version || key_id_hash || purpose_hash || wrapped_dek_blob).
-    # 4. Call wrap.unwrap_dek(wrapped_dek_blob, key_id, backend=...) to recover the 32-byte
-    #    DEK (single biometric prompt covers the whole batch — SecKeyCopyKeyExchangeResult
-    #    sessions amortize one user gesture across all envelopes in the same call frame;
-    #    if Enclave behavior changes in a future macOS, fall back to one-prompt-per-envelope
-    #    and document in PR description).
-    # 5. AES-GCM-decrypt the original aes_blob under the recovered DEK with the original AAD
-    #    → original_plaintext.
-    # 6. Compute portable manifest_aad = b"MRMN" || key_id_hash(16) || purpose_hash(16)
-    #    (36 bytes, no MRKW prefix).
-    # 7. AES-GCM-re-encrypt: manifest_aes_blob = AES-GCM-encrypt(DEK, original_plaintext,
-    #    aad=manifest_aad) with a fresh 96-bit nonce. Output bytes = nonce(12)||ciphertext||tag(16).
-    # 8. Append a manifest entry (manifest_aad is recomputable on import from key_id +
-    #    purpose, so it is NOT stored in the entry):
-    #      {
-    #        "purpose_hash_hex": "<32 hex chars>",
-    #        "envelope_id":      "<URL-safe b64, 22 chars>",
-    #        "dek_hex":          "<64 hex chars>",
-    #        "manifest_aes_blob_b64": "<base64 of step-7 output>",
-    #      }
-    # 9. Serialize manifest as canonical JSON:
-    #      manifest_json = json.dumps({
-    #        "version": 1,
-    #        "key_id": <plaintext key_id>,
-    #        "envelopes": [<entry>, ...],
-    #      }, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    # 10. Argon2id-derive KEK_passphrase from passphrase + fresh 16-byte salt
-    #     (m=46 MiB, t=1, p=1 — same parameters as PR2 backup.export).
-    # 11. manifest_body = AES-GCM-encrypt(KEK_passphrase, manifest_json,
-    #     aad=PR2_backup_header_aad) (PR2 backup wire format AAD already binds salt + KDF
-    #     params + verification_digest).
-    # 12. Pack PR2 MRKV blob with verification_digest from digests/<sha256(key_id)[:16].hex()>.commit
-    #     and manifest_body as the AES blob payload (PR2 backup.export contract).
-    # 13. Emit keyvault.backup_exported (#24, fields: key_id_hash, blob_version=1,
-    #     kdf_id=1, envelope_count = len(manifest.envelopes)).
-    # Returns the MRKV blob bytes; file persistence is the caller's responsibility.
-    ...
-
-def import_backup(
-    blob: bytes,
-    passphrase: str,
-    *,
-    seed_phrase: str,
-    pow_bytes: bytes,
-    backend: NativeBackend | None = None,
-    audit_sink: AuditSink,
-    home: Path | None = None,
-) -> str:
-    # 1. recovery.parse_header(blob) — PR2 contract; raises BackupCorrupt on parse failure.
-    # 2. Recompute verification digest from normalized (seed_phrase, passphrase, pow_bytes)
-    #    using api._normalize_seed_phrase + api._normalize_passphrase + digest.compute_digest.
-    #    Compare with the header's verification_digest field via 32-byte length guard +
-    #    hmac.compare_digest. Mismatch → raise RecoveryDigestMismatch + emit
-    #    keyvault.recovery_digest_mismatch (#17).
-    # 3. Argon2id-derive KEK_passphrase from passphrase + parsed salt.
-    # 4. AES-GCM-decrypt manifest_body → manifest_json. AAD = PR2 backup header AAD.
-    # 5. Parse manifest JSON; validate "version" == 1. Require a genuinely
-    #    fresh destination: no main row, pending main journal, committed audit
-    #    ownership, pending audit journal, digest, or ciphertext artifact.
-    # 6. imported_key_id = manifest["key_id"]. Derive this destination
-    #    profile's native_key_id, persist pending_native_key, then generate the
-    #    physical key on this device. The portable logical id is unchanged.
-    # 7. For each manifest entry (in declared order):
-    #    a. Recompute manifest_aad = b"MRMN" || sha256(imported_key_id)[:16] ||
-    #       bytes.fromhex(entry["purpose_hash_hex"]) (36 bytes, identical to export step 6).
-    #    b. plaintext = AES-GCM-decrypt(bytes.fromhex(entry["dek_hex"]),
-    #                                   b64decode(entry["manifest_aes_blob_b64"]),
-    #                                   aad=manifest_aad).
-    #    c. new_wrapped_dek = wrap.wrap_dek(dek_bytes, imported_key_id,
-    #       native_key_id=..., backend=...) — offline, and produces a fresh
-    #       127-byte MRKW blob whose wire hash remains logical while its DEK is
-    #       bound to THIS profile's physical public key.
-    #    d. new_key_id_hash = sha256(imported_key_id)[:16].
-    #       new_envelope_aad = b"MREN" || version(1) || new_key_id_hash ||
-    #                           bytes.fromhex(entry["purpose_hash_hex"]) || new_wrapped_dek
-    #       (164 bytes total — identical layout to step-C MREN envelope §AAD).
-    #    e. new_aes_blob = AES-GCM-encrypt(dek_bytes, plaintext, aad=new_envelope_aad) with a
-    #       fresh 96-bit nonce. Output bytes = nonce(12) || ciphertext || tag(16).
-    #    f. envelope_bytes = new_envelope_aad ||
-    #                        len(new_aes_blob).to_bytes(4, "big") || new_aes_blob.
-    #    g. Persist envelope_bytes to
-    #       ciphertexts/<new_key_id_hash.hex()>/<entry["purpose_hash_hex"]>/<entry["envelope_id"]>.gcm
-    #       via the step-B atomic + fsync + flock helpers.
-    # 8. Write digests/<new_key_id_hash.hex()>.commit, then durably save a meta
-    #    row carrying imported_key_id + native_key_id while retaining
-    #    pending_native_key. A separate save clears pending only after that
-    #    ownership commit succeeds, under the same lifecycle/per-root lock.
-    # 9. Return imported_key_id.
-    # 10. On failure through the first ownership save: delete only the scoped
-    #     native_key_id and remove transaction artifacts, then re-raise. If
-    #     native deletion fails, retain row+pending (when the rename landed) or
-    #     pending-only so reset can retry. After ownership save succeeds,
-    #     pending cleanup failure never deletes the key.
-    ...
-```
-
-**Manifest wire format** (inside the MRKV body, after PR2 header parse + AES-GCM decrypt):
-
-```
-Mordred Manifest v1 — UTF-8 JSON with canonical separators:
-{
-  "version": 1,
-  "key_id": "<plaintext key_id>",
-  "envelopes": [
-    {
-      "purpose_hash_hex": "<32 hex chars = sha256(purpose)[:16].hex()>",
-      "envelope_id":      "<URL-safe base64, 22 chars, no padding>",
-      "dek_hex":          "<64 hex chars = 32-byte DEK>",
-      "manifest_aes_blob_b64": "<base64 of nonce(12)||ciphertext||tag(16)>"
-    }
-  ]
-}
-```
-
-`manifest_aad` is **not stored in the manifest entry** — it is recomputed deterministically on import from `(manifest["key_id"], entry["purpose_hash_hex"])` so a manifest with a tampered `key_id` or `purpose_hash_hex` fails AES-GCM tag verification on import. This is the AAD-binding integrity story: any field that participates in `manifest_aad` is implicitly authenticated; tampering one field flips the GCM tag.
-
-**Why re-encrypt** (rather than ship the original `aes_blob` unmodified): the original envelope's AAD includes the per-device MRKW prefix (`wrapped_dek_blob`, 127 bytes). The destination device has a different Enclave key and therefore a different MRKW prefix, so the original AAD cannot be reconstructed there. AES-GCM does NOT allow rebinding AAD without re-encryption — that is by design (AAD is part of the tag computation). The export side therefore decrypts under the original AAD, the manifest side carries plaintext under a *portable* AAD (no MRKW component), and the import side re-encrypts under the new device's envelope AAD. The plaintext is exposed in memory only inside `export_backup` and `import_backup`; it never touches disk.
+The CLI exposes export through `keyvault export --output <path>`. It selects
+the single initialized logical key, collects the init passphrase and any
+required paper Seed Phrase through masked prompts, and delegates MRKV creation
+to `keyvault.api.export_backup()`. The wizard publishes a complete mode-`0600`
+file atomically without replacement. The parent must already be a real
+directory, the final path must not exist, and failures leave no partial final
+file. Import remains `keyvault recover --blob <path>` into an empty profile.
 
 ##### File-safety semantics (step-B foundation, codex HIGH #4)
 
-All keyvault filesystem operations MUST:
+Security-sensitive state uses profile-scoped validated roots, mode `0700`
+directories, mode `0600` regular files, atomic replacement, directory flushes,
+and stable lock files. Reads and writes reject unsafe symlinks and special-file
+endpoints. Lifecycle lock ordering prevents reset, import, generation, and
+envelope mutation from crossing one another.
 
-- Open files with `os.open(path, O_NOFOLLOW)` to refuse symlink-following (symlink → `KeyvaultPermissionError`).
-- Reject existing files whose mode is not `0600` and directories whose mode is not `0700` via `fstat` after open (mode mismatch → `KeyvaultPermissionError`).
-- Write atomically: `<file>.tmp + fsync(tmp_fd) + os.replace(tmp, final) + fsync(parent_dir_fd)`.
-- Acquire the stable parent-side `.keyvault.lifecycle.lock` before the per-root
-  `keyvault/.lock`, and hold them across every operation that must serialize
-  with reset (generate, encrypt/decrypt, export/import, and auxiliary audit-key
-  provisioning). Reset holds the stable lifecycle lock through native deletion
-  and root removal. Public metadata/status snapshots join that lifecycle lock
-  and re-check the parent reset journal before reading. Reset durably flushes
-  root removal before unlinking the journal; a failed journal-unlink flush
-  re-publishes the recovery bytes before returning an error.
-- On `meta.json` corruption (JSON parse failure / missing required keys / `version` mismatch): raise `KeyvaultCorruptError` whose `str()` does NOT include the corrupted contents (audit-safety — corrupted JSON could include secret-shaped bytes from a partially-overwritten file).
+The exact persistent inventory and journal names are owned by
+[`PATHS.md`](./PATHS.md).
 
 ##### Audit emissions for PR4 (4 new reason codes #21-24)
 
-See `POLICY.md` §"Phase 4 PR4 step-0 freeze" for the full table. Summary:
+The heading is historical; the complete current enum is in
+[`POLICY.md`](./POLICY.md). The four format-era events remain:
 
-| # | Code | Emit site | Decision |
-| --- | --- | --- | --- |
-| 21 | `keyvault.init_started` | `confirm_generate` durability barrier | `allow` |
-| 22 | `keyvault.init_completed` | `confirm_generate` success | `allow` |
-| 23 | `keyvault.init_denied` | `confirm_generate` digest mismatch | `block` |
-| 24 | `keyvault.backup_exported` | `export_backup` success | `allow` |
+- `keyvault.recovery_digest_mismatch`
+- `keyvault.seed_display_aborted_screenshot`
+- `keyvault.unwrap_authorized`
+- `keyvault.unwrap_denied`
 
-`encrypt` and `decrypt` are NOT audited at the api layer (codex OD-3): `encrypt` has no auth gate (wrap is offline), and `decrypt` already inherits #19/#20 via the wrap layer.
+Initialization and backup export add their own later stable reasons. An event
+contains bounded identifiers only, never seed words, passphrases, raw key IDs,
+DEKs, or backup bytes.
 
 ##### Capability-probe fail-on-skip (codex HIGH #5)
 
-`is_secure_enclave_available()` returning `False` while `MORDRED_KEYVAULT_LIVE=1` is set in the environment MUST cause the live test suite to **fail** (not skip). The integration test fixture asserts the capability and the env var consistency before any per-test skip logic.
+Live backend tests are allowed to skip only when their entire suite was not
+requested. Once `MORDRED_KEYVAULT_LIVE=1` requests the live path, missing
+hardware capability, helper installation, or authorization is a failure, not
+a green skip. CI cannot provide the device interaction; maintainers record the
+manual result as required by [`CI.md`](./CI.md).
+
+#### Agent-memory at-rest encryption (sealed memory file format v1)
+
+No Hermes release encrypts `<home>/memories/*.md`, and the `memory`
+encryption target previously only provisioned a key without protecting
+anything on disk. This runtime makes that protection real, on the same
+precedent as the `.env` write guard and the config `.pth` hook: a defensive
+wrapper Mordred installs around a private upstream seam, fail-closed on the
+read path.
+
+The sealed memory file format is a two-line text container:
+
+```text
+line 0: HERMES-MEMORY-ENC-v1
+line 1: base64url(nonce[12] || AES-256-GCM(plaintext, aad))
+```
+
+The key is `HERMES_MEMORY_KEY`: URL-safe base64 of exactly 32 bytes, with an
+optional `base64:` or `hex:` prefix. AAD binds each ciphertext to its file's
+basename (`hermes-memory-v1:<file basename>`) so `MEMORY.md` and `USER.md`
+ciphertexts cannot be swapped for each other. The format is text-safe on
+purpose — an upstream `read_text()` of a sealed file yields a recognisable
+magic line instead of a `UnicodeDecodeError`. Every write uses a fresh nonce,
+and the plaintext is always the whole file body: Mordred encrypts bytes and
+leaves entry parsing to Hermes.
+
+Arming is evaluated per call, from a marker file and the current key, never
+cached:
+
+| marker | key | behavior |
+|---|---|---|
+| absent | any | not armed — plaintext as today |
+| present | valid | armed — writes seal; reads unseal sealed files and pass plaintext files through (migration on write) |
+| present | missing or invalid | armed, fails closed for memory I/O — every write refuses, and reading a *sealed* file refuses; plaintext files still read |
+| present | valid, but ciphertext fails to authenticate | refuses loudly — the read raises, so the affected load or mutation aborts and nothing is overwritten |
+
+`HERMES_SAFE_MODE` disarms the hook outright. An undecryptable sealed file
+always refuses loudly rather than reporting an empty memory. The hook never
+blocks interpreter start-up; when sealed files exist and the key is missing,
+the first memory load fails with the remedy in the message (so agent start-up
+stops there) instead of presenting an empty memory, and every memory write
+refuses — Mordred never silently writes plaintext while armed.
+
+Seam coverage depends on which shape of the upstream memory tool is
+installed. Mordred wraps three call sites per seam shape shipped by
+hermes-agent 0.13–0.15, 0.16–0.19, and current main: the read chokepoint, the
+write chokepoint, and the drift-backup write. An unrecognised seam is
+unsupported: when armed, the process refuses to start (`sys.stderr` plus exit
+1, recoverable with `HERMES_SAFE_MODE=1`); when not armed, nothing is wrapped
+and memory stays plaintext.
+
+Known out-of-band paths are documented limitations, not silent gaps: `hermes
+agent-import` is best-effort patched; raw readers (`hermes doctor` size
+reporting, the Desktop learning graph, the Honcho migration upload) see
+sealed text and degrade gracefully rather than leak plaintext; an
+out-of-process writer produces plaintext that is sealed on its next write and
+shown as `exposed` in the meantime; and `memory.write_approval` pending JSON
+stays plaintext (`encryption enable memory` warns about it).
+
+`encryption enable memory` requires the runtime probe to pass and the env
+target to already be enrolled and not opted out — the key rides on the env
+shim. It performs one Touch ID authorization through `set_memory_key`, writes
+the marker, eagerly migrates existing plaintext files to sealed, and warns
+when a running gateway needs a restart to pick up the change. `encryption
+disable memory` decrypts every sealed file back to plaintext, removes the
+marker and sets the opt-out marker (paused by operator), and keeps the key.
+`encryption purge memory` disables and then strips the key. `encryption
+status` reports `on`, `paused`, `off`, or `exposed`. `setup` runs a
+`memory-encryption` step right after `env-encryption`: it runs without a
+dedicated prompt, exactly like the env step (the opt-out marker is how an
+operator declines), resolves `manual` under `--non-interactive`, and honours
+the operator opt-out.
+
+The capability probe `runtime_memory_encryption_available` joins the env and
+config probes in the same family and appears in `encryption status`'s gateway
+lines. A CI canary test runs the round trip against the installed upstream
+memory tool so an upstream refactor of the seam trips a red build rather than
+a silent regression.
 
 #### Explicitly out of v1
 
-- Encryption of binaries/folder names/file names → `v2-F6`
-- per-skill file-encryption mapping → `v2-F6`
-- External HSM, Windows-native DPAPI/TPM, and master-password backends →
-  `v2-OS2` (Linux TPM 2.0 is already shipped)
-- Secure Enclave-backed signing isolation, Payment signing → `v3-P1`
-- Session log encryption → requires a session-log writer seam on the Hermes side
+- exporting private native wrapping keys;
+- silently downgrading Linux TPM protection to a software key;
+- automatic migration of an existing key when `enable-se` or `enable-tpm`
+  installs a helper;
+- unattended claims for keys created with attended authorization policy;
+- same-UID tamper-proof storage; and
+- cross-purpose decryption or recovery into a non-empty keyvault.
 
 ### Plugin: `mordred_wizard` (CLI Extension)
 
-Provides the canonical `hermes-mordred ...` console-script tree. The wizard
-also passes the same parser setup to
-`PluginContext.register_cli_command("mordred", help, setup_fn, handler_fn)` as
-an optional host-CLI compatibility surface.
+The standalone CLI exposes these top-level commands:
 
-Subcommands:
-- `hermes-mordred setup` — re-runnable first-run orchestrator; probes each step (upstream Hermes, `configure`, `network init`, the platform key helper, `keyvault init`, `encryption enable env`) and runs only what is incomplete, then prints `status`. Flags: `--with-hermes-setup` / `--skip-hermes-setup` force or skip the upstream `hermes setup` wizard; `--unattended-keys` / `--attended-keys` select the keyvault key authorization policy before keys are created (else `MORDRED_SEKEY_UNATTENDED=1`, else an interactive question, default attended); `--store-seed-for-hd` / `--paper-only` pass through to `keyvault init`; `--non-interactive` runs the automatable subset and lists the remaining interactive commands (exit code 0 only when fully set up). Never auto-runs `keyvault reset`: a corrupt or blocked keyvault stops setup with repair guidance. Step probes are structural presence checks, not semantic ones — `setup` never validates or overwrites the *content* of an existing configuration (rerun `configure` to change it). On Windows the hardware-helper step is reported as not supported yet and setup stops.
-- `hermes-mordred configure` — asks Mordred-specific questions; with `--with-hermes-setup` it first spawns `hermes setup` as a child process (skipped by default)
-- `hermes-mordred upgrade` — Story 1 / 1.5 single-command migration
-- `hermes-mordred install <skill>` — skill installation via privacy-check (a substitute until a skill install hook is added to Hermes core)
-- `hermes-mordred network init` — on-demand network-privacy setup (Tor / VPN / clearnet + Mullvad); separate from `configure`, re-runnable (blank Mullvad answer keeps the current secret). `--non-interactive` is flag-driven (`--path` / `--tor-binary` / `--tor-socks-port` / `--mullvad-relay` / `--mullvad-killswitch`); `--clear-mullvad` removes the stored secret. The Mullvad secret is never accepted as a CLI flag.
-- `hermes-mordred network use <tor|vpn|clearnet>` — persist the next process route; same-route use is a live no-op, while a conflicting frozen route requires restart
-- `hermes-mordred network status` — show current active path
-- `hermes-mordred policy show` — print effective policy
-- `hermes-mordred policy explain <skill-id>` — explain why a given skill is allowed/blocked
-- `hermes-mordred policy dry-run <skill-path>` — predict install-time decision without installing
-- `hermes-mordred policy reload` — invalidate in-memory policy cache
-- `hermes-mordred audit tail [-n N]` — print last N entries from `~/.hermes/mordred/audit.log`
-- `hermes-mordred audit grep <pattern>` — search audit log
-- `hermes-mordred keyvault init` — Seed Phrase + Passphrase + PoW generation flow
-- `hermes-mordred keyvault list` — list key IDs (no key material)
-- `hermes-mordred keyvault verify-digest` — re-display digest
-- `hermes-mordred keyvault recover --blob <path>` — recovery on different machine
-- `hermes-mordred audit decrypt --date YYYY-MM-DD` — from Phase 4 onward, decrypts encrypted historical logs via the selected native backend
+```text
+status
+setup
+configure
+upgrade
+install
+network     use | status | init
+policy      show | explain | dry-run | reload
+audit       tail | grep | decrypt | purge
+keyvault    init | list | verify-digest | export | recover | reset |
+            enable-se | enable-tpm | enable-winkey | eth
+vault       init | change-passphrase | recover | add | status | cat |
+            migrate | set-memory-key | enable-config-decrypt |
+            disable-config-decrypt
+encryption  status | enable | disable | purge | change-passphrase
+plugins     list | migrate
+extension   pair | serve
+desktop     install | uninstall | status
+egress      status | set | block | unblock | block-tool | unblock-tool |
+            taint
+telegram    setup | doctor | login | sync | status | logout | venice |
+            local-llm | migrate-tee
+uninstall
+```
+
+`status`, `policy show`, keyvault listing, vault status, and encryption status
+are non-mutating. `configure`, `keyvault init/reset`, `network init`, vault
+mutations, encryption toggles, audit purge, pairing, serving, and `uninstall`
+(restores plaintext, edits `config.yaml` / `.env`, removes the package; `--dry-run`
+is non-mutating) can touch real profile or external state; tests and local experiments must isolate
+`HERMES_HOME` as described in [`setup.md`](./setup.md).
+
+The wizard is the sole writer of the canonical Mordred policy transaction and
+preserves unrelated Hermes configuration. It never accepts the Mullvad account,
+seed phrase, or recovery passphrase as a normal command-line flag.
+
+`setup` is a re-runnable first-run orchestrator. It probes upstream Hermes,
+configuration, the selected network route, the platform helper, keyvault, and
+macOS env and agent-memory encryption, then runs only incomplete steps and
+prints status. It never resets or overwrites a blocked/corrupt keyvault.
+Non-interactive mode runs only the automatable subset and reports the
+interactive commands still needed.
 
 ## Operational Guarantees & Caveats
 
 ### Audit log policy
 
-- Path: `~/.hermes/mordred/audit.log`
-- File mode: `0600` (user-only)
-- Format: newline-delimited JSON (NDJSON), append-only
-- Concurrency: serialized by an in-process lock and a stable hidden sidecar
-  `fcntl.flock` spanning format checks, rotation, append, and rollback.
-  Encrypted writers also verify active inode/header ownership before reusing
-  their process-local DEK
-- Rotation: daily roll to `audit.log.YYYY-MM-DD`, gzip after rotation, size cap 10 MB per current file (force-rotate), retention 30 days
-- Redaction: `reason` strings are a fixed enum (free-text params / full skill content are never logged). The `ReasonCode` `Literal` in `src/mordred_hermes/privacy_check/_audit_reasons.py` is the type-level source of truth for the enum; see [`POLICY.md`](./POLICY.md) §Audit log `reason` enum for the human-readable canonical list. Closed-set additions through the prompt, transport-gate, and provider-endpoint-binding follow-ups bring the current total to **31 codes**. Existing codes are never removed or renamed
-- Encryption: Phase 1-3 is plaintext NDJSON at file mode `0600`. From Phase 4 onward, new entries are encrypted with AES-GCM (the DEK is keyvault-wrapped, held in memory only)
-- Phase staging: the `audit.py` writer freezes a swappable Writer interface in Phase 1, factory-swapped to `EncryptedWriter` in Phase 4
+Audit entries are bounded records with `ts`, `event`, `decision`, and
+`reason`. Current decisions include `allow`, `block`, `override`, `warn`,
+`raise`, and `fallback`. `reason` is one of the 31 stable values in
+[`POLICY.md`](./POLICY.md), or `null` where no policy reason applies.
 
-Audit entry shape (synthetic example):
+The active log rotates daily or at 10 MiB, retains dated files for 30 days,
+and serializes cooperating writers through a stable sidecar lock. Plaintext
+NDJSON is the baseline before a keyvault audit key exists. When encrypted
+logging was expected but cannot be constructed, the factory falls back to
+plaintext and emits `mordred.degraded.audit_encryption_unavailable` when it can
+do so safely.
 
-```json
-{
-  "ts": "2026-04-29T12:34:56.000Z",
-  "event": "pre_tool_call",
-  "decision": "block",
-  "reason": "policy.strict.clearnet",
-  "tool_name": "web_fetch",
-  "skill_id": "example-skill"
-}
-```
-
-Fields: `ts` (ISO-8601 UTC), `event` (hook name), `decision` (`allow`/`block`/`override`/`warn`), `reason` (fixed enum), `skill_id`/`tool_name`/`provider_id` (one or another depending on the event), and optional event-specific fields.
+Encryption protects record confidentiality and per-entry integrity at rest.
+It does not make the log append-only or prevent a same-UID process from
+deleting, truncating, or replacing history.
 
 #### Encrypted audit-log wire format (`MRAL` v1, Phase 4 PR6 freeze)
 
-From Phase 4 onward, `EncryptedWriter` in `keyvault/log_encryption.py` (a Phase 1 `Writer` Protocol implementation) encrypts new entries with AES-GCM. The file is line-oriented — 1 entry = 1 line, preserving `O_APPEND`'s whole-entry atomicity while avoiding the need to re-encrypt the entire file:
+`MRAL` is line-oriented:
 
-```
-Line 0   legacy header   {"fmt":"MRAL","ver":1,"key_id":<str>,"wdek":<base64>}
-Line 0   current header  {"fmt":"MRAL","ver":1,"key_id":<str>,"native_key_id":<str>,"wdek":<base64>}
-Line 1+  entry    base64( nonce(12) ‖ AES-GCM-ciphertext ‖ tag(16) )
+```text
+line 0: {"fmt":"MRAL","ver":1,"key_id":...,"wdek":...}
+line N: base64(nonce(12) || AES-GCM-ciphertext || tag(16))
 ```
 
-- `wdek` is a 127-byte `MRKW` blob produced by wrapping the audit-log DEK with `keyvault.wrap.wrap_dek`. Only the **wrapped DEK** goes to disk; the plaintext 32-byte DEK exists only in the writer's memory (its reference is discarded on `close()`).
-- `key_id` remains the logical `mordred.audit-log` id and is what MRKW/audit
-  hashes bind. Current headers additionally persist the deterministic
-  profile-scoped `native_key_id` used for physical lookup. Only an absent
-  field selects the legacy logical native id; JSON null, the wrong type, or a
-  value that does not re-derive for the selected keyvault root fails before
-  native I/O. This lets old and new rotated MRAL files coexist.
-- The DEK is **lazily generated on the first append**, not at writer creation, fresh per file. `wrap_dek` is an offline operation using the selected backend's public key and therefore does not invoke private-key authorization — **writing does not cross the authorization boundary**.
-- Each entry's AES-GCM AAD = `MAGIC ‖ version ‖ SHA-256(header line)`. Since the header line contains a file-specific random `wdek`, the digest differs per file, so splicing entries from another file, or replay after tampering with the header, fails the tag check.
-- Atomicity: an encrypted line at the 4000-byte plaintext limit is about
-  5.4 KiB. Writers do not rely on `PIPE_BUF` (a pipe/FIFO property) for
-  regular-file atomicity: cooperating processes hold the stable sidecar lock
-  through the write-all loop and any truncate rollback. An MRAL writer whose
-  active inode/header was replaced wipes its stale DEK, rotates the successor
-  intact, and creates a fresh independently decryptable file.
-- Rotation is the same as the Phase 1 NDJSONWriter (daily + size cap + gzip + 30-day retention). Each rotation gets a fresh file + DEK + header. Existing foreign files (pre-Phase-4 plaintext logs, or encrypted files from another session whose DEK cannot be unwrapped without a prompt) are **rotated aside rather than overwritten**.
-- Decryption is `keyvault.log_encryption.decrypt_log_file` — it snapshots a
-  regular non-symlink source under the same audit sidecar used by writers,
-  releases that sidecar, then unwraps the DEK via `wrap.unwrap_dek` at the
-  selected native-backend boundary (emitting `keyvault.unwrap_authorized`).
-  The whole logical read holds the keyvault lifecycle lease and transparently
-  handles gzip-rotated files. Structural / integrity errors raise
-  `AuditLogDecryptError`; prompt rejection (`WrapAuthCancelled`) and missing
-  key (`WrapKeyNotFound`) are propagated unwrapped so the CLI can distinguish
-  them.
-- The logical audit wrapping-key id is `mordred.audit-log`
-  (`AUDIT_LOG_KEY_ID`); current profiles derive a separate physical id from
-  the keyvault root. No new audit code is emitted—the unwrap decision still
-  records only the logical key-id hash through `wrap.unwrap_dek`.
-- That logical id is reserved and cannot be selected as the main key id
-  (including through an imported backup). Auxiliary generation first saves
-  `pending_audit_key`, then saves `audit_key` while retaining pending, and
-  finally clears pending in a second durable metadata save. The scoped audit
-  factory uses `EncryptedWriter` only for a validated `audit_key` record with
-  no pending record; a published-but-uncommitted or cleanup-uncertain key stays
-  on the marked plaintext fallback. Re-running provisioning is idempotent. An
-  exact deterministic duplicate may be adopted only when a freshly committed
-  pending record proves the key predated this attempt, or when an existing
-  row+pending state proves generation previously succeeded; pending-only retry
-  after a native durability error remains fail-closed. Legacy main rows
-  continue to select the historical global audit key when these new scoped
-  records are absent; either scoped audit ownership field beside a legacy main
-  row is inconsistent and forces the marked plaintext fallback.
+`wdek` is a base64 `MRKW` blob. The in-memory 32-byte log DEK is wiped when the
+writer closes. Every entry is encrypted independently and bound by AAD to its
+file header. Cooperating append/rotate/rollback operations share the audit lock
+and detect inode/header ownership changes before reusing a cached DEK.
+
+Historical plaintext logs are not rewritten in place. The audit CLI can tail,
+search, decrypt dated encrypted files, and purge confirmed old rotations.
 
 ### Plugin-disable protection (plugin-side only, zero-PR strategy)
 
-There is a risk that enforcement gets silently disabled if the user runs e.g. `hermes plugins disable mordred_privacy_check`.
+The required sibling set is a fixed six-entry constant, not dynamically
+expanded from manifests. Strict startup aborts when any sibling is recorded as
+disabled. Lenient/off operation may continue with a degradation record.
 
-**Tier A (v1 default, plugin-only strict-mode startup refusal, H3)**:
-
-Because **zero upstream PR** was finalized in MIGRATION.md §10 row 4 (2026-05-07), v1 performs a fail-closed startup refusal on the plugin side. This is not "limited to a warning" — it is a defense that raises a `BaseException`-derived exception to stop strict-mode session startup itself:
-
-1. Each runtime plugin (`mordred_privacy_check`, `mordred_network`, `mordred_llm_guard`, `mordred_keyvault`, and `mordred_e2e`) registers the same integrity callback on `on_session_start`. It scans `["mordred_network", "mordred_privacy_check", "mordred_llm_guard", "mordred_keyvault", "mordred_e2e", "mordred_wizard"]` for any entry disabled by either the deny-list or an opt-in allowlist. Registering the callback from every runtime sibling is essential: disabling `mordred_privacy_check` must not disable its own detector.
-2. If policy is `strict` and even one sibling is disabled: raise `MordredIntegrityRefused("Mordred strict mode requires all sibling plugins enabled; disabled: [...]. Re-enable via 'hermes plugins enable <name>' or downgrade policy to lenient.")` (a direct `BaseException` subclass — an `Exception` subclass such as `RuntimeError` would be swallowed by Hermes `invoke_hook`'s `except Exception:` wrapper), aborting the session
-
-   > **Exception propagation contract** (2026-05-13; unified 2026-07-28): refusal exceptions must escape Hermes `invoke_hook`'s `except Exception:` wrapper and must not masquerade as CLI exits. `MordredIntegrityRefused`, `MordredHarnessRefused`, and `MordredSessionRefused` therefore derive directly from `BaseException`, not `Exception` or `SystemExit`.
-3. Simultaneously records `mordred.degraded.disable_unprotected` (decision=`block`) in the audit log
-4. For `policy=lenient` / `off`, only a warning is issued (for compatibility)
-5. `privacy_lock: true` remains a declarative marker on the five plugins that
-   have `plugin.yaml`; Hermes ignores it. Runtime enforcement uses the explicit
-   six-entry `privacy_check._runtime.SIBLING_PLUGINS` tuple, mirrored by the
-   wizard's canonical plugin list. The marker does not auto-discover or expand
-   either list.
-
-**Tier B (v2 deferred, vendored fork extra)**:
-
-Once hard enforcement is truly needed, the `pip install hermes-mordred[hard-lock]` extra is provided. It carries a patched version of `hermes_cli/plugins_cmd.py` under `vendor/hermes/<version>/`, and while `hermes-mordred[hard-lock]` pins to a specific Hermes version via `dependencies` in `pyproject.toml` at install time, it refuses the disable operation itself on the core side. No PR is submitted to Hermes upstream; it is distributed as a vendored fork. Out of scope for v1.
-
-**Important caveat (see §Threat Model "does NOT defend against")**: Tier A is designed to block **at the next session start**. "Immediate stop if disabled while running" is out of scope for v1 (on the premise that Hermes does not reflect a plugin's dynamic disablement while a session is running, verified in Phase 0.8). The defense flow is: disable edited between sessions → next session's strict startup → block. This remains plugin-only enforcement: if every runtime Mordred plugin is disabled, no plugin callback can execute; preventing that operation itself requires Tier B/core control.
+The packaged interpreter-startup integrity guard provides an earlier
+defense-in-depth check for normal Hermes console starts, but it remains local
+code under the same user account. Neither layer prevents an operator or
+same-UID attacker from uninstalling the package or launching a different
+interpreter.
 
 ### Policy file caching
 
-- Loaded at `on_session_start` (when the Hermes session starts)
-- Cached in-memory for the session lifetime
-- Reload via `hermes-mordred policy reload` (an internal function call; a fs watcher is not introduced in v1)
-- Intentional tradeoff: prevents hot-path file reads; policy edits require an explicit reload
+Readers cache a validated policy snapshot within a process. `policy reload`
+clears that in-process cache; there is no filesystem watcher. The wizard uses a
+lock and pending marker across `config.yaml` plus `policy.json`, and readers
+that observe an incomplete transaction fail closed instead of combining two
+generations.
 
 ### Plugin Versioning & Compatibility
 
-- All Mordred plugins are bundled in the single pip package `hermes-mordred`, sharing a common version
-- Declares `min-hermes-version` in `[tool.mordred]` of `pyproject.toml`; the
-  install dependency and the `hermes-floor` CI job enforce the same floor
-- Detects changes to consumed Hermes hook names and payload fields in local and
-  scheduled CI
-- Sources the package version from `src/mordred_hermes/__about__.py`; use
-  `tools/bump_version.py` to update its human and manifest mirrors
+The `mordred` plugin and all its components ship in the `hermes-mordred`
+distribution and share one version.
+The package version in `src/mordred_hermes/__about__.py` is the release source
+of truth and is updated through `tools/bump_version.py`. The minimum supported
+Hermes version is declared in `pyproject.toml`; CI checks both the floor and a
+current release. Private upstream seams used by compatibility guards must be
+validated in tests and cause an explicit refusal or diagnostic on drift.
+
+Persistent `MRKV`, `MRKW`, `MREN`, and `MRAL` layouts require versioned readers.
+Stable audit reason strings and documented policy fields are compatibility
+surfaces and are not renamed casually.
 
 ### Observability
 
-- All hook decisions (allow / block / override) are logged via the audit log policy above
-- `hermes-mordred policy explain <skill-id>` gives a per-skill decision trace
-- `hermes-mordred policy dry-run <skill-path>` predicts install-time decision without filesystem mutation
-- `hermes-mordred network status` reports active path + health
-- LLM Guard prints the active provider override target in the startup banner
-- Operates in parallel with Hermes's observability plugins (langfuse, etc.) without conflict
+Operators use `hermes-mordred status`, focused `network`/`policy`/`keyvault`/
+`vault`/`encryption` status commands, and the audit CLI. Status output must
+distinguish configured, initialized, protected, exposed, paused/inactive, and
+unavailable states instead of reducing them to one boolean.
+
+Sensitive values are redacted. JSON output is available where documented for
+automation, while destructive or secret-bearing ceremonies remain explicit
+and interactive unless a narrowly scoped confirmation flag exists.
 
 ## Scope (Out) — explicitly deferred
 
-> Motivation, dependencies, and priorities for post-v1 work live in [`ROADMAP.md`](./ROADMAP.md). This section only enumerates what is **excluded** from v1.
+- modifying or submitting pull requests to Hermes upstream;
+- a general sandbox for arbitrary Python, shell, or direct socket activity;
+- automatic rerouting of a resolved cloud LLM request to a local provider;
+- trusted per-skill runtime provenance without a new host seam;
+- hard prevention of plugin disable/uninstall by the local user;
+- mobile product support (Windows completion is tracked below);
+- transparent env/config/workspace lifecycle outside macOS (the Windows
+  memory lifecycle is required by the completion contract below);
+- audit hash chains, external anchoring, or same-UID tamper resistance;
+- isolated signer/payment authorization;
+- automatic migration of native-key protection tiers.
 
-- Phase 4 keyvault on Windows native (v2-OS2); Linux TPM 2.0 is shipped
-- Harness-aware LLM Guard enforcement (v2)
-- GUI controls (v2)
-- Payment skills using `mordred_keyvault` (v3-P1)
-- Per-skill independent network paths (v2; v1 is gateway-wide single-state)
-- Skill metadata signing / integrity verification (v2)
-- Multi-user / multi-tenant on a single machine (v2)
-- Mordred-specific telemetry or crash reporting (v2; inherits Hermes's existing telemetry behavior)
-- iOS / Android native Mordred apps (v2; only Hermes's Termux support is usable, for Phase 1-3)
-- Large-scale changes to Hermes core (permanently out of scope. The zero-PR commitment means no PRs are submitted to Hermes upstream at all in v1; if hard enforcement becomes necessary in v2, it's handled via a vendored fork in the `[hard-lock]` extra; MIGRATION.md §10 row 4)
+Future candidates and their release gates live in
+[`ROADMAP.md`](./ROADMAP.md); actionable unfinished work lives in
+[`TODO.md`](./TODO.md).
+
+## Windows product completion contract
+
+This section defines the remaining native Windows work after the helper,
+private-filesystem and wallet slices (PRs #189–#194). It supplements their
+contracts; it does not turn their successful checks into product acceptance.
+The port retains the Linux-equivalent scope of the Windows native support
+proposal: Windows memory and Private Telegram custody are required; new
+macOS-equivalent env/config/workspace seals, Windows Hello, per-use presence,
+ARM64 and TPM-key recovery remain excluded. Completing every component means
+completing that native port, not silently broadening those security promises.
+The initial target is Windows 11 x64 with local NTFS and an ordinary user.
+Windows Server 2025 is a development and hardware-validation environment.
+Virtual machines are acceptable: record the OS, architecture, token and TPM
+provider, and qualify evidence from a virtual TPM accordingly. A physical PC
+is not an acceptance prerequisite. Server or hosted-CI results do not establish
+Windows 11 compatibility.
+
+### Shared storage and coordination
+
+- Preserve the checked filesystem boundary: no reparse traversal, hard-linked
+  sensitive files, ACL repair on reads, unbounded reads or implicit adoption of
+  unsafe existing state. Preserve classified failures and uncertain commit
+  outcomes through every caller. Only a checked, pre-mutation missing result
+  can select a fresh-state path. Permission errors are not absence.
+- Add checked metadata, bounded enumeration, prefix reads, deletion, append
+  and no-replace sibling rename before migrating consumers that need them.
+  Files remain bound to validated identities throughout mutations. A delete
+  removes a namespace entry, not the underlying media securely. Mutations
+  cannot promise power-loss atomicity; post-mutation cleanup errors remain
+  uncertain and must not cause automatic retry, rollback or key recreation.
+- Append holds the stable directory transaction across size capture, write,
+  flush and any rollback. A failed rollback is uncertain. Rotation publishes
+  without replacing existing history; compression retains the raw source
+  until its replacement is verified. Retention deletes only validated files.
+- Keep the permanent directory lock while the directory is a live shared
+  namespace. Recursive deletion requires an outer lifecycle lock and checked
+  traversal; never delete a live lock to make a busy operation succeed.
+- Existing Hermes home directories are shared upstream state. Define a
+  separate trusted-parent boundary for canonical config and dotenv files;
+  do not silently relax the private-directory contract or rewrite the home's
+  ACL. New sensitive files receive a private ACL before content is written.
+  Existing unsafe files require an explicit migration with verified recovery.
+- Canonical policy writes serialize the complete config/policy pair, including
+  nested writer calls. Use one caller coordinator and documented lock order;
+  do not recursively acquire the non-reentrant foundation lock. Retain a
+  pending marker after interrupted or uncertain publication. Readers reject
+  pending/unsafe state, including cache hits. Windows caches must revalidate
+  security metadata or remain disabled.
+
+### Component acceptance boundaries
+
+| Component | Required Windows behavior |
+| --- | --- |
+| keyvault | CNG-backed memory and Private Telegram custody, checked state/markers/plaintext capture, generation leases, reset/export, runtime probes, retained encrypted audit keys and truthful file-vault capability gates |
+| wizard | Native installer, actual Hermes interpreter discovery, helper installation/probe, configure/setup/status, lifecycle commands, upgrade and uninstall with verified backups |
+| network | Native executable discovery and safe process lifecycle, Tor private state and quoted paths, explicit VPN capabilities, enforced no-clearnet fallback in strict mode |
+| llm_guard | Checked policy/config reads and fail-closed pending-state checks on every decision, including previously cached provider decisions |
+| privacy_check | Checked plaintext/encrypted audit publication, process serialization, rotation/compression/retention and recoverable failures |
+| extension | Pairing, attestation, replay and revocation serialization; encrypted history and Telegram custody; process-safe archive lifecycle; gateway shutdown and runtime discovery |
+| Desktop integration | Native installation/removal, truthful Windows capability/status output, CNG-backed memory flow, local-model checks and restart behavior |
+
+These are separate implementation PR boundaries, not permission to combine
+plugins in one PR. Shared contracts land in documentation first; shared
+primitives get their own implementation PR. Dependencies may be stacked, but
+each PR identifies the incremental component changes and targets `dev`.
+
+Do not infer CNG key absence from an inaccessible keyset, regenerate keys after
+unwrap failure, or claim that a vTPM provides biometric/per-operation presence.
+Windows reset journals preserve ambiguous native deletion outcomes. Enabling
+memory encryption must prove that the actual installed Hermes runtime consumes
+it before removing any plaintext. Unknown process discovery is not an empty
+process list. File-vault recovery and excluded env/config seals remain explicitly
+unavailable on Windows and must refuse before changing retained state; safe
+unsupported refusal satisfies the gate for these excluded capabilities only.
+
+APFS workspace images and Secure Enclave/Touch ID remain explicitly
+macOS-specific. A Windows setup may skip that optional target with a concrete
+explanation; it may not skip every encryption target or report an ordinary
+directory as an encrypted workspace. External route/account/model dependencies
+are reported per capability, not hidden behind a general Windows-ready flag.
+
+### Product completion evidence
+
+Acceptance requires a wheel built from the sdist, installed outside the source
+tree through the native installer, with a disposable `HERMES_HOME`. Record the
+actual Python/module/helper paths. Exercise install, registration with Hermes,
+configure, setup, status, gateway/extension use, memory sealing and reopening,
+applicable export, excluded recovery refusal, upgrade, uninstall and reinstall.
+Include separate users,
+concurrent processes, spaces/non-ASCII paths, restart, reboot, unavailable TPM,
+corruption and unsafe filesystem objects. Verify no plaintext fallback or lost
+retained ciphertext on failures. Real network routes and externally authenticated
+flows need their own explicit acceptance evidence; synthetic fixtures are
+regression tests, not substitutes for those claims.
+
+Publish a matrix distinguishing implemented, unit-tested, native-server-tested,
+Windows-11-tested and externally unverified. Until the applicable Windows 11
+installation-to-use and security gates pass, Windows product support remains
+incomplete even if every component PR has been created.
+
+### Canonical Windows configuration boundary
+
+`open_confidential_directory(path, create=False)` is a separate internal
+capability for shared Hermes home files and installer-owned profile executables.
+It does not relax `open_private_directory`: Mordred state directories and their
+files keep the exact private DACL requirement. The confidential capability
+pins every local NTFS ancestor and validates the endpoint as a trusted parent,
+including refusal of untrusted add-file/add-directory/delete-child, ownership,
+ACL or reparse-relevant mutation rights. Directory read/traverse rights alone
+are acceptable. Existing parent descriptors are never repaired.
+
+An existing confidential file must be regular, non-reparse, single-linked and
+owned by the current token user. Its DACL may be inherited, but every effective
+allow must grant only the current user, SYSTEM or Administrators. Recognize
+only supported ordinary allow/deny ACEs, inheritance flags and permission bits;
+unknown descriptors fail closed. Denies do not excuse unsafe allows. Safe
+duplicate or restricted grants are acceptable; a null DACL is not. Actual access
+failure remains a failure. New/staged/backup/lock files always receive the exact
+private DACL before content. Replacing a validated inherited-safe file creates
+a private replacement; a no-op preserves its bytes and descriptor. Broad or
+foreign-owned existing files cannot be adopted by silently replacing them.
+
+The capability exposes checked `stat`, bounded `read_bytes`, and transactions
+with `stat`, `read_bytes`, `create_bytes`, `replace_bytes` and identity-bound
+`delete_file`. Missing final-leaf observations must be distinguished from
+missing/uncheckable ancestors and cleanup uncertainty. Creation is limited to
+the checked missing final directory. No generic public `strict=False` switch,
+raw fallback or second installer-specific ACL validator is permitted.
+
+Canonical Windows configuration sessions acquire the home transaction before
+the private `home/mordred` transaction. Nested same-home calls reuse live
+capabilities bound to process, thread and directory identity; nested different
+homes refuse. Policy scope can extend an existing home scope in that order and
+retains both until outer exit. Never call a home operation while holding only a
+lower-level Mordred lock. Runtime readers take the same locks nonblocking and
+fail closed on contention. A decision reading both config and policy uses one
+checked snapshot; separate before/after marker checks cannot exclude a complete
+intervening write. Windows decision caches must not bypass this boundary.
+
+Policy updates stage complete intended changes before an explicit commit.
+Parse and validate existing documents first; neither unreadable nor malformed
+state becomes an empty config. Publish/verify the pending marker before either
+member, publish the changed members, then read and verify the complete intended
+pair. Only that verification permits identity-bound marker deletion. An
+interrupted or uncertain pair publication retains the marker. Failure during
+or after final marker deletion is uncertain and requires reconciliation; it
+may leave an already verified consistent pair marker-free. Do not promise to
+recreate an already deleted marker, automatically retry, or provide two-file
+power-loss atomicity. Full configure may explicitly reconcile a stale safe
+marker; generic readers, dotenv operations and uninstall cannot clear it.
+Reading through a pending marker requires the active owning canonical session
+for full recovery; a public boolean bypass is insufficient. Ordinary snapshots
+fail closed on marker presence or inability to validate it.
+
+Canonical config, policy and dotenv reads are initially bounded to 8 MiB each;
+marker diagnostics to 4 KiB. Checked absence alone selects fresh-install state.
+Config-only edits and deletion use the pair protocol, even when policy remains
+unchanged. Dotenv RMW uses home scope. Cleanup first creates and verifies a
+private no-replace backup under the same locks. Existing POSIX lock/adoption
+behavior remains unchanged; Windows legacy mode-based writers must all be
+stopped during migration. Unsafe upstream-created Windows defaults remain
+unchanged/refused and require a separately reviewed explicit migration.
 
 ## MVP Phasing
 
-If full v1 scope is too large for a single milestone, ship in this order. Each phase is independently usable.
-
-1. **Phase 1 — Privacy primitives**: `mordred_privacy_check` (with skill install wrapper) + `metadata.mordred.network_requirements` + `mordred_wizard configure/upgrade/policy`. Partially achieves Story 2 and Story 3
-2. **Phase 2 — LLM enforcement**: `mordred_llm_guard` + `mordred-local` synthetic provider (full Hermes adapter surface). Achieves Story 4. Adds a `pre_tool_call` generic allowlist to privacy-check
-3. **Phase 3 — Network paths**: `mordred_network` (Tor + VPN + Clearnet process-scoped route, registration/exit lifecycle, provider transport flagging). Completes Story 3
-4. **Phase 4 — Key management**: `mordred_keyvault` (Secure Enclave /
-   login-Keychain wrapping on macOS and TPM 2.0 wrapping on Linux). Achieves
-   Story 5. The largest engineering risk; independently deployable
-
-User-visible MVP = Phase 1 + Phase 2. This is the minimal "Hermes with Privacy" delivery.
+The original phase headings and pull-request notes have been removed from the
+current specification. All six entry points, the policy/network/LLM layers,
+keyvault formats, CLI, at-rest vault, and extension surface described above are
+shipped behavior. A feature is current only when implementation, tests, and
+the canonical documents agree; a roadmap item is not part of the MVP merely
+because code scaffolding exists.
 
 ## Operational Setup (one-time)
 
-Required before starting development:
+Use [`setup.md`](./setup.md) for the development environment and
+[`../user/QUICKSTART.md`](../user/QUICKSTART.md) for operator setup. Always run
+repository commands through `uv run` or `.venv/bin/...`, and isolate
+`HERMES_HOME` before testing a mutating ceremony. On macOS, build/probe the
+Secure Enclave helper before relying on that protection tier; on Linux,
+build/probe the TPM helper before keyvault initialization. Reserve extension
+port 7788 for the production gateway and use another port for local tests.
 
-1. Confirm the `hermes-mordred/` repository (the Mordred plugin development repo; the environment must already have Hermes itself via `pip install hermes-agent`)
-2. Create the `~/.hermes/` profile (automatic when running `hermes setup`)
-3. Scaffold the plugins: create the following in each `src/mordred_hermes/<name>/` directory
-   - `plugin.yaml` — manifest (`name`, `version`, `description`, `author`, `privacy_lock`, `config_schema`)
-   - `__init__.py` — entry, defines `register(ctx: PluginContext) -> None`
-   - `*.py` — runtime modules (lazy import for native/heavy deps)
-   - `tests/test_*.py` — pytest, colocated
-   - `README.md` — Mordred-owned paths, config keys, internal API surface
+Operators should start with `hermes-mordred setup`; developers should follow
+[`setup.md`](./setup.md). Before a release, run the automated quality gates in
+[`CI.md`](./CI.md) and record the applicable manual live-device validations.
+Do not substitute version strings for checking which environment/import path
+is actually under test.
 
-   `mordred_e2e` (added later, package dir `extension/`) is the one exception to this scaffold — it has no `plugin.yaml` manifest.
-4. Declare the `hermes_agent.plugins` entry point in `pyproject.toml` (the `hermes-mordred` package):
-   ```toml
-   [project.entry-points."hermes_agent.plugins"]
-   mordred_network = "mordred_hermes.network"
-   mordred_privacy_check = "mordred_hermes.privacy_check"
-   mordred_llm_guard = "mordred_hermes.llm_guard"
-   mordred_keyvault = "mordred_hermes.keyvault"
-   mordred_wizard = "mordred_hermes.wizard"
-   mordred_e2e = "mordred_hermes.extension.gateway_plugin"
-   ```
-5. CI workflow: `.github/workflows/ci.yml` (pytest + ruff + mypy), `.github/workflows/upstream-check.yml` (detects consumed Hermes hook-name and payload-field drift)
-6. ~~Submitting the HSeam-1 PR~~ → **Removed**: because of the zero-PR commitment (MIGRATION.md §10 row 4, finalized 2026-05-07), no PR is submitted to Hermes upstream. Disable protection is fully handled by the plugin-side strict-mode startup refusal (§Plugin-disable protection Tier A). If hard enforcement becomes necessary in v2, the `[hard-lock]` extra (vendored fork) is added
+## Linux Private Telegram Design
+
+Status: dedicated-key implementation completed on 2026-10-07; acceptance results
+are recorded below and in the validation log.
+Implementation and EC2 acceptance are recorded in PLAN.md and CI.md; live-account
+acceptance remains separate from synthetic hardware validation.
+
+### Intent and success criteria
+
+Enable Mordred's read-only private Telegram integration on Linux, including
+headless EC2 and Hermes Desktop. Preserve encrypted credentials, encrypted
+archives, mandatory encrypted agent memory, read-only MTProto, and Venice/local
+model restrictions. Validate on EC2 throughout implementation, including a
+packaged Desktop check. The user requested planning before implementation.
+
+Success requires the actual Linux Hermes interpreter to read and write sealed
+memory across process restarts, the Telegram setup to complete with a usable
+TPM, and failures to refuse without exposing plaintext or losing keys. A
+mocked platform check or successful helper compilation is insufficient.
+
+### Current evidence
+
+The following describes the unchanged pre-feature baseline `f3211c6fb`; the
+implementation now supplies the dedicated provider, lifecycle, and Linux UI
+described below. See CI.md for feature acceptance and the pending live-account gate.
+
+- `extension/telegram/tee.py:hardware_backend` already selects the Linux TPM
+  helper and excludes software and legacy fallbacks.
+- `_memory_hook.py` wraps the memory tool independently of the OS, but obtains
+  its key exclusively from `HERMES_MEMORY_KEY`.
+- `wizard/memory_cli.py` requires the macOS `.env` vault injection path;
+  `wizard/encryption_cli.py:memory_status` explicitly requires Darwin.
+- `keyvault/_identity.py:resolve_store` uses the Keychain anchor store. The
+  file vault has no production Linux freshness anchor. Enabling the existing
+  `.env` path on Linux would therefore be incomplete and unsafe.
+- `wizard/_runtime_gate.py` skips checks outside macOS. The memory runtime
+  probe currently proves only that the upstream memory seam is compatible.
+- Desktop rejects non-macOS setup; the CLI setup and diagnostic text assume
+  Secure Enclave, Touch ID, Xcode, and a Mac-local model.
+- The previous EC2 validation covered Linux API behavior and packaged Desktop,
+  but explicitly excluded hardware keys and live Telegram login.
+- The current baseline's Ubuntu CI TPM job passed 64 native tests against
+  swtpm with the live-test gate enabled. A separately requested EC2 baseline
+  run then passed the same 64 native tests on actual NitroTPM, 172 focused
+  Python tests, production wrap/unwrap and Telegram credential-store round
+  trips, cross-instance key-blob rejection, and stop/start persistence.
+  See [the validation log](CI.md#manual-live-device-validation-log).
+  This established the existing custody path before the Linux memory and
+  Telegram integration work.
+
+### Options and recommendation
+
+1. **Recommended: a dedicated TPM-wrapped Linux memory key.** Reuse the existing
+   hardware backend, wrap format, memory cipher, and memory hook. The Linux
+   memory lifecycle does not enroll `.env` or open the file vault. This delivers
+   private Telegram without redesigning the vault's freshness guarantees.
+2. **Port the complete file vault to Linux first.** Add a genuine device-bound
+   freshness anchor, recovery, runtime `.env` injection, and lifecycle support.
+   This offers broader feature parity but requires a separate security design
+   and substantially more work. A disk file pretending to be a Keychain anchor
+   is not an acceptable implementation.
+
+This proposal selects option 1. Existing macOS key custody and wire formats
+remain compatible. General Linux `.env`/config/workspace encryption and vault
+recovery are outside this feature.
+
+### Security and persistence contract
+
+- Python 3.11 remains the minimum; no Hermes upstream changes or PRs.
+- Linux requires a working TPM 2.0 helper; no software-key fallback.
+- TPM protection is machine-bound, without a per-use Touch ID/PIN guarantee.
+  UI, CLI, and documentation must describe that distinction explicitly.
+- Memory remains AES-256-GCM in the existing `memory_crypto` format.
+- A new 32-byte memory key is wrapped with `wrap.wrap_dek`; its existing
+  127-byte format is stored at `<home>/mordred/memory-key.wrapped`, mode `0600`.
+  The parent is private (`0700`); explicit provisioning tightens an existing
+  safe non-private parent to this mode. Reject symlinks and non-regular files.
+- The logical wrapping key ID is `mordred-hermes.memory.v1.` followed by the
+  first 16 hex characters of SHA-256 over the canonical absolute Hermes home.
+  Native storage uses that home's `mordred/keyvault` root. Another profile may
+  not read, overwrite, or delete this profile's memory key.
+- First provisioning is locked, atomic, and never replaces an existing key.
+  An orphaned hardware key may be reused if no wrapped key or sealed memories
+  exist. Corrupt/missing material with an armed marker or sealed memories is a
+  refusal, not an instruction to generate a new key.
+- A managed Linux profile reads its wrapped key directly through the memory
+  hook. No plaintext key is written to `.env`, config, logs, responses, command
+  arguments, or a new environment variable. No process-global key cache is
+  introduced in the first version: each key resolution follows the live home
+  and revalidates the stored material.
+- A valid ambient memory key may be adopted only by explicit enable-time
+  migration, after it authenticates every existing sealed memory. Re-enable
+  with an existing wrapped key ignores ambient values, including malformed ones. Runtime use
+  of a managed profile never falls back to ambient keys after TPM failure.
+- This is memory-key custody, not a new file-vault anchor. It does not add
+  rollback protection to memory snapshots or authenticate a whole-disk state;
+  public-key wrapping alone is not a freshness or writer-identity guarantee.
+  Existing vault verification remains unchanged.
+- The first version has no portable recovery/export for the Linux memory key.
+  Losing the TPM state loses access to sealed memory and Telegram credentials.
+  Disabling memory encryption while the TPM is usable restores plaintext;
+  setup must explain the recovery limitation before provisioning.
+
+### Runtime and lifecycle
+
+The new keyvault module owns hardware selection, key identity, secure storage,
+and runtime key resolution. It must not import Telegram or wizard modules.
+The memory hook resolves keys per profile before decrypting or sealing data,
+including when imported before plugin registration. Missing hardware or an
+invalid key must never cause a plaintext write or truncate a sealed file.
+Safe mode retains the existing protection against overwriting sealed memory.
+
+Linux `encryption enable memory` checks the local seam and installed Hermes
+runtime before provisioning. After provisioning, a subprocess of the actual
+runtime must unwrap the key and round-trip a synthetic memory payload in RAM;
+only then may the CLI arm the marker and migrate real files. Probe identifiable
+gateway interpreters as well. Check install-time capability separately from a
+running process: an older live gateway must be stopped/restarted before use.
+Probe failures leave existing files and markers unchanged; an inert provisioned
+key may remain for retry. No probe prints key bytes or real memory contents.
+
+The generic runtime gate gains a supported-platform parameter whose default
+remains Darwin-only; only memory opts into Linux. Existing force semantics may
+skip interpreter verification, but never hardware, key-integrity, or migration
+checks. Guided Telegram setup does not use the force option.
+
+Linux hook operations pin the active home, refuse paths from another profile,
+and hold the profile lifecycle lock through managed reads, every write and
+drift-backup publication. Unmanaged reads create no files and require no
+writable Mordred directory; if they observe a seal, it is still authenticated.
+The non-secret lock accepts safe existing non-private directories without
+changing their mode. Disable and purge take the same lock; even disarmed writes
+join it so concurrent enable cannot be followed by a stale plaintext write.
+Re-enable authenticates all existing seals and backups before arming.
+Linux adoption, migration, disable, purge and readiness checks enumerate memory
+files explicitly and refuse traversal/read failures; an inaccessible directory
+is never evidence that no encrypted files remain.
+
+Disable decrypts existing files before disarming, retaining the Linux key for
+re-enable. Purge deletes the Linux key only after successful disable and a
+rescan proving no sealed memory remains. Keep the current refusal on concurrent
+gateway resealing. Uninstall restores memory before removing the runtime hook;
+Telegram logout/forget never deletes the separate memory key. Keyvault reset
+takes the memory lifecycle lock before its own lock and refuses to remove the
+native store while independent memory custody remains. Uninstall with data
+purge restores or explicitly erases memory, then purges its key before resetting
+the native keyvault store.
+
+Read-only status uses local capability, marker, key-artifact, and plaintext-drift
+checks; it does not unwrap keys. It must distinguish configured protection from
+a verified live TPM operation. Actual access and enable-time probes are the
+authority when hardware disappears or loses permissions after a status check.
+
+### Telegram setup and interface compatibility
+
+- CLI selects `keyvault enable-tpm` on Linux and `enable-se` on macOS.
+- Linux setup enables memory directly, skipping `.env` enrollment and the
+  Keychain-backed vault. macOS retains its existing shared FlowSession.
+- Desktop adds `POST /hardware/build` with OS-aware dispatch. Retain
+  `/enclave/build` as the macOS-only compatibility endpoint.
+- Desktop `/status?client_version=2` retains `platform` and `telegram_supported`
+  (implementation support for a compatible client, not setup readiness), and adds
+  `hardware_kind` (`secure_enclave`, `tpm`, or `null`) and
+  `user_presence_supported` and `telegram_platform_supported`. Legacy status
+  requests keep Linux unsupported so old assets cannot promise Secure Enclave
+  or Touch ID behavior. Linux `/memory/enable` requires the new client
+  acknowledgment `acknowledge_tpm_no_recovery: true`, sent only from the button
+  below the displayed recovery limitation. Unready Linux shows TPM prerequisites and failed
+  checks; unsupported operating systems still refuse before any mutation.
+- Preserve the existing `secure_enclave` diagnostic field for older clients;
+  add a hardware-neutral `hardware` check for new clients and use explicit
+  metadata rather than parsing English sentences for readiness.
+- `/memory/enable` on Linux provisions only the dedicated key and never
+  generates a vault recovery passphrase. It preserves `ok`, `already`, and
+  `restart_required` response behavior. macOS responses remain compatible.
+- No Linux screen or error remediation prescribes Xcode or Touch ID. Local
+  model guidance says this host, not this Mac. Legacy client/server combinations
+  must retain a safe unsupported/setup-incomplete state.
+
+### EC2 validation contract
+
+The previous environment was found in local session
+`01a11385-d499-7af1-a128-6394c5b250aa` and the local artifact directory
+`~/.codex/artifacts/mordred-ubuntu-validation-20261007/`. Its AWS state was read
+on 2026-10-07: stopped, Ubuntu 24.04 x86_64, `t3.medium`, UEFI boot, no
+`TpmSupport`. The subsequent, explicitly requested TPM baseline test cloned
+that stopped disk into a private NitroTPM-enabled AMI and used two isolated
+instances. The original instance remained stopped. Results are in
+[CI.md](CI.md#manual-live-device-validation-log).
+
+1. Use the NitroTPM test environment for the required EC2 checks. Preserve the
+   earlier Desktop environment and use separate test homes, checkouts, and key
+   stores. Hermetic swtpm tests remain useful in CI but never replace the
+   user-requested actual-device acceptance gate.
+2. Use a NitroTPM-enabled Linux AMI and supported instance type for actual TPM
+   success tests. Reusing the old non-TPM machine unchanged cannot provide this proof.
+   Inspect P-256/ECDH support, device permissions, helper probe, and actual wrap
+   round trips before accepting that instance as a suitable test target.
+3. Use fresh processes, a Hermes gateway, and the packaged Desktop against the
+   new build. Confirm that the imported Mordred path is the intended checkout
+   or wheel in each interpreter. Use port 7799 and loopback-only SSH tunnels.
+4. Use synthetic Telegram messages for repeatable tests. A real account login,
+   small read-only sync, query, cancellation, and logout form a separate live
+   acceptance gate; the operator supplies API credentials, OTP/2FA and any
+   model credentials interactively, without putting them in test artifacts.
+5. Record exact commits, OS/Python/Hermes versions, commands, counts, failures,
+   screenshots, and limitations. Emulator, NitroTPM, and live Telegram results
+   must be reported separately. Stop task-owned compute after testing.
+
+AWS requires an enabled AMI and UEFI for NitroTPM. NitroTPM state is not part
+of EBS snapshots; restoring a disk is not key recovery. See the
+[AWS NitroTPM requirements](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enable-nitrotpm-prerequisites.html).
+
+### Delivery boundaries
+
+Follow the repository's docs-first, one-component-per-PR convention: contract
+documentation, keyvault runtime, wizard lifecycle/setup, then Desktop/extension
+integration. All PRs target `dev`. Do not advertise Linux support before the
+dependent slices and acceptance gates pass. This change contains planning and
+the separately requested unchanged-code TPM baseline evidence, not the feature
+implementation or published PRs.
+
+Review decisions: approve the dedicated-key scope and its recovery limitation;
+choose in-session execution or subagent-driven execution. Recommended execution
+is in-session because the small sequence has tightly coupled interfaces.
+## Windows keyvault wallet configuration (2026-10-08)
+
+This is the first bounded keyvault caller migration after the private filesystem
+foundation in PR #192 (contract PR #191). It covers only the keyvault-owned
+`<home>/extension/wallet.json` selection document. Native Windows product support,
+key custody, signing, memory, reset/purge, audit and Desktop remain incomplete.
+The component contract must precede its implementation PR; both target `dev`.
+
+On Windows, `extension_sign.set_wallet` and `_load_wallet_cfg` use checked
+private directories, bounded reads and transactions from `_private_fs`.
+Keep the POSIX implementation and `.wallet.lock` protocol unchanged. On Windows
+use the permanent `<home>/extension/.mordred-fs.lock` for the entire file
+existence/read/create-or-replace operation; retain the in-process wallet mutex.
+All Windows wallet writers/readers in this version use that same lock. Older
+Windows writers do not participate: stop them before using this version. No
+mixed-version Windows writer compatibility or automatic ACL migration is claimed.
+
+Writes create only the final `extension` directory under an existing trusted
+profile path. Existing directories/files must satisfy the foundation's private
+ACL contract; never chmod, repair or adopt them automatically. Reject junctions,
+unsafe ancestors, hard-linked files and unsafe lock objects. A missing checked
+directory or wallet alone permits the existing absent-wallet discovery behavior;
+access, ACL, lock, cleanup, size and other I/O failures must never become absence.
+The scope of a missing-error handler must distinguish the open/read operation
+from transaction/directory cleanup errors, even when those errors say `missing`.
+
+Preserve the existing JSON schema, duplicate-member rejection and UTF-8 checks.
+Both existing-file reads and serialized writes are bounded at 1 MiB. Validate
+the proposed document before creating a directory. Under the transaction, read
+and validate the existing file's storage posture before choosing exclusive
+creation for absence or checked replacement for presence. Oversized existing
+files are refused without replacement. This operation is not a multi-file or
+native-key lifecycle transaction and needs no delete/append primitive.
+
+Map filesystem failures to a `WalletConfigError` subclass, retaining non-secret
+reason, native status and `commit_state`. Its message must distinguish an
+uncertain save and tell the caller to inspect before retrying. Never retry,
+delete, regenerate keys, return a default wallet or roll back after an uncertain
+publication, including errors during context cleanup. Do not include document
+contents, key IDs, RPC credentials or paths in the public error text.
+
+Acceptance covers public set/load behavior on Windows Server 2022 hosted CI
+(Python 3.11–3.13) and retained Server 2025 ordinary-user source/wheel checks,
+including a fresh process, other-user denial and retained selection. No TPM
+operation is needed for this selection-document slice. Windows 11, interactive
+installation and whole-product flows remain later acceptance gates.
+
+
+
+## Windows native support proposal (2026-10-07)
+
+Status: proposed implementation contract following the approved Windows
+feasibility investigation. Windows product support remains deferred until the
+component and acceptance gates below pass. This section does not change the
+currently shipped Platform Support (v1) claims.
+
+### Intended outcome and scope
+
+Run the single Mordred plugin natively on Windows, with the same policy and
+privacy decisions as the supported Linux tier, including TPM-protected Private
+Telegram credentials and agent memory. Validate progressively on AWS Windows
+Server with actual NitroTPM. Preserve public Hermes integration and the
+zero-upstream-PR commitment. WSL results are not native Windows results.
+
+Initial implementation targets x86_64, Python 3.11–3.13, and a pinned,
+Windows-capable released Hermes version. Server 2025 is the actual-device
+engineering target; Server 2022 is a compatibility target. Windows 11 Desktop
+installation and its bundled runtime need a distinct acceptance run. Neither
+Server tests nor source-built Desktop prove MSIX installation/update behavior.
+
+No new macOS-equivalent `.env`, configuration/workspace seal, Windows Hello,
+per-use presence, ARM64, or TPM-key recovery claim is part of this port.
+
+### Windows hardware custody
+
+Implement a separate `mordred-hermes-winkey.exe` helper using Windows CNG and
+`Microsoft Platform Crypto Provider`. Preserve the existing helper commands,
+neutral error taxonomy, SEC1 P-256 public-key representation and 127-byte MRKW
+version-1 format. No changes to P-256 ECDH, HKDF-SHA256 or AES-256-KW are required
+by the successful initial AWS wire-format experiment.
+
+- Open the explicit Platform Crypto Provider and verify its implementation
+  reports hardware, with no software-provider substitution.
+- Create user-scoped persisted `ECDH_P256` keys. Do not set the Key Usage property
+  to KeyAgreement: the actual provider refused that setting with `0x80090029`,
+  while its default key successfully performed ECDH. Probe actual operations,
+  not just advertised algorithms or a property's label.
+- Keep export policy non-exportable. Public-key export is permitted; a private
+  export must fail. Handle conversion validates magic, curve size and lengths.
+- Import a valid public peer into the same provider, call `NCryptSecretAgreement`
+  and `NCryptDeriveKey(TRUNCATE)`, reverse the returned little-endian secret and
+  return exactly 32 bytes, preserving leading zeroes. Test against independent
+  Python/OpenSSL ECDH and the production wrapping functions.
+- Key names use `mordred-hermes:` followed by the lowercase SHA-256 hex digest
+  of the decoded application tag, keeping CNG names bounded and case-stable.
+  Reject empty, odd-length, non-hex tags and tags larger than 256 decoded bytes
+  before calling CNG; a
+  4 KiB UTF-8 request limit bounds the new helper. Generation must not overwrite
+  an existing key. Deletion must respect lifecycle guards. A successful Windows
+  deletion requires opening and deleting the exact key. An unopenable keyset
+  returns `UNAVAILABLE` with the original native status, even on a repeated
+  delete after successful removal. Actual PCP testing could not distinguish
+  absence from retained but inaccessible keys: both returned `NTE_BAD_KEYSET`,
+  and enumeration omitted the inaccessible retained key. Thus the Windows
+  helper does not promise success-on-missing idempotency; it must never falsely
+  confirm removal from a successful probe of a different key.
+- Do not store Windows passwords or impersonate users in the product helper.
+  It runs under the application's existing user token. Diagnostics test this
+  actual token's key access. The probe observed public-key-only SSH refusal and
+  password-authenticated ordinary-user success; desktop, terminal, scheduled
+  gateway and service contexts must be tested separately. Preserve native
+  error status in diagnostics: `NTE_BAD_KEYSET` is documented as key-not-found,
+  but the probe also observed it for an existing key under an incapable token.
+  Missing access must never be treated as permission to replace retained keys.
+  See [NCryptOpenKey](https://learn.microsoft.com/en-us/windows/win32/api/ncrypt/nf-ncrypt-ncryptopenkey).
+- Runtime lookup/open/unwrap failures never generate replacement keys, downgrade
+  to software, adopt an ambient plaintext key or erase valid ciphertext.
+- Describe the tier as machine-bound, without per-use presence or automatic
+  recovery. A copied disk is not a TPM backup; deletion/termination warnings
+  apply before irreversible custody actions.
+
+### Windows private storage and lifecycle
+
+Replace POSIX-specific security properties with tested Windows equivalents;
+never make Windows support a collection of skipped mode/lock checks.
+
+Private files and directories must have protected DACLs granting only the
+current user, SYSTEM and Administrators the necessary access. Validate ownership,
+parent-directory trust, unexpected inherited/broad grants, file type and stable
+handle identity. Deny reparse points and directory junctions on protected paths.
+Do not claim protection from administrators or arbitrary same-user hostile code.
+
+Use `CreateFileW` with a security descriptor at creation, handle-based metadata,
+`LockFileEx` for cooperating processes, and a checked replacement/flush strategy.
+Creation must not have an initial broad-permission window. Sharing violations,
+interrupted writes, concurrent writers and antivirus-held handles must preserve
+the prior valid data and return an actionable refusal. Network shares are not
+an initial supported secret-store location; validate local filesystem behavior.
+
+Keep the POSIX implementation intact behind an OS-dispatch boundary. Migrate
+caller components in separate PRs after the shared primitive contract is landed.
+
+Use upstream home resolution and explicit `HERMES_HOME`, Windows `Scripts`
+interpreter paths, `.exe` discovery, Unicode paths and PowerShell-compatible
+setup. Install native executables through a verified temporary file and atomic
+replacement; an in-use executable must not produce a partial installation.
+
+### Feature integration and truthful capabilities
+
+Windows memory custody follows the Linux wrapped-DEK lifecycle and retains its
+concurrent provision/reset/purge guards. Setup, doctor and status inspect the
+actual application interpreter and token before enabling encryption. Preserve
+existing data and report why custody is unavailable when that check fails.
+
+Desktop capability responses expose Windows TPM readiness, no per-use presence,
+setup prerequisites and restart requirements. Hide unsupported setup paths;
+never offer Xcode/Secure Enclave remediation on Windows. Old clients must not
+silently enable an unsupported setup flow.
+
+Each network path must verify Windows executable discovery, service ownership,
+process-tree termination, local/remote DNS, explicit proxy use, route liveness
+and failure behavior. Until verified, an unavailable route must refuse a strict
+operation rather than fall through to clearnet. Keep component-specific policy,
+LLM guard, privacy audit and extension changes separate.
+
+### Acceptance and delivery boundaries
+
+The first delivery is a docs-only contract PR targeting `dev`, then a keyvault
+helper PR, shared Windows primitives, keyvault runtime, wizard setup, separate
+network/policy/privacy caller migrations, Desktop/extension and CI integration.
+Do not advertise broad Windows support before all dependent slices pass.
+
+Actual-device gates cover ordinary-user generation/reopen/ECDH, independent
+cryptographic parity, non-exportability, malformed/corrupt inputs, process and
+OS restart, EC2 stop/start, unavailable provider/helper, deletion and device
+binding. A second instance must reject copied custody data after controlling for
+account/SID/DPAPI differences; an account-access denial alone is not that proof.
+
+Run unchanged-code baseline failures before porting, focused regression tests
+on Windows after each slice, reduced-extras typing, Windows wheel smoke and full
+macOS/Linux regressions. Standard hosted Windows CI does not establish TPM
+hardware support. Record emulator, actual NitroTPM, synthetic Telegram, real
+account/model and Desktop UI results separately in the CI validation log.
+
+The execution environment must contain only synthetic fixtures until a separate
+live-account test is requested. Stop task-owned compute, retain only explicitly
+identified development resources, and record residual storage costs.
+
+
+## Checked private file lifecycle (C1a)
+
+The opt-in `_private_fs` API retains checked private directories, single-link
+regular files, platform ACL validation and its permanent cooperative transaction
+lock. No component callers migrate in this slice. `FileMetadata` is a frozen
+record of `identity: FileIdentity`, `size: int`, and Unix-epoch `mtime_ns: int`.
+Both directory and transaction expose `stat(name)`, `read_prefix(name,
+max_bytes=...)`, and `list_names(max_entries=...)`. Stat always opens and validates
+the object; missing is an error. Prefix reads return up to the positive integer
+limit, including from longer files. Full reads still refuse oversized files.
+Enumeration returns sorted names as a bounded tuple, omitting only the reserved
+permanent lock and staging names. At most max_entries names are returned; at
+most max_entries + 1 non-dot entries fit the scan budget (one permanent-lock
+allowance); one additional entry may be fetched to detect overflow.
+Abandoned staging entries consume this scan budget. It never follows links or recurses, applies
+the filename contract, and refuses overflow. Names remain untrusted until
+opened. The transaction protects the snapshot from cooperating writers;
+ordinary directory enumeration has no snapshot atomicity promise.
+
+Transactions additionally expose `delete_file(name, expected_identity=None)`,
+`rename_file(name, destination, expected_identity=None)` and
+`append_bytes(name, data)`. They require existing checked regular files. Optional
+identity comparison precedes mutation. Rename is sibling-only and never
+replaces a destination, including an unsafe object. Windows uses an exclusive
+DELETE-capable checked handle and native no-replace rename/FileDispositionInfo;
+no checked-open/path-delete sequence is allowed. Deletion returns successfully
+only after close and checked absence. Any error after native deletion is
+attempted is uncertain. A rename error is retry-safe only after confirming the
+original checked identity and source name are retained. POSIX uses descriptor-
+relative unlink or no-replace link followed by unlink and directory flush;
+partial rename retains the recoverable duplicate and reports uncertain.
+
+Append holds the transaction, remembers original length, writes all bytes and
+flushes. On write/flush failure it truncates and flushes only the still-validated
+same file. Confirmed rollback reports not_committed; failed rollback reports
+uncertain. Cleanup after successful mutation is uncertain, including unlock
+and enclosing-directory close failures. Preserve original exceptions when
+cleanup also fails, promoting classified failures rather than replacing them.
+Never retry uncertain operations automatically. There is no secure-erasure,
+power-loss atomic append, or protection from hostile same-user code claim.
+All new operations reject invalid positive limits, reserved/path filenames and
+invalid closed/thread/fork lifetimes before touching filesystem state.
+
+### Confidential Windows directory capabilities
+
+Windows-only `open_confidential_directory(path, *, create=False)` admits a
+trusted shared parent while preserving exact-private `open_private_directory`.
+`ConfidentialDirectory` provides `stat`, bounded `read_bytes`, bounded
+`list_names(max_entries=...)`, and `transaction`;
+`ConfidentialTransaction` exposes the same bounded `list_names` and adds
+`create_bytes`, `replace_bytes`, and
+`delete_file(name, *, expected_identity=None)`. Existing files must be owned by
+the current user, regular, non-reparse and single-linked. Ordinary allow/deny
+ACEs with known inheritance flags and masks are accepted only if every
+effective allow targets that user, SYSTEM or Administrators; OWNER_RIGHTS maps
+to the verified owner. Denies never excuse an outside grant. Inherited,
+duplicate and restricted safe grants need not match the private descriptor.
+New locks, staging files, backups and replacements are exact-private before
+content. Existing parent descriptors and no-op file descriptors stay unchanged.
+
+`open_optional_confidential_directory(path)` and
+`open_optional_private_directory(path)` are Windows-only, noncreating contexts
+yielding the corresponding capability or `None`. Only a checked missing final
+leaf yields `None`; missing intermediate ancestors and unsafe/inaccessible
+objects fail. All checked ancestor handles stay pinned through context exit;
+cleanup errors propagate, including after an absence observation. No missing
+sentinel crosses cleanup. The endpoint is checked as a trusted parent with
+`creating_child=True`; create permits only a missing final leaf and verifies its
+new exact-private descriptor. Each operation
+rechecks the directory security/identity and successful observations recheck
+the file binding and security. Failed lock creation never permits unlocked IO.
+
+
+Both `PrivateDirectory` and `ConfidentialDirectory` expose
+`directory_identity() -> FileIdentity` for coordinator identity binding. It
+validates active context, originating process/thread, pinned directory and
+ancestor security, identity and path binding before returning the checked
+handle identity. There is no path-only or raw-stat fallback. POSIX private
+directories revalidate descriptor-relative names throughout the pinned chain.
+
+
+`PrivateTransaction` and `ConfidentialTransaction` also expose
+`directory_identity() -> FileIdentity`. A borrowed transaction must be active
+and belong to the current thread/process, then revalidate its owning directory
+with the same checked identity contract. This method never reacquires a lock.
+
+
+
+
+The confidential inventory uses the same handle-bound checked enumeration,
+namespace validation and entry budget as private inventory. It filters only
+foundation-reserved entries and does not admit listed children as safe files;
+callers must use checked file operations for each selected name. Enumeration
+rechecks directory binding/security before returning and respects directory and
+transaction process/thread/lifetime boundaries.
+
+`current_principal_id() -> bytes` returns the effective Windows token's validated
+canonical binary SID through the existing token capability. It has no account-name,
+path or environment fallback; token and cleanup failures propagate. Other platforms
+raise classified `unsupported`. This is identity data, not a secret or a key.
+
+### Checked Windows audit sessions
+
+Shared audit operations use one exact-private directory transaction across
+format probes, append, rotation, compression and retention. Borrowing an existing
+transaction requires a checked `assert_private_admission()` capability as well
+as matching checked directory identity; confidential admission is rejected even
+when its parent is exact-private. No independent global mutex may be held while
+waiting for this filesystem lock. Nested sessions reuse an explicitly owned
+same-directory transaction; different-directory nesting refuses.
+
+Snapshots and gzip decoding have explicit finite limits: initial defaults are
+16 MiB per file/decompressed output, 64 MiB aggregate, 4,096 entries and 4,096
+first-line bytes. Compression may retain an oversize raw file; readers never
+silently truncate. Rotation uses no-replace publication and recognizes only
+valid dated rotation names, with optional numeric suffix and gzip extension.
+Automatic retention uses checked mtime and excludes the current operation's
+new raw/gzip artifacts from that immediate sweep. It never selects unrelated
+prefix-matching files or permanent locks.
+
+Compression may report a degraded raw-retained result only for a local
+compression failure before publication, or a known not-committed I/O/access/busy
+publication failure, after verifying the original raw identity remains intact. Unsafe, identity, unsupported and uncertain errors
+propagate. Published gzip is verified before identity-bound raw deletion;
+failed deletion may leave both copies. Fatal compound failures after prior
+persistent mutation are reported uncertain, preserving underlying diagnostics.
+No automatic retry, guessed rollback, secure-erasure or power-loss claim is
+made. Consumers own encryption formats, generation leases and key authorization;
+uncertain writes invalidate their cached active identity/header/DEK and require
+explicit reconciliation. Shared audit operations do not enable those consumers.
+
+
+### Windows custody coordination capabilities
+
+`CanonicalSession.borrow_mordred_transaction()` lends a lifetime-bound protected
+`PrivateTransaction` proxy under home-before-mordred coordination. It requires
+exact-private admission and matching checked directory identity, extends scope
+without reacquiring the home lock, honors nonblocking mode, and creates only
+when the owning outer session authorized creation. Pending policy state refuses
+borrowing. Configured/canonical policy leaves, pending/legacy locks, their
+legacy temporary files and foundation-reserved names cannot be read or mutated;
+both rename operands are checked and bounded enumeration filters protected names.
+The proxy never exposes or releases the underlying transaction. Successful
+mutations join outer publication tracking and classified uncertainty is sticky,
+even when caught by a caller. No unrelated policy marker is manufactured.
+
+`CanonicalSession.publication_receipt()` lends no filesystem authority. Its
+`mark_published()` and `mark_uncertain(error: PrivateFSError)` methods validate
+process/thread/owner/receipt lifetime, then monotonically record child outcome
+before any parent filesystem revalidation. A child writer must report each
+successful mutation and each uncertain primitive/cleanup outcome. Escaping
+errors after reported publication also poison the owner. Original uncertainty
+survives later outer cleanup; reports cannot reset state. See
+[the coordinator API](WINDOWS_CONFIG_IO.md#future-audit-integration) for the exact
+caller obligations. These capabilities do not activate production custody.
+
+### Native Windows installation and helper (C4)
+
+The native PowerShell installer selects the actual Hermes virtualenv/conda
+interpreter, verifies Hermes distribution/CLI registration there, installs a
+pinned release or explicitly supplied source/wheel with keyvault and extension
+extras, and verifies the single `mordred` entry point. It scrubs Python/uv
+redirects and checks every native exit status. `-InstallOnly` finishes package
+validation without claiming configure/setup; otherwise it delegates the existing
+install dispatch and canonical writers (C3 dependency). No Bash or WSL is used.
+
+Windows wizard interpreter discovery has one reusable Python resolver, honoring
+an authoritative explicit override, `Scripts/python.exe`, conda roots and
+Desktop managed environments. System Python and mismatched Hermes launchers
+refuse. Public launchers and native helpers require verifiable content-bound
+ownership; unknown files and reparse destinations are retained/refused.
+
+`keyvault enable-winkey [--install-dir PATH]` builds only packaged or validated
+checkout sources with PowerShell array arguments and the running interpreter.
+Rust MSVC/Visual C++ tools are prerequisites. The exact freshly installed helper
+is probed under the current token, including custom destinations; build/probe
+errors remain failures. A successful probe establishes TPM machine binding,
+not presence, active memory encryption or Windows product completion. Windows
+setup/status use this command/finder without broadening encryption capabilities.
+
+Native PowerShell 5.1/pwsh and ordinary-user Windows installation, upgrade,
+uninstall and CNG evidence remain controller-run acceptance gates.
+
+C4 native executable/receipt publication depends on C1b's
+`open_confidential_directory` transactions, including trusted-parent ACL checks
+and identity-bound deletion. Missing C1b refuses; no weak native fallback is
+permitted. C4 cannot be finalized or advertised as native installation-ready
+until that dependency and its native acceptance pass.
+### Public Windows build-source reads
+
+Windows-only `read_public_build_output(path, *, max_bytes) -> bytes` reads public
+build output under the shared trusted-ancestor policy. The positive integer
+bound is at most 64 MiB. The source must be a regular, non-reparse file on the
+same local NTFS volume as its pinned parent, with a trusted owner and no foreign
+mutation rights. Read-only outside grants are allowed. Cargo output may have
+multiple hardlinks; the capability neither changes nor adopts the source.
+
+A single source handle excludes concurrent write/delete access through every
+alias until reading and security, identity, size and path postchecks finish.
+The named source is rechecked under that handle. Bytes are returned only after
+source and ancestor cleanup succeeds. There is no staging, guessed rollback or
+retry. Installed confidential/private files, receipts and destination admission
+still require a single link and retain their existing ownership/ACL rules.
+
+The wizard checks the PE header and any supplied build-script SHA256 against
+these bytes before publishing. Executable and receipt remain separate checked
+publications; failure may leave an unowned artifact requiring inspection, and
+never constitutes a successful installation.
+
+
+C3 may create a verified, create-no-replace `env-removed-[safe stamp].env`
+backup directly in the already-held exact-private policy directory through
+`CanonicalSession.create_policy_backup`. It rejects canonical policy and pending
+marker names before matching backup names, including custom canonical leaves.
+The method uses existing coordinator bounds, marker guards and classified
+publication/failure tracking. Explicit backup child directories retain their
+checked private capabilities and lock order; a successful child publication
+followed by outer coordination cleanup failure remains uncertain.
+
+### Windows dedicated custody and memory lifecycle
+
+C5 implements the Linux-equivalent Windows tier: CNG-backed memory custody,
+independent encrypted audit-key custody, and shared role identity/lifecycle
+services for Private Telegram. Preserve MRKW, memory AES-GCM and MRAL wire
+formats and existing Linux/macOS identifiers. This does not require a port of
+all `_storage` file-vault layouts. Windows file-vault freshness anchors,
+env/config/workspace seals, TPM recovery and per-use presence remain excluded.
+Their public APIs and runtime bootstrap paths must refuse before state mutation,
+anchor substitution or plaintext deletion. Ordinary configuration editing is
+supported independently of configuration encryption.
+
+#### Custody coordinator interfaces
+
+`CanonicalSession.borrow_mordred_transaction()` is a context-managed,
+lifetime-bound proxy over the already-owned exact-private Mordred transaction;
+it is not a raw transaction accessor. It validates process/thread/lifetime,
+checked directory identity and `assert_private_admission()`. Acquiring or
+extending scope follows home before mordred; borrowers never release the
+underlying lock. Reject another home, an unauthorized absent directory or a
+confidential-admission transaction.
+
+The proxy rejects canonical `policy.json`, the configured policy leaf,
+`.policy-write.pending`, permanent foundation lock/staging names and legacy
+coordinator lock names on every operation. Rename checks both operands;
+enumeration excludes these protected names. Thus callers cannot bypass the
+pair protocol, read through its marker or clear coordination state. A closed
+loan or outer session invalidates the proxy. C3 keeps its narrower
+`create_policy_backup` interface.
+
+The coordinator records successful proxy mutations and uncertain failures
+before returning to the borrower. Uncertainty poisons the owning session even
+if the borrower catches the exception; it cannot subsequently report success
+or clear a pending policy marker. Known unchanged collisions may be handled
+without erasing earlier publication tracking. Outer cleanup failure after a
+recorded mutation is a compound uncertain result, without automatic rollback.
+
+`CanonicalSession.publication_receipt()` supplies a lifetime-bound receipt
+with monotonic `mark_published()` and `mark_uncertain(exc)` methods for an
+independently locked memories child transaction. It provides no filesystem
+authority and no method to clear recorded state. The memory adapter reports
+each successful mutation and uncertain primitive/child-cleanup failure before
+leaving that child scope; escaping classified uncertainty is also recorded.
+The outer coordinator retains this outcome after a caller catches the error.
+No independent child publication may evade the owner's cleanup accounting.
+
+C5 lifecycle order is home, mordred, then memories; every Windows memory write,
+including a disarmed plaintext write, joins it. C7a audit operations receive
+the protected loan when their directory is mordred. A custom audit directory
+is acquired after custody locks. Audit providers resolve ownership first and
+must not recursively acquire home under an audit/mordred lock. Synchronous
+audit sinks reuse an explicitly lent transaction or emit after the scope;
+there is no cross-module implicit transaction lookup.
+
+The confidential capability is narrowly extended to canonical
+`<home>/memories`, including bounded `list_names(max_entries=...)` on both its
+directory and transaction. Existing inherited-safe files retain current-user
+ownership and confidential admission; broad grants, hardlinks, reparse points
+and inaccessible state refuse without ACL repair. New ciphertext, restored
+plaintext and backups are exact-private before content. The foundation exposes
+Windows `current_principal_id() -> bytes`, returning the validated current
+token's canonical binary SID; callers do not duplicate token/ACL code or use
+localized account names for identity.
+
+#### Physical profile binding and flat ownership
+
+New Windows native selectors are versioned and fully domain-separated by role.
+They bind the checked physical home `FileIdentity`, current binary SID and a
+persisted random profile nonce, plus an independent role-generation nonce.
+Derive a full SHA-256 identifier from validated, unambiguous field encodings;
+never authorize native use/deletion through a path string's casefold or an
+arbitrary persisted tag. The helper retains its bounded hashed CNG key naming.
+
+Aliases reaching the same checked physical home use the same ownership state.
+A safe rename/relocation preserving its FileIdentity, current SID and nonce is
+allowed. A copied, restored or recreated home with a different identity refuses
+without generating a key or automatically adopting retained material. Cost:
+movement to a new physical directory requires decrypt-before-move or explicit
+future migration; transparent encrypted portability is not promised. Existing
+Linux/macOS IDs and preliminary Windows artifacts are not silently reinterpreted.
+
+`<home>/mordred/windows-custody.json` is a flat, exact-private ownership
+manifest, bounded to 64 KiB and at most 64 retained role generations across
+roles. Roles are fixed to memory, audit and Telegram; current and retained
+records, version, profile binding and lifecycle epoch use an exact validated
+schema frozen by C5a before implementation. Role-specific pending journals
+record enrollment or deletion intent before the native operation. These are
+custody journals, not a new vault freshness anchor or whole-disk rollback
+protection. Memory purge does not delete independent audit or Telegram roles;
+retained audit generations remain owned while their history is retained.
+
+##### Dedicated Windows custody v1 schema
+
+The manifest has exactly `version: 1`, `home: {volume, file_id}`, `sid`,
+`profile_nonce`, `epoch`, and `roles`. Volume is an unsigned 64-bit integer;
+file ID is 16 bytes encoded as lowercase hex; SID is canonical revision-1
+binary SID encoded as lowercase hex. Nonces are independent random 32-byte
+lowercase hex values. Epoch is an integer from 0 through 2^53-1, never a
+boolean. `roles` contains exactly `memory`, `audit`, and `telegram`, each with
+`current` (null or record) and `retained` (record array). A record has exactly
+`generation`, `epoch`, `key_id`, `native_key_id`, and `public_sha256`.
+Logical IDs are respectively `mordred.memory`, `mordred.audit-log`, and
+`mordred-hermes.telegram.credentials.v1`. Public fingerprints are full SHA-256
+over validated uncompressed P-256 public bytes. Generation nonces are unique across all
+records. A current record's epoch does not change when another role changes.
+Duplicate JSON keys, unknown fields, invalid UTF-8, noncanonical hex, malformed
+SID/identity, record mismatch, overflow, and more than 64 retained generations
+refuse. Encoded manifests and journals are each bounded to 64 KiB.
+
+`windows-{role}.pending.json` has exactly `version`, `profile_nonce`, `role`,
+`operation`, `phase`, and `record`. Operation is `create` or `delete`; create
+phases are `intent` and `verified`, delete phases `intent` and `deleted`.
+Only create intent permits a null public fingerprint. Journal identity and
+generation are checked against the bound manifest. Create intent is durable
+before native creation, verified fingerprint before memory-wrapper publication,
+current ownership before final journal deletion. Delete intent precedes native
+deletion, and positive deletion is durably recorded before artifact cleanup.
+An interrupted native delete with only intent remains ambiguous even if the
+key subsequently cannot be opened. Explicit reconciliation never generates.
+Retained audit/Telegram records can be selected only by a validated generation
+lease; a new current role may retain its predecessor without deleting it.
+
+The native selector is `mordred-hermes.windows.v1.` plus full lowercase SHA-256
+of the domain `mordred-hermes.windows-custody.v1\0` followed by length-prefixed
+binary fields: big-endian 64-bit volume, 16-byte file ID, SID, profile nonce,
+ASCII role, and generation nonce. Each length is unsigned big-endian 32-bit.
+No pathname participates in native authority.
+
+`windows_custody_session(home, create=False, canonical=None, backend=None)`
+owns home then mordred, or joins an explicit C2 session after checking the
+physical home identity without reacquiring its lock. `WindowsCustodySession`
+provides immutable `GenerationLease` values (profile nonce, role, generation,
+epoch, logical/native IDs and fingerprint), current/retained `lease()` selection,
+`validate_lease()` and `backend_for()` exact-public verification. Leases are
+observations, not perpetual authority: consumers validate them inside a fresh
+custody scope before mutation. The session's checked `canonical` coordinator
+supports subsequent memory/audit adapters; use ends when either scope closes.
+
+`enroll_memory(adopted_key=None)` provisions inert memory custody;
+`enroll_role(role, retain_current=False)` explicitly provisions audit/Telegram.
+Runtime `resolve_windows_memory_key` is load-only. A valid manifest containing
+only other roles is not broken memory custody; no memory role/journal/blob,
+marker/opt-out or seal evidence means an unmanaged result without creation.
+Helper discovery happens before enrollment intent, but native creation failures
+retain the intent journal. `reconcile_pending()` never creates a native key.
+
+`delete_role(lease, erase_authorized=False)` validates ownership and journals
+irreversible deletion. Memory requires explicit opt-out, no opt-in/seals and a
+known stopped Windows gateway inventory. Audit/Telegram require a future caller
+ceremony proving history removal or explicitly authorizing erasure. Only a
+positively recorded `deleted` phase permits checked wrapper/opt-out removal,
+role cleanup and journal removal last; recovery may encounter already-removed
+cleanup members, but still refuses opt-in, seals or unsafe objects. Independent
+roles and permanent directory locks survive. Successful memory purge returns
+to unmanaged state; a later explicit enrollment obtains a fresh generation.
+An intent with an ambiguous native deletion result remains unresolved. Native
+create/delete scopes mark the owning publication receipt before the call, so
+later ledger failures remain sticky even if a borrower catches them; classified
+filesystem failures retain their identity and are promoted to uncertain.
+
+#### Enrollment, loading and lifecycle failures
+
+Separate explicit create-only enrollment from load-only key resolution.
+Enrollment first validates checked fresh state or an explicit in-memory
+adoption request, then persists its role journal, invokes native generation
+without overwrite, verifies the exact public key and wrap/unwrap roundtrip,
+publishes the wrapped memory key without replacement, and commits checked
+ownership. The arm marker is a later step. A generation collision or any
+uncertain step retains evidence and requires explicit reconciliation.
+
+`NTE_BAD_KEYSET`, `WrapKeyNotFound`, failed lookup or enumeration omission never
+proves hardware-key absence. Neither runtime loading nor enrollment recovery
+may generate a replacement after such a result. Wrapped keys, markers,
+opt-outs, pending ownership and any existing/broken memory seal preclude a
+fresh-state inference. Explicit pending recovery can reuse only the journaled
+key after positive exact-key verification; a probe of another key is no proof.
+No ambient plaintext key or software backend is a runtime fallback.
+
+Checked flat memory inventory includes `.md` files and `.md.bak.*` backups;
+initial limits are 4,096 entries, 8 MiB per file and 64 MiB aggregate. Errors
+and overflow are not an empty inventory. Explicit adoption authenticates every
+seal before native creation. Windows hook reads, writes, journey checks and
+drift backups use the shared checked adapter, not upstream raw publication.
+Preserve basename-bound AEAD, broken-seal refusal and sticky sealing while
+disarmed/in safe mode. Unreadable sealed state cannot become an empty successful
+memory read. No process-global plaintext key cache is introduced.
+
+Disable decrypts and verifies all selected memories before final disarm;
+partial failure preserves custody, remaining ciphertext and armed state.
+Purge requires a complete rescan proving no seal or broken seal remains and a
+positive exact-key native deletion under a persisted deletion journal. Failure
+after deletion but before recording success remains ambiguous; a later failed
+open cannot turn it into confirmed absence or permission to recreate the key.
+Classified uncertainty survives wrapper exceptions and outer cleanup.
+
+#### Runtime proof and audit enrollment
+
+The first Windows release requires installed-runtime proof; there is no
+force-runtime-unverified override. Reuse C4's `_windows_runtime` resolver,
+validator and scrubbed environment rather than copying launcher logic.
+An authoritative interpreter/launcher failure does not fall through to another
+runtime. Check the actual installed memory hook and perform a synthetic
+in-memory roundtrip through its CNG-backed provider under the application token.
+Release custody locks before launching that subprocess, then reacquire and
+revalidate the same profile/generation/wrapped key before arming. A failed proof
+preserves real files and markers; an inert enrolled key may remain for retry.
+
+Windows gateway discovery returns explicit known/unknown state and observed
+runtimes. Use viable native/psutil process inspection, preserving AccessDenied,
+process-exit and PID-reuse distinctions. An inaccessible plausible gateway or
+failed inventory is unknown, never an empty list proving safety. The observed
+ordinary-user CIM denial must not become an empty-success fallback. Unknown
+or running relevant gateways refuse destructive lifecycle transitions; a new
+subprocess cannot prove which hook an existing process loaded. Process discovery
+supplements lifecycle locks and does not guarantee that a new process cannot
+start after the scan.
+
+Audit enrollment is an explicit native-custody initialization ceremony. Memory
+enable may call that ceremony explicitly; an audit callback never provisions
+a key. Audit load/writer construction uses a checked independent role lease,
+without a full file-vault/main-key metadata dependency. C7a supplies checked
+append, rotation and bounded snapshots. Uncertain outcomes invalidate cached
+active identity/header/DEK and require reconciliation. Existing audit downgrade
+policy remains a separate consumer decision; unsafe/uncertain storage never
+permits overwriting retained ciphertext or silently creating replacement keys.
+
+Flat memory/audit lifecycle needs no recursive filesystem API. Keep its
+permanent directory lock after purge. Recursive uninstall of Telegram/archive
+or legacy vault trees remains a later shared-foundation prerequisite requiring
+checked traversal, an outer lifecycle lock and quiescent directory removal;
+raw recursive deletion does not satisfy this contract.

@@ -33,6 +33,7 @@ def test_history_at_exact_frame_limit_is_complete() -> None:
     complete = {
         "id": "history-1",
         "type": "history_result",
+        "status": "ok",
         "turns": turns,
         "truncated": False,
     }
@@ -55,6 +56,7 @@ def test_history_returns_the_longest_complete_newest_suffix() -> None:
     expected = {
         "id": "history-2",
         "type": "history_result",
+        "status": "ok",
         "turns": turns[-2:],
         "truncated": True,
     }
@@ -74,6 +76,7 @@ def test_unicode_uses_the_same_ascii_count_as_the_wire_frame() -> None:
     complete = {
         "id": "unicode",
         "type": "history_result",
+        "status": "ok",
         "turns": turns,
         "truncated": False,
     }
@@ -96,6 +99,7 @@ def test_single_oversized_newest_turn_yields_an_empty_suffix() -> None:
     empty = {
         "id": "huge",
         "type": "history_result",
+        "status": "ok",
         "turns": [],
         "truncated": True,
     }
@@ -128,6 +132,7 @@ def test_serving_a_suffix_does_not_modify_encrypted_history(
     expected_suffix = {
         "id": "persist",
         "type": "history_result",
+        "status": "ok",
         "turns": [messages[-1]],
         "truncated": True,
     }
@@ -140,3 +145,17 @@ def test_serving_a_suffix_does_not_modify_encrypted_history(
     assert json.loads(ws.raw[-1]) == expected_suffix
     assert len(ws.raw[-1]) <= extension_api.MAX_WS_FRAME_CHARS
     assert extension_history.load_messages() == messages
+
+
+def test_undecryptable_history_is_flagged_additively() -> None:
+    """``messages``/``turns`` stay a list for older clients; the outcome rides
+    alongside it as an additive field."""
+    result = extension_api._bounded_history_result("h", [], status="undecryptable")
+
+    assert result == {
+        "id": "h",
+        "type": "history_result",
+        "status": "undecryptable",
+        "turns": [],
+        "truncated": False,
+    }

@@ -543,6 +543,26 @@ with _storage.keyvault_lifecycle_lock(root):
             pass
 
     def test_replaced_inner_lock_inode_is_refused(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A lock inode that keeps being replaced while it is opened is refused.
+        root = tmp_path / "kv"
+        _storage.ensure_layout(root)
+        lock_path = root / ".lock"
+        real_open = os.open
+
+        def racing_open(path: os.PathLike[str] | str, flags: int, mode: int = 0o777) -> int:
+            if Path(path) == lock_path and not flags & os.O_CREAT:
+                lock_path.unlink()
+                replacement_fd = real_open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(replacement_fd)
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(_storage.os, "open", racing_open)
+        with pytest.raises(_storage.KeyvaultPermissionError, match="changed"), _storage.keyvault_lock(root):
+            pass
+
+    def test_single_lock_inode_replacement_is_retried(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # One replacement (or macOS bumping the change time once) is re-checked
+        # from scratch; the lock then holds the inode the path names now.
         root = tmp_path / "kv"
         _storage.ensure_layout(root)
         lock_path = root / ".lock"
@@ -559,8 +579,8 @@ with _storage.keyvault_lifecycle_lock(root):
             return real_open(path, flags, mode)
 
         monkeypatch.setattr(_storage.os, "open", racing_open)
-        with pytest.raises(_storage.KeyvaultPermissionError, match="changed"), _storage.keyvault_lock(root):
-            pass
+        with _storage.keyvault_lock(root):
+            assert swapped
 
     def test_forked_child_drops_inherited_lock_state_and_waits_for_parent(self, tmp_path: Path) -> None:
         root = tmp_path / "kv"

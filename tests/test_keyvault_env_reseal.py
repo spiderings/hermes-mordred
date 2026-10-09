@@ -40,18 +40,10 @@ from mordred_hermes.keyvault import _env_reseal, _env_write_guard, _identity, va
 from mordred_hermes.keyvault._env_reseal import reseal_env
 from mordred_hermes.keyvault._runtime_env import _env_optout_marker_path
 
+from ._helpers import _init_empty_vault
 from ._keyvault_fakes import FakeAnchorStore, FakeBackend
 
-_PASSPHRASE = "correct horse battery staple"
 _ENV_MULTI = b"A=1\nB=2\n"
-
-
-def _init_empty_vault(root: Path, backend: FakeBackend, store: FakeAnchorStore) -> None:
-    key_id = anchor_label = _identity.vault_identity(root)
-    backend.generate_enclave_key(key_id)
-    vault.init_vault(
-        root, key_id=key_id, passphrase=_PASSPHRASE, backend=backend, store=store, anchor_label=anchor_label
-    ).close()
 
 
 def _vault_env(root: Path, backend: FakeBackend, store: FakeAnchorStore) -> bytes | None:

@@ -25,6 +25,7 @@ import sys
 from typing import Any, cast
 
 from .._audit_support import safe_audit_append
+from .._plugin_identity import MIGRATE_COMMAND, PLUGIN_NAME
 from .._policy_types import VALID_ACTIVE_PATHS, ActivePath
 from . import _runtime
 from ._exceptions import MordredIntegrityRefused
@@ -54,15 +55,17 @@ def _resolve_active_network_path() -> ActivePath | None:
 
 
 def check_plugin_integrity(**kwargs: Any) -> None:
-    """Detect an explicitly disabled Mordred plugin from any live sibling.
+    """Detect a disabled, unloaded, or partially registered Mordred plugin.
 
-    Strict + sibling-disable → audit + poison + integrity refusal.
-    Lenient/off + sibling-disable → audit (warn) + log warning, continue.
+    Strict + disabled/incomplete → audit + poison + integrity refusal.
+    Lenient/off + disabled/incomplete → audit (warn) + log warning, continue.
 
-    Every runtime plugin registers this same callback. That is deliberate:
-    relying on ``mordred_privacy_check`` alone would make disabling that plugin
-    disable the detector too. As long as at least one runtime sibling remains
-    active, strict mode therefore fails closed.
+    The ``mordred`` plugin registers this callback first, before its
+    components, and the ``.pth`` runtime bootstrap puts a mandatory copy at the
+    front of ``on_session_start`` that runs even when the plugin is disabled or
+    not enabled at all (``mordred_hermes._runtime_bootstrap``). With the
+    manager in hand it also reports each failed component as
+    ``mordred/<component>``.
     """
     state = _runtime.ensure_state()
     disabled = _runtime.find_disabled_siblings(config_path=state.config_path)
@@ -71,6 +74,7 @@ def check_plugin_integrity(**kwargs: Any) -> None:
         disabled.update(_runtime.find_unloaded_siblings(plugin_manager))
 
     if disabled:
+        hint = _legacy_names_hint(state.config_path) if PLUGIN_NAME in disabled else ""
         decision = "block" if state.policy_mode == "strict" else "warn"
         # safe_audit_append, not a bare append: Hermes wraps every hook callback
         # in ``except Exception`` and logs-and-continues. A plain Exception from
@@ -91,8 +95,8 @@ def check_plugin_integrity(**kwargs: Any) -> None:
         )
         if state.policy_mode == "strict":
             msg = (
-                f"Mordred strict mode: sibling plugins disabled: {sorted(disabled)}. "
-                "Re-enable them or switch to lenient/off mode."
+                f"Mordred strict mode: Mordred plugin not loaded or incomplete: {sorted(disabled)}. "
+                f"Enable the '{PLUGIN_NAME}' plugin and fix the failure, or switch to lenient/off mode.{hint}"
             )
             _runtime.poison(msg)
             _LOG.error(msg)
@@ -109,7 +113,23 @@ def check_plugin_integrity(**kwargs: Any) -> None:
             with contextlib.suppress(Exception):
                 print(f"mordred: {msg}", file=sys.stderr)
             raise MordredIntegrityRefused(msg)
-        _LOG.warning("Mordred siblings disabled in %s mode: %s", state.policy_mode, sorted(disabled))
+        _LOG.warning(
+            "Mordred plugin not loaded or incomplete in %s mode: %s.%s", state.policy_mode, sorted(disabled), hint
+        )
+
+
+def _legacy_names_hint(config_path: Any) -> str:
+    """Point an unmigrated config (old per-component plugin names) at the fix."""
+    try:
+        legacy = _runtime.find_legacy_plugin_names(config_path=config_path)
+    except Exception:
+        return ""
+    if not legacy:
+        return ""
+    return (
+        f" config.yaml still lists the old plugin names {sorted(legacy)}, which Hermes no longer loads; "
+        f"run `{MIGRATE_COMMAND}` to switch to '{PLUGIN_NAME}'."
+    )
 
 
 def on_session_start(**kwargs: Any) -> None:
@@ -130,6 +150,53 @@ def on_session_start(**kwargs: Any) -> None:
             },
             logger=_LOG,
         )
+
+
+def _check_tool_egress(state: Any, tool_name: str, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """Apply the tool-egress level (see :mod:`.egress`); fail closed on errors."""
+    from . import egress
+
+    session_id = str(kwargs.get("session_id") or "") or None
+    try:
+        policy = egress.load_policy()
+        decision = egress.decide(tool_name, kwargs.get("args"), session_id, policy)
+    except Exception:
+        _LOG.exception("tool-egress evaluation failed; blocking %s", tool_name)
+        policy = egress.EgressPolicy(level="lockdown")
+        decision = egress._block("lockdown", "egress.evaluation_failed", "the egress check itself failed.")
+    if decision.allow:
+        if decision.taints and policy.taint:
+            egress.mark_tainted(session_id)
+        return None
+    if decision.approve:
+        # Hermes shows its approval prompt (once / session / always / deny) and
+        # blocks the call on deny or when no human is present.
+        safe_audit_append(
+            state.audit,
+            {
+                "event": "pre_tool_call",
+                "decision": "ask",
+                "reason": "policy.egress.tool_blocked",
+                "rule": decision.reason,
+                "level": policy.level,
+                "tool_name": tool_name,
+            },
+            logger=_LOG,
+        )
+        return {"action": "approve", "message": decision.message, "rule_key": decision.rule_key}
+    safe_audit_append(
+        state.audit,
+        {
+            "event": "pre_tool_call",
+            "decision": "block",
+            "reason": "policy.egress.tool_blocked",
+            "rule": decision.reason,
+            "level": policy.level,
+            "tool_name": tool_name,
+        },
+        logger=_LOG,
+    )
+    return {"action": "block", "message": decision.message}
 
 
 def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
@@ -160,6 +227,10 @@ def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
             "message": _runtime.get_poison_reason() or "Mordred strict mode: process poisoned",
         }
 
+    egress_block = _check_tool_egress(state, tool_name, kwargs)
+    if egress_block is not None:
+        return egress_block
+
     outcome = evaluate_pre_tool_call(
         policy_mode=state.policy_mode,
         tool_name=tool_name,
@@ -184,3 +255,25 @@ def pre_tool_call(**kwargs: Any) -> dict[str, Any] | None:
             ),
         }
     return None
+
+
+NETWORK_PROMPT = """## Internet use (Mordred)
+Do the work locally: files, local commands and code are fine. `web_search` is \
+fine. Avoid any other internet access (opening URLs, browsing, curl/wget, \
+installing packages, remote APIs, git push/pull): use it only when the task \
+really needs it. Each such call shows the user an approval prompt with where \
+it goes and what it sends, so say in one line why before you call it, and \
+accept a refusal. Never send the user's private data (Telegram answers, file \
+contents, notes) to the internet. Blocklisted sites and bare IP addresses are \
+always refused."""
+
+
+def network_prompt_section() -> str:
+    """The prompt section for the ``ask`` level (empty when another level is set)."""
+    from . import egress
+
+    try:
+        level = egress.load_policy().level
+    except Exception:
+        return ""
+    return NETWORK_PROMPT if level == "ask" else ""

@@ -48,9 +48,9 @@ NOT protect against a same-uid attacker on a running, unlocked machine —
 an unattended wrapping key lets any same-uid process unwrap the master.
 That tradeoff is accepted for hands-free operation.
 
-Like its keyvault siblings it imports :mod:`cryptography` (through the
-crypto modules) and is only importable where the ``[macos]`` extra is
-installed.
+It imports :mod:`cryptography` through the cross-platform ``keyvault`` extra.
+Device custody remains abstracted behind the injected native backend and
+anchor store.
 """
 
 from __future__ import annotations
@@ -184,7 +184,12 @@ def _load_pinned_unverified(
             f"authoritative manifest for generation {record.generation} is missing — {missing_detail}"
         ) from e
     untrusted = manifest.parse_unverified(blob)
-    anchor.verify_anchor(store, anchor_label, wmk=untrusted.wmk, generation=untrusted.generation)
+    # Pin-check against the record read above: ONE Keychain read per open.
+    # Re-reading here added nothing (the record was just read and nothing is
+    # locked between the two reads) but cost a second Keychain access, and with
+    # it a second macOS access dialog whenever the item's ACL does not trust
+    # the calling binary.
+    anchor.verify_pinned(record, wmk=untrusted.wmk, generation=untrusted.generation)
     return blob, untrusted
 
 
@@ -322,7 +327,7 @@ def open_vault(
     1. read the device-bound anchor → the authoritative generation N (and
        the pinned wmk fingerprint),
     2. load ``manifest.<N>`` and ``parse_unverified`` it to extract ``wmk``,
-    3. :func:`anchor.verify_anchor` — reject unless ``SHA-256(wmk)`` and the
+    3. :func:`anchor.verify_pinned` — reject unless ``SHA-256(wmk)`` and the
        manifest's generation match the pins (defeats P1-a + P1-b),
     4. SE-unwrap the now-trusted ``wmk`` to obtain the master,
     5. :func:`manifest.decode` to authenticate the full manifest under it.

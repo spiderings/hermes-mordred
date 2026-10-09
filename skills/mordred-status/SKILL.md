@@ -14,8 +14,8 @@ metadata:
 # Mordred status (read-only)
 
 Inspect the local Mordred privacy layer when the user asks things like
-"mordredの状態は？" / "what's my mordred status" / "今のpolicyは？" /
-"どのnetwork経路？" / "mordredのプラグイン一覧".
+"what's my Mordred status?", "what policy is active?", "which network route
+is selected?", or "which Mordred plugins are loaded?".
 
 ## CRITICAL — read-only boundary
 
@@ -58,10 +58,10 @@ the exact command and tell them to run it themselves in their shell:
 
 ## Why
 
-These rules preserve the "domain separation" principle in
-`docs/dev/HARNESS_PRIVACY.md`: a recording agent may watch Mordred's
-on/off state, but secrets (recovery passphrase, `.env` contents, decrypted audit)
-and control actions must stay on the operator's shell, outside the transcript.
+These rules preserve the domain separation in `docs/dev/SPEC.md` §Threat Model
+& Accepted Limitations: a recording agent may observe Mordred's state, but
+secrets (recovery passphrase, `.env` contents, decrypted audit) and control
+actions stay in the operator's shell, outside the transcript.
 
 > **Residual risk**: the FORBIDDEN list above is a prompt-level instruction,
 > not an enforcement mechanism — it does not technically prevent this agent

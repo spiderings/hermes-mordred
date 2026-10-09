@@ -8,11 +8,9 @@ to manage nonce uniqueness manually. Wire format:
 AES-GCM key sizes accepted: 128 / 192 / 256 bit. The keyvault uses 256-bit
 data-encryption keys (DEKs) per SPEC §Plugin: ``mordred_keyvault``.
 
-Reachability note: ``cryptography`` is declared under ``[macos]`` extras
-because Phase 4 keyvault is macOS Apple Silicon only per SPEC §Platform
-Support L43. Linux / WSL2 must not import this module — the ImportError
-surfaces at package level when ``[macos]`` extras are absent. Tier 2 /
-Tier 3 platform fallbacks (TPM / DPAPI) are scheduled for v2-OS2.
+``cryptography`` is supplied by the cross-platform ``keyvault`` extra. Native
+key custody is selected separately (Secure Enclave on macOS or TPM 2.0 on
+Linux), so these pure primitives remain platform-neutral.
 """
 
 from __future__ import annotations

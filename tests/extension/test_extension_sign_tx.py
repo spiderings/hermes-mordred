@@ -150,6 +150,27 @@ def test_malformed_or_unrepresentable_transactions_are_rejected(updates, error):
         extension_sign.sign_transaction(tx, chain_id=1)
 
 
+@pytest.mark.parametrize(
+    ("tx", "error"),
+    [
+        ({"to": "0xzz", "from": "0xzz"}, "invalid_transaction_address:to"),
+        ({"accessList": [1], "nonce": "bad"}, "unsupported_transaction_access_list"),
+        ({"maxPriorityFeePerGas": 100, "maxFeePerGas": 1, "to": "0xzz"}, "invalid_transaction_address:to"),
+        ({"gasPrice": "0x1", "maxFeePerGas": "0x2", "bogus": "x"}, "unsupported_transaction_fields:bogus"),
+    ],
+)
+def test_validate_transaction_request_reports_first_error_in_field_order(tx, error):
+    """A transaction that fails several checks at once must always report the
+    same first one, so a reorder inside ``_extension_tx``'s split-out
+    validators (``_validate_present_transaction_fields``,
+    ``_validate_present_transaction_values``, ``validate_transaction_request``)
+    fails this test. Order pinned: ``to`` before ``from``; ``accessList``
+    before per-field values; per-field values (``to``) before fee bounds;
+    unknown fields before the fee-mode conflict check."""
+    with pytest.raises(ValueError, match=error):
+        extension_sign.validate_transaction_request(tx, chain_id=1)
+
+
 def test_missing_fields_raises():
     with pytest.raises(extension_sign.TransactionFieldsMissing) as ei:
         extension_sign.sign_transaction({"to": "0x" + "00" * 20, "value": "0x1"}, chain_id=1)

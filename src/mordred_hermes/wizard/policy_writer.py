@@ -1,6 +1,6 @@
 """Round-trip writer for ``~/.hermes/config.yaml`` and ``~/.hermes/mordred/policy.json``.
 
-Sole writer for the wizard-owned files (PATHS.md L17-19 writer column).
+Sole writer for the wizard-owned policy files (PATHS.md §Overview).
 Preserves user comments, key order, and anchors in ``config.yaml`` via
 ``ruamel.yaml`` round-trip mode. Writes ``policy.json`` as the
 debugger-friendly mirror that other Mordred plugins read directly.
@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import stat
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
@@ -38,14 +39,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Literal, Protocol, runtime_checkable
+from typing import Any, Final, Literal, NoReturn, Protocol, runtime_checkable
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
+from .._config_io import CONFIG_LIMIT, POLICY_LIMIT, CanonicalPaths, CanonicalSession, canonical_session
+from .._file_lock import private_flock
+from .._plugin_identity import PLUGIN_NAME, PluginListMigration, migrate_plugin_lists
 from .._policy_io import (
     load_policy_mapping,
     policy_transaction_marker_for_policy,
 )
+from .._private_fs import PrivateFSError, open_private_directory
 from ._runtime import (
     DEFAULT_HERMES_CONFIG_PATH,
     DEFAULT_MORDRED_DIR,
@@ -65,7 +71,13 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None  # type: ignore[assignment]
 
-MORDRED_PLUGIN_NAMES: Final = (
+#: Names that must be in ``plugins.enabled``: the single ``mordred`` plugin.
+MORDRED_PLUGIN_NAMES: Final = (PLUGIN_NAME,)
+
+#: ``plugins.<section>`` settings blocks this writer may edit. These are
+#: Mordred's own config keys (named after the pre-0.2.0a0 per-component
+#: plugins), not Hermes plugin identities.
+MORDRED_CONFIG_SECTIONS: Final = (
     "mordred_privacy_check",
     "mordred_wizard",
     "mordred_llm_guard",
@@ -88,6 +100,129 @@ class _HasConfigYamlSection(Protocol):
     """
 
     def to_config_yaml_section(self) -> Mapping[str, Any]: ...
+
+
+def _windows() -> bool:
+    return sys.platform == "win32"
+
+
+def _canonical_paths(config: Path, policy: Path, mordred: Path) -> CanonicalPaths:
+    if policy.parent != mordred or mordred.parent != config.parent:
+        raise ValueError("canonical config and policy must share one home")
+    return CanonicalPaths(config.parent, config.name, mordred.name, policy.name)
+
+
+def _bounded_utf8(text: str, limit: int) -> bytes:
+    data = text.encode("utf-8")
+    if len(data) > limit:
+        raise ValueError("configuration exceeds its byte limit")
+    return data
+
+
+@dataclass
+class _CheckedPolicyEdit:
+    session: CanonicalSession
+    yaml: YAML
+    root: Any
+    policy: dict[str, Any]
+    config_present: bool
+    config_bytes: bytes | None = None
+    policy_bytes: bytes | None = None
+
+    def dump_config(self) -> None:
+        buf = io.StringIO()
+        self.yaml.dump(self.root, buf)
+        self.config_bytes = _bounded_utf8(buf.getvalue(), CONFIG_LIMIT)
+
+    def edit_sections(
+        self,
+        sections: Mapping[str, Mapping[str, Any]],
+        mutator: Callable[[Any, str, Mapping[str, Any]], None],
+    ) -> None:
+        for name, body in sections.items():
+            if name not in MORDRED_CONFIG_SECTIONS:
+                raise ValueError(f"PolicyWriter only edits Mordred plugin sections; refusing to touch {name!r}")
+            mutator(self.root, name, body)
+        _ensure_plugins_enabled(self.root)
+        self.dump_config()
+
+    def emit(self, snapshot: PolicySnapshot) -> None:
+        if snapshot.provider_overrides == {} and "provider_overrides" in self.policy:
+            snapshot = replace(snapshot, provider_overrides=copy.deepcopy(self.policy["provider_overrides"]))
+        self.policy_bytes = _bounded_utf8(json.dumps(snapshot.to_json_dict(), indent=2) + "\n", POLICY_LIMIT)
+
+
+@contextmanager
+def _checked_policy_edit(paths: CanonicalPaths, *, recover: bool = False) -> Iterator[_CheckedPolicyEdit]:
+    with (
+        canonical_session(paths, scope="policy", create=True) as session,
+        session.policy_update(recover_pending=recover) as update,
+    ):
+        pair = session.read_pair()
+        yaml = _round_trip_yaml()
+        try:
+            root = yaml.load(pair.config.data.decode("utf-8")) if pair.config else {}
+        except YAMLError as exc:
+            raise ValueError("canonical config contains invalid YAML") from exc
+        if not isinstance(root, MutableMapping):
+            raise ValueError("canonical config must contain a mapping")
+        policy = json.loads(pair.policy.data.decode("utf-8")) if pair.policy else {}
+        if not isinstance(policy, dict):
+            raise ValueError("canonical policy must contain an object")
+        edit = _CheckedPolicyEdit(session, yaml, root, policy, pair.config is not None)
+        yield edit
+        if edit.config_bytes is not None:
+            update.put_config(edit.config_bytes)
+        elif pair.config is not None:
+            update.put_config(pair.config.data)
+        if edit.policy_bytes is not None:
+            update.put_policy(edit.policy_bytes)
+        elif pair.policy is not None:
+            update.put_policy(pair.policy.data)
+        update.commit()
+
+
+def _write_checked_private(path: Path, data: bytes, *, backup: bool = False) -> bool:
+    """Write a private child with its parents already checked and locked.
+
+    Caller owns canonical home/policy locks and accounts for publication if
+    their later cleanup fails. The foundation creates only this final child.
+    Backup locks never wait: an explicit destination can belong to a different
+    profile, so blocking here could form a cross-profile lock cycle.
+    """
+    published = False
+    try:
+        with (
+            open_private_directory(path.parent, create=True) as directory,
+            directory.transaction(blocking=not backup) as transaction,
+        ):
+            try:
+                before = transaction.stat(path.name)
+            except PrivateFSError as exc:
+                if exc.reason != "missing" or exc.commit_state != "not_committed":
+                    raise
+                before = None
+            if before is not None and not backup:
+                if before.size > CONFIG_LIMIT:
+                    raise PrivateFSError("unsafe", "oversize")
+                original = transaction.read_bytes(path.name, max_bytes=CONFIG_LIMIT)
+                if transaction.stat(path.name) != before:
+                    raise PrivateFSError("unsafe", "read_changed")
+                if original == data:
+                    return False
+                transaction.replace_bytes(path.name, data)
+            else:
+                transaction.create_bytes(path.name, data)
+            published = True
+            before = transaction.stat(path.name)
+            actual = transaction.read_bytes(path.name, max_bytes=CONFIG_LIMIT)
+            if actual != data or transaction.stat(path.name) != before:
+                raise PrivateFSError("unsafe", "private_write_verification")
+        return True
+    except PrivateFSError as exc:
+        if published:
+            exc.commit_state = "uncertain"
+        raise
 
 
 def _round_trip_yaml() -> YAML:
@@ -130,6 +265,8 @@ def _fsync_parent(path: Path) -> None:
 
 def _read_regular_text(path: Path) -> str | None:
     """Read an existing regular file without following or blocking on specials."""
+    if _windows():
+        raise PrivateFSError("unsupported", "generic_configuration_read_requires_checked_consumer")
     try:
         before = path.lstat()
     except FileNotFoundError:
@@ -164,9 +301,31 @@ def _ensure_real_directory(directory: Path) -> None:
         raise OSError(errno.ENOTDIR, "writer parent must be a real directory", str(directory))
 
 
+def _reject_unopenable_policy_lock(lock_path: Path, exc: OSError) -> NoReturn:
+    """Wrap an ``os.open`` failure on the policy lock as a tagged ``EPERM``."""
+    raise OSError(errno.EPERM, "policy writer lock is unsafe or unavailable", str(lock_path)) from exc
+
+
+def _reject_unsafe_policy_lock(lock_path: Path) -> NoReturn:
+    """Fail closed when the policy lock is not a private regular file."""
+    raise OSError(errno.EPERM, "policy writer lock must be a mode-0600 regular file", str(lock_path))
+
+
 @contextmanager
 def _policy_write_lock(directory: Path) -> Iterator[None]:
-    """Serialize policy/config read-modify-write cycles across threads/processes."""
+    """Serialize policy/config read-modify-write cycles across threads/processes.
+
+    The descriptor lifecycle is
+    :func:`mordred_hermes._file_lock.private_flock`. The reentrancy-depth
+    bookkeeping, the ``RLock``, the parent-directory check, and both raises
+    stay here: the depth counter is specific to this module's nested
+    transactions, and keeping the raises local keeps the tagged ``EPERM``
+    :exc:`OSError`\\ s (and the ``from exc`` chaining) byte-identical. ``depth``
+    is still set only *after* the flock is held and cleared *before* it is
+    released, so a nested caller can never observe the flag without the lock.
+    """
+    if _windows():
+        raise PrivateFSError("unsupported", "legacy_policy_lock_requires_canonical_consumer")
     with _POLICY_THREAD_LOCK:
         depth = getattr(_POLICY_LOCK_STATE, "depth", 0)
         if depth:
@@ -178,27 +337,16 @@ def _policy_write_lock(directory: Path) -> Iterator[None]:
             return
 
         _ensure_real_directory(directory)
-        lock_path = directory / _POLICY_LOCK_FILENAME
-        flags = os.O_RDWR | os.O_CREAT | _O_CLOEXEC | _O_NOFOLLOW | _O_NONBLOCK
-        try:
-            fd = os.open(lock_path, flags, 0o600)
-        except OSError as exc:
-            raise OSError(errno.EPERM, "policy writer lock is unsafe or unavailable", str(lock_path)) from exc
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-                raise OSError(errno.EPERM, "policy writer lock must be a mode-0600 regular file", str(lock_path))
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+        with private_flock(
+            directory / _POLICY_LOCK_FILENAME,
+            on_unsafe=_reject_unsafe_policy_lock,
+            on_open_error=_reject_unopenable_policy_lock,
+        ):
             _POLICY_LOCK_STATE.depth = 1
             try:
                 yield
             finally:
                 _POLICY_LOCK_STATE.depth = 0
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
 
 
 def _atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> None:
@@ -228,6 +376,8 @@ def _atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> Non
     idempotency comparison would allow a writable parent directory to turn a
     transient ACL/ownership problem into silent data loss.
     """
+    if _windows():
+        raise PrivateFSError("unsupported", "generic_configuration_write_requires_checked_consumer")
     try:
         path_metadata = path.lstat()
     except FileNotFoundError:
@@ -337,16 +487,20 @@ def _finish_policy_transaction(marker: Path) -> None:
     _fsync_parent(marker)
 
 
-def _ensure_plugins_enabled(root: Any) -> None:
-    """Ensure all Mordred plugin names appear in ``plugins.enabled``.
+def _ensure_plugins_enabled(root: Any, *, log_notes: bool = True) -> PluginListMigration:
+    """Ensure ``mordred`` appears in ``plugins.enabled`` (and migrate legacy names).
 
-    Per HOOK_PAYLOADS.md §1 / TODO.md §0.5 acceptance gate L128, Hermes's
+    Per HOOK_PAYLOADS.md §1, Hermes's
     entry-point plugins are NOT auto-loaded; their names must be listed
     in ``plugins.enabled`` for ``register()`` to be invoked.
 
     No-op if the section is already complete. If ``plugins.enabled`` is
     absent we add it; if ``plugins`` itself is absent we add it. Existing
-    non-Mordred entries are preserved.
+    non-Mordred entries are preserved. The pre-0.2.0a0 per-component names
+    (``mordred_network``, ...) are removed from ``plugins.enabled`` and
+    ``plugins.disabled``; see :func:`mordred_hermes._plugin_identity.migrate_plugin_lists`.
+    The migration notes are logged as warnings unless ``log_notes`` is false
+    (callers that print them to the operator themselves).
     """
     plugins = root.get("plugins") if isinstance(root, Mapping) else None
     if not isinstance(plugins, MutableMapping):
@@ -358,36 +512,26 @@ def _ensure_plugins_enabled(root: Any) -> None:
         # Use a plain dict -- ruamel will still emit it as a mapping; round-trip
         # treatment of NEW keys is best-effort (we own this section).
         root["plugins"] = {"enabled": list(MORDRED_PLUGIN_NAMES)}
-        return
+        return PluginListMigration(added_enabled=True)
 
     enabled = plugins.get("enabled")
-    if enabled is None:
-        plugins["enabled"] = list(MORDRED_PLUGIN_NAMES)
-        return
-
-    if not isinstance(enabled, list):
+    if enabled is not None and not isinstance(enabled, list):
         # Hermes treats a malformed allow-list exactly like a missing one:
         # no entry-point plugin loads.  Leaving it untouched after a successful
-        # configure therefore strands every runtime guard.  Preserve a scalar
-        # plugin name when possible, otherwise replace the unusable value, then
-        # extend the repaired list below.
-        recovered = [enabled] if isinstance(enabled, str) and enabled.strip() else []
+        # configure therefore strands every runtime guard. The migration keeps
+        # a scalar plugin name when possible and replaces the unusable value.
         _LOG.warning(
             "plugins.enabled is %s, not list; replacing with a valid enabled list",
             type(enabled).__name__,
         )
-        plugins["enabled"] = recovered
-        enabled = recovered
-
-    sanitized = [item for item in enabled if isinstance(item, str) and item.strip()]
-    if len(sanitized) != len(enabled):
+    elif isinstance(enabled, list) and any(not isinstance(item, str) or not item.strip() for item in enabled):
         _LOG.warning("plugins.enabled contains invalid plugin names; removing non-string or empty entries")
-        enabled[:] = sanitized
 
-    existing = {str(x) for x in enabled if isinstance(x, str)}
-    for name in MORDRED_PLUGIN_NAMES:
-        if name not in existing:
-            enabled.append(name)
+    migration = migrate_plugin_lists(plugins)
+    if log_notes:
+        for note in migration.notes():
+            _LOG.warning("%s", note)
+    return migration
 
 
 def _upsert_mordred_section(root: Any, plugin_name: str, body: Mapping[str, Any]) -> None:
@@ -597,6 +741,43 @@ class PolicyWriter:
     policy_json_path: Path = DEFAULT_POLICY_JSON_PATH
     mordred_dir: Path = DEFAULT_MORDRED_DIR
 
+    def _checked_edit(self, *, recover: bool = False) -> contextlib.AbstractContextManager[_CheckedPolicyEdit]:
+        return _checked_policy_edit(
+            _canonical_paths(self.config_path, self.policy_json_path, self.mordred_dir), recover=recover
+        )
+
+    def resolve_and_write(self, resolve: Callable[[dict[str, Any]], PolicySnapshot]) -> PolicySnapshot:
+        """Resolve pure flag inputs from the locked Windows pair, then publish once.
+
+        The callback must not prompt or perform provider/network operations.
+        """
+        if not _windows():
+            raise PrivateFSError("unsupported", "checked_flag_resolution_is_windows_only")
+        with self._checked_edit(recover=True) as edit:
+            existing = dict(edit.policy)
+            plugins = edit.root.get("plugins")
+            guard = plugins.get("mordred_llm_guard") if isinstance(plugins, Mapping) else None
+            if isinstance(guard, Mapping) and isinstance(guard.get("harness_primary"), str):
+                existing["harness_primary"] = guard["harness_primary"]
+            snapshot = resolve(existing)
+            edit.emit(snapshot)
+            edit.edit_sections(
+                {
+                    "mordred_privacy_check": snapshot.to_config_yaml_section(),
+                    "mordred_llm_guard": snapshot.to_llm_guard_section(),
+                },
+                _upsert_mordred_section,
+            )
+        return snapshot
+
+    def transform_config(self, transform: Callable[[MutableMapping[str, Any]], None]) -> None:
+        """Apply a pure Windows config transformation to the checked complete pair."""
+        if not _windows():
+            raise PrivateFSError("unsupported", "checked_config_transform_is_windows_only")
+        with self._checked_edit() as edit:
+            transform(edit.root)
+            edit.dump_config()
+
     def upsert_mordred_sections(self, sections: Mapping[str, Mapping[str, Any]]) -> None:
         """Round-trip-edit ``config.yaml`` to upsert one or more Mordred plugin sections.
 
@@ -612,6 +793,10 @@ class PolicyWriter:
         Also ensures all Mordred plugin names appear in ``plugins.enabled``
         (Hermes entry-point loader requires this -- HOOK_PAYLOADS §1).
         """
+        if _windows():
+            with self._checked_edit() as edit:
+                edit.edit_sections(sections, _upsert_mordred_section)
+            return
         with _policy_write_lock(self.policy_json_path.parent):
             self._edit_config(sections, _upsert_mordred_section)
 
@@ -626,8 +811,43 @@ class PolicyWriter:
         Pathological cases (the on-disk value is a scalar / list) fall back
         to whole-replacement -- a corrupted section is no longer mergeable.
         """
+        if _windows():
+            with self._checked_edit() as edit:
+                edit.edit_sections(sections, _merge_mordred_section)
+            return
         with _policy_write_lock(self.policy_json_path.parent):
             self._edit_config(sections, _merge_mordred_section)
+
+    def migrate_plugin_identity(self, *, create_missing: bool = False) -> PluginListMigration:
+        """Switch ``plugins.enabled`` / ``plugins.disabled`` to the single ``mordred`` plugin.
+
+        Touches nothing but those two lists and writes only when something
+        changed. A missing ``config.yaml`` is left missing unless
+        ``create_missing`` (nothing to migrate; ``configure`` creates it).
+        See :func:`_ensure_plugins_enabled`.
+        """
+        if _windows():
+            with self._checked_edit() as edit:
+                if not edit.config_present and not create_missing:
+                    return PluginListMigration()
+                migration = _ensure_plugins_enabled(edit.root, log_notes=False)
+                if migration.changed:
+                    edit.dump_config()
+            return migration
+        with _policy_write_lock(self.policy_json_path.parent):
+            existing = _read_regular_text(self.config_path)
+            if existing is None and not create_missing:
+                return PluginListMigration()
+            yaml = _round_trip_yaml()
+            root = yaml.load(existing) if existing else None
+            if root is None:
+                root = {}
+            migration = _ensure_plugins_enabled(root, log_notes=False)
+            if migration.changed:
+                buf = io.StringIO()
+                yaml.dump(root, buf)
+                _atomic_write_text(self.config_path, buf.getvalue())
+            return migration
 
     def _edit_config(
         self,
@@ -650,7 +870,7 @@ class PolicyWriter:
             root = {}
 
         for plugin_name, body in sections.items():
-            if plugin_name not in MORDRED_PLUGIN_NAMES:
+            if plugin_name not in MORDRED_CONFIG_SECTIONS:
                 raise ValueError(f"PolicyWriter only edits Mordred plugin sections; refusing to touch {plugin_name!r}")
             section_mutator(root, plugin_name, body)
 
@@ -669,6 +889,10 @@ class PolicyWriter:
         ``provider_overrides`` are carried forward verbatim, including invalid
         values that the strict transport gate must continue to reject.
         """
+        if _windows():
+            with self._checked_edit() as edit:
+                edit.emit(snapshot)
+            return
         with _policy_write_lock(self.policy_json_path.parent):
             snapshot = _preserve_provider_overrides(snapshot, self.policy_json_path)
             text = json.dumps(snapshot.to_json_dict(), indent=2, sort_keys=False) + "\n"
@@ -694,6 +918,20 @@ class PolicyWriter:
         network use <path>`` invocations don't clobber the wizard's
         choices.
         """
+        if _windows():
+            network_section = network_answers.to_config_yaml_section() if network_answers is not None else None
+            with self._checked_edit(recover=True) as edit:
+                edit.emit(snapshot)
+                edit.edit_sections(
+                    {
+                        "mordred_privacy_check": snapshot.to_config_yaml_section(),
+                        "mordred_llm_guard": snapshot.to_llm_guard_section(),
+                    },
+                    _upsert_mordred_section,
+                )
+                if network_section is not None:
+                    edit.edit_sections({"mordred_network": network_section}, _merge_mordred_section)
+            return
         with _policy_write_lock(self.policy_json_path.parent):
             marker = _begin_policy_transaction(self.policy_json_path)
             self.emit_policy_json(snapshot)

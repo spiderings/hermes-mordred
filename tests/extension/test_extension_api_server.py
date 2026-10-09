@@ -5,11 +5,14 @@ Origin guard. Uses asyncio.run to avoid a pytest-asyncio dependency."""
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import importlib.metadata
 import json
 import os
 import socket
 import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
@@ -49,11 +52,6 @@ def test_reported_package_version_falls_back_to_legacy_distribution(monkeypatch)
 
     assert extension_api._hermes_version() == "0.1.0a15"
     assert calls == ["hermes-mordred", "mordred-hermes"]
-
-
-@pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
 
 def _free_port() -> int:
@@ -227,13 +225,14 @@ def test_full_server_flow():
     assert r["webauthn_required"] is False
     assert r["pair_type"] == "pair_complete"
     assert r["auth_type"] == "auth_ok"
-    assert r["auth_capabilities"] == ["discord_channel_resolve_v1"]
+    assert r["auth_capabilities"] == ["discord_channel_resolve_v1", "telegram_import_v1"]
     assert r["enc_type"] == "encrypt_result"
     assert r["client_decrypt"] == "秘密"
     assert r["dec_plaintext"] == "秘密"
     assert r["chat"] == "こんにちは、受け取りました: 状態"
     assert r["sign_prompt_type"] == "sign_prompt"
-    assert r["sign_risk"] == "low"
+    # "0xdeadbeef" is opaque bytes, not a readable message: medium, not low.
+    assert r["sign_risk"] == "medium"
     assert r["signer"] == "0x" + "ab" * 20
     assert r["signature"] == "0xstubbedsig"
 
@@ -350,7 +349,8 @@ def test_page_token_auth_and_history():
 
 def test_accounts_failure_is_a_correlated_rpc_error(monkeypatch):
     def _fail_account_snapshot():
-        raise RuntimeError("vault unavailable")
+        # The message is attacker/environment-shaped (paths, backend detail).
+        raise RuntimeError("vault unavailable: /Users/operator/.hermes/extension/wallet.json")
 
     monkeypatch.setattr(extension_api, "_get_account_snapshot", _fail_account_snapshot)
 
@@ -374,7 +374,7 @@ def test_accounts_failure_is_a_correlated_rpc_error(monkeypatch):
     assert asyncio.run(_flow(_free_port())) == {
         "id": "a1",
         "type": "error",
-        "reason": "wallet: vault unavailable",
+        "reason": "wallet_unavailable",
     }
 
 
@@ -574,7 +574,7 @@ def test_crashed_handler_replies_error(monkeypatch):
     def _boom():
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(extension_history, "projected_turns", _boom)
+    monkeypatch.setattr(extension_history, "projected_history", _boom)
 
     async def _flow(port):
         server = extension_api.ExtensionAPIServer(port=port)
@@ -1312,7 +1312,9 @@ def test_transaction_sign_request_rejects_unsafe_rpc_before_prompt():
             "id": "s1",
             "type": "sign_result",
             "request_id": "tx1",
-            "error": "transaction_prepare_failed: invalid_rpc_url: RPC endpoints must use HTTPS",
+            # The rejection reason stays a stable code; the human-readable
+            # detail ("RPC endpoints must use HTTPS") is logged, not returned.
+            "error": "transaction_prepare_failed: invalid_rpc_url",
         }
     ]
     assert conn._pending_sign == {}
@@ -1686,3 +1688,274 @@ def test_authed_dispatch_does_not_reparse_state_per_frame(monkeypatch):
     assert len(conn.ws.sent) == 10
     assert all(frame["type"] == "encrypt_result" for frame in conn.ws.sent)
     assert counter[0] == 0
+
+
+def test_accounts_request_burst_costs_one_keyvault_resolution():
+    """A page principal must not be able to drive one Secure-Enclave unwrap
+    (and one Touch ID prompt, and one audit row) per frame it sends. The
+    snapshot is public data — addresses the page is already entitled to — so
+    the bound is a short-lived cache rather than a refusal."""
+    from mordred_hermes.extension import wallet as extension_wallet
+    from mordred_hermes.keyvault import extension_sign
+
+    calls: list[int] = []
+
+    def _snapshot():
+        calls.append(1)
+        return "0x" + "ab" * 20, 1
+
+    async def _flow(port):
+        server = extension_api.ExtensionAPIServer(port=port)
+        await server.start()
+        try:
+            async with (
+                aiohttp.ClientSession() as session,
+                session.ws_connect(
+                    f"http://127.0.0.1:{port}/ext",
+                    headers={"Origin": f"http://127.0.0.1:{port}"},
+                ) as ws,
+            ):
+                await _page_auth(ws, server)
+                for i in range(4):
+                    await ws.send_str(json.dumps({"id": f"a{i}", "type": "accounts_request"}))
+                replies = [await _recv(ws) for _ in range(4)]
+            # Deliberate: the snapshot is NOT keyed by principal. Both the page
+            # and the paired extension are entitled to the same public address,
+            # so a shared entry leaks nothing — and keying it per principal
+            # would let a second principal re-arm the prompts the bound exists
+            # to prevent.
+            async with (
+                aiohttp.ClientSession() as ext_session,
+                ext_session.ws_connect(
+                    f"http://127.0.0.1:{port}/ext",
+                    headers={"Origin": "chrome-extension://abc"},
+                ) as ext_ws,
+            ):
+                await _pair_and_auth(ext_ws)
+                await ext_ws.send_str(json.dumps({"id": "x", "type": "accounts_request"}))
+                replies.append(await _recv(ext_ws))
+            return replies
+        finally:
+            await server.stop()
+
+    extension_wallet.reset_account_snapshot_cache()
+    original = extension_sign.account_snapshot
+    extension_sign.account_snapshot = _snapshot
+    try:
+        replies = asyncio.run(_flow(_free_port()))
+    finally:
+        extension_sign.account_snapshot = original
+        extension_wallet.reset_account_snapshot_cache()
+
+    assert len(calls) == 1
+    assert [r["type"] for r in replies] == ["accounts_result"] * 5
+    assert all(r["accounts"] == ["0x" + "ab" * 20] and r["chainId"] == "0x1" for r in replies)
+
+
+def test_page_response_carries_a_hash_based_csp():
+    """The page holds a bearer token in its fragment: deny framing, deny
+    referrers, and pin the document's executable content by hash."""
+    from mordred_hermes.extension import page_headers
+
+    async def _flow(port):
+        server = extension_api.ExtensionAPIServer(port=port)
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session, session.get(f"http://127.0.0.1:{port}/") as response:
+                return response.headers, await response.text(), port
+        finally:
+            await server.stop()
+
+    headers, html, port = asyncio.run(_flow(_free_port()))
+    policy = headers["Content-Security-Policy"]
+    assert headers["X-Frame-Options"] == "DENY"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    assert headers["Cache-Control"] == "no-store"
+    assert "frame-ancestors 'none'" in policy
+    assert "base-uri 'none'" in policy
+    assert "form-action 'none'" in policy
+    assert "'unsafe-inline'" not in policy
+    # The page's own WebSocket endpoint must stay reachable.
+    assert f"ws://127.0.0.1:{port}" in policy
+    # Everything the served bytes actually execute or style is covered.
+    scripts, styles = page_headers._inline_sources(html)
+    assert scripts, "the served page has no inline script — check the bundle"
+    for source in (*scripts, *styles):
+        digest = base64.b64encode(hashlib.sha256(source.encode("utf-8")).digest()).decode("ascii")
+        assert f"'sha256-{digest}'" in policy
+    assert "style=" not in html.split("<body", 1)[-1]
+
+
+def test_history_result_flags_undecryptable_history(tmp_path):
+    """The page must be able to tell "no history yet" from "the stored history
+    no longer decrypts" — both used to arrive as an empty turn list."""
+
+    from mordred_hermes.extension import extension_history
+
+    code, _ = pairing.generate_code()
+    ext_pub = xc.b64u_encode(xc.x25519_public_raw(X25519PrivateKey.generate()))
+    pairing.handle_pair_init(code, ext_pub, xc.b64u_encode(b"\x00" * 32))
+
+    async def _flow(port):
+        server = extension_api.ExtensionAPIServer(port=port)
+        await server.start()
+        try:
+            async with (
+                aiohttp.ClientSession() as s,
+                s.ws_connect(f"http://127.0.0.1:{port}/ext", headers={"Origin": f"http://127.0.0.1:{port}"}) as ws,
+            ):
+                await _page_auth(ws, server)
+                await ws.send_str(json.dumps({"id": "h0", "type": "history_get"}))
+                empty = await _recv(ws)
+                extension_history.save_messages([{"role": "user", "content": "hello"}])
+                await ws.send_str(json.dumps({"id": "h1", "type": "history_get"}))
+                readable = await _recv(ws)
+                # Re-pairing leaves a blob sealed under a key that is now gone.
+                (tmp_path / "extension" / "history.enc").write_text(
+                    "\U0001f512ENC:v1:not-a-real-envelope", encoding="utf-8"
+                )
+                await ws.send_str(json.dumps({"id": "h2", "type": "history_get"}))
+                return empty, readable, await _recv(ws)
+        finally:
+            await server.stop()
+
+    empty, readable, broken = asyncio.run(_flow(_free_port()))
+    assert empty["turns"] == [] and empty["status"] == "empty"
+    assert readable["turns"] == [{"role": "user", "content": "hello"}]
+    assert readable["status"] == "ok"
+    assert broken["turns"] == [] and broken["status"] == "undecryptable"
+    assert broken["type"] == "history_result"
+
+
+def test_page_allowlist_entries_are_all_used_by_the_shipped_page():
+    """``_PAGE_ALLOWED`` is a page-scoped action list, not a read-only one:
+    ``history_clear`` mutates. It stays allowed only because the bundled page
+    triggers it from an explicit, confirmed user action — if a bundle refresh
+    ever drops that call, the entry must be dropped with it."""
+    from mordred_hermes.extension import page_headers
+
+    bundle = Path(page_headers.__file__).parent / "web" / "index.html"
+    if not bundle.exists():  # pragma: no cover - only when the app isn't built
+        pytest.skip("the localhost web app bundle is not built in this checkout")
+    html = bundle.read_text("utf-8")
+    for action in extension_api._PAGE_ALLOWED:
+        assert f'"{action}"' in html or f"'{action}'" in html, action
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected_reason"),
+    [
+        (RuntimeError("boom at /Users/operator/.hermes/secret-detail"), "agent_error"),
+        (RuntimeError("agent_unavailable: refused connecting to 10.0.0.5:11434"), "agent_unavailable"),
+    ],
+)
+def test_chat_handler_exception_text_never_reaches_the_client(raised, expected_reason):
+    async def _boom(_content, _context):
+        raise raised
+        yield ""  # pragma: no cover - unreachable, keeps this an async generator
+
+    async def _flow(port):
+        server = extension_api.ExtensionAPIServer(port=port, chat_handler=_boom)
+        await server.start()
+        try:
+            async with (
+                aiohttp.ClientSession() as s,
+                s.ws_connect(f"http://127.0.0.1:{port}/ext", headers={"Origin": f"http://127.0.0.1:{port}"}) as ws,
+            ):
+                await _page_auth(ws, server)
+                await ws.send_str(json.dumps({"id": "c1", "type": "chat", "content": "hi"}))
+                return await _recv(ws)
+        finally:
+            await server.stop()
+
+    reply = asyncio.run(_flow(_free_port()))
+    assert reply == {"id": "c1", "type": "chat_error", "reason": expected_reason}
+    assert "10.0.0.5" not in json.dumps(reply)
+    assert "/Users/operator" not in json.dumps(reply)
+
+
+def test_sign_failure_text_never_reaches_the_client(monkeypatch):
+    from mordred_hermes.keyvault import extension_sign
+
+    signer = "0x" + "ab" * 20
+    monkeypatch.setattr(extension_sign, "get_address", lambda: signer)
+    conn = _authed_conn()
+
+    def _boom(*_args):
+        raise RuntimeError("keyvault unwrap failed: /Users/operator/.hermes/keyvault/wmk")
+
+    monkeypatch.setattr(extension_api, "_do_sign", _boom)
+    asyncio.run(
+        conn.dispatch(
+            json.dumps(
+                {
+                    "id": "s1",
+                    "type": "sign_request",
+                    "request_id": "r1",
+                    "method": "personal_sign",
+                    "params": ["0x1", signer],
+                }
+            )
+        )
+    )
+    asyncio.run(conn.dispatch(json.dumps({"id": "s2", "type": "sign_approve", "request_id": "r1", "approved": True})))
+
+    result = conn.ws.sent[-1]
+    assert result == {"id": "s2", "type": "sign_result", "request_id": "r1", "error": "sign_failed"}
+    assert "/Users/operator" not in json.dumps(conn.ws.sent)
+
+
+def test_slack_setup_failure_text_never_reaches_the_client(monkeypatch):
+    def _boom(*_args):
+        raise OSError("[Errno 13] Permission denied: '/Users/operator/.hermes/.env'")
+
+    monkeypatch.setattr(extension_api, "_update_slack_env", _boom)
+    conn = _authed_conn()
+    asyncio.run(
+        conn.dispatch(
+            json.dumps(
+                {
+                    "id": "s1",
+                    "type": "slack_setup",
+                    "bot_token": "xoxb-" + "a" * 20,
+                    "app_token": "xapp-" + "b" * 20,
+                }
+            )
+        )
+    )
+
+    assert conn.ws.sent == [
+        {"id": "s1", "type": "slack_setup_result", "ok": False, "note": "", "error": "slack_setup_failed"}
+    ]
+
+
+def test_page_route_error_replies_still_carry_security_headers(tmp_path, monkeypatch):
+    """The 403 and 503 branches answer from the same origin as the page, so
+    the route's protection must not depend on which branch replied."""
+
+    async def _flow(port):
+        server = extension_api.ExtensionAPIServer(port=port)
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Rebinding attempt: loopback peer, non-loopback Host header.
+                async with session.get(
+                    f"http://127.0.0.1:{port}/",
+                    headers={"Host": "evil.example"},
+                ) as rebind:
+                    forbidden = rebind.status, dict(rebind.headers)
+                monkeypatch.setattr(extension_api, "_WEB_DIR", tmp_path / "missing")
+                async with session.get(f"http://127.0.0.1:{port}/") as unbuilt:
+                    return forbidden, (unbuilt.status, dict(unbuilt.headers))
+        finally:
+            await server.stop()
+
+    (forbidden_status, forbidden_headers), (unbuilt_status, unbuilt_headers) = asyncio.run(_flow(_free_port()))
+    assert forbidden_status == 403
+    assert unbuilt_status == 503
+    for headers in (forbidden_headers, unbuilt_headers):
+        assert headers["Cache-Control"] == "no-store"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert headers["Referrer-Policy"] == "no-referrer"
+        assert headers["X-Frame-Options"] == "DENY"
+        assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]

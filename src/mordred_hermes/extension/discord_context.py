@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import ipaddress
 import os
 import re
 from dataclasses import dataclass
@@ -19,15 +18,15 @@ import aiohttp
 
 from mordred_hermes import __version__
 from mordred_hermes._home import hermes_home
+from mordred_hermes.extension.egress import EgressError, loopback_proxy_host, tor_route_required
 
 _API_ROOT = "https://discord.com/api/v10"
-_SOURCE_URL = "https://github.com/InternetMaximalism/hermes-mordred"
+_SOURCE_URL = "https://github.com/mordredagent/hermes-mordred"
 _THREAD_TYPES = frozenset({10, 11, 12})
 _SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
 # The browser extension gives the entire RPC eight seconds.  Keep route
 # resolution plus both possible Discord requests below that wire deadline.
 _RESOLUTION_TIMEOUT_SECONDS = 6.0
-_PROTECTED_NETWORK_PATHS = frozenset({"tor", "vpn"})
 
 
 @dataclass(frozen=True)
@@ -146,57 +145,18 @@ def _validate_channel(
 def _tor_route_required() -> bool:
     """Return whether Discord must use Tor, failing closed on bad live state.
 
-    The registered runtime is authoritative in a full Hermes process.  The
-    standalone extension launcher has no plugin discovery, so it falls back to
-    the persisted selection.  Tor still requires an explicit proxy, while VPN
-    is refused because its live OS route cannot be verified without a runtime.
+    The rules live in :func:`mordred_hermes.extension.egress.tor_route_required`,
+    shared with the extension server's other outbound clients.
     """
 
-    from mordred_hermes.network import api as network_api
-    from mordred_hermes.network._exceptions import MordredNetworkError
-
     try:
-        status = network_api.status()
-    except MordredNetworkError:
-        try:
-            from mordred_hermes.network.settings import read_default_path_strict
-
-            selected_path = read_default_path_strict(hermes_home() / "config.yaml")
-        except Exception as exc:
-            raise DiscordContextError("routing_unavailable") from exc
-        if selected_path == "vpn":
-            raise DiscordContextError("routing_unavailable") from None
-        return selected_path == "tor"
-    except Exception as exc:
+        return tor_route_required()
+    except EgressError as exc:
         raise DiscordContextError("routing_unavailable") from exc
-
-    if status.active_path not in {"tor", "vpn", "clearnet"}:
-        raise DiscordContextError("routing_unavailable")
-    if status.active_path in _PROTECTED_NETWORK_PATHS and not status.ready:
-        raise DiscordContextError("routing_unavailable")
-    try:
-        if status.active_path in _PROTECTED_NETWORK_PATHS and network_api.is_dropped():
-            raise DiscordContextError("routing_unavailable")
-    except DiscordContextError:
-        raise
-    except Exception as exc:
-        raise DiscordContextError("routing_unavailable") from exc
-    return status.active_path == "tor"
 
 
 def _loopback_proxy_host(url: str) -> bool:
-    try:
-        host = urlsplit(url).hostname
-    except ValueError:
-        return False
-    if host is None:
-        return False
-    if host.casefold() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+    return loopback_proxy_host(url)
 
 
 def _resolve_gateway_route() -> _ClientRoute:

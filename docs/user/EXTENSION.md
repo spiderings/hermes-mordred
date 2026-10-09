@@ -11,25 +11,29 @@ or `keyvault` for the current platform and adds both the extension server and
 Ethereum wallet dependencies with `--with-extension`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/InternetMaximalism/hermes-mordred/main/scripts/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/mordredagent/hermes-mordred/main/scripts/install.sh | \
   bash -s -- --with-extension
 ```
 
-Add `--version VERSION` after replacing `VERSION` with the exact PyPI release
-you need. Terminal QR rendering is optional; without the `messaging` extra,
-`extension pair` prints the pairing code as text. To add QR rendering after the
-installer completes:
+The `messaging` extra is not required to use the browser extension. Without it,
+`hermes-mordred extension pair` prints the `MORT-...` pairing code as text. If
+you also want the same code rendered as a terminal QR, add only `messaging` to
+the recommended extension bundle:
 
 ```sh
-uv pip install --python ~/.hermes/hermes-agent/venv/bin/python3 \
-  --upgrade-package hermes-mordred "hermes-mordred[messaging]"
+curl -fsSL https://raw.githubusercontent.com/mordredagent/hermes-mordred/main/scripts/install.sh | \
+  bash -s -- --with-extension --extras messaging
 ```
 
+Add `--version VERSION` to either form after replacing `VERSION` with the exact
+PyPI release you need. When rerunning the installer, repeat the same feature
+options and version pin.
+
 The browser client is a separately distributed
-[Chromium Manifest V3 bundle](https://github.com/InternetMaximalism/Mordred-Extension-dist):
+[Chromium Manifest V3 bundle](https://github.com/mordredagent/mordred-extension-dist):
 
 ```sh
-git clone https://github.com/InternetMaximalism/Mordred-Extension-dist.git
+git clone https://github.com/mordredagent/mordred-extension-dist.git
 ```
 
 Open `chrome://extensions` (or the equivalent page in Brave, Arc, or Edge),
@@ -95,11 +99,28 @@ For wallet requests, the browser cannot select an arbitrary chain or RPC URL.
 Both must match the operator-selected values in
 `~/.hermes/extension/wallet.json` or the built-in endpoint for that chain. RPC
 transport rejects local/private targets and redirects, pins validated direct
-DNS answers, and follows the route selected by `mordred_network`.
+DNS answers, and follows the route selected by Mordred's network component
+(`plugins.mordred_network`).
 
 Before returning a message signature or broadcasting a transaction, Hermes
 recovers the actual signer and verifies that it still matches the address shown
 in the approval prompt.
+
+`personal_sign` prompts distinguish a readable message from an opaque payload.
+A bare 32-byte digest — a Safe transaction hash, a meta-transaction — is
+labelled as unverifiable and warns that the signature alone may authorize
+contract actions or asset movement off-chain. Only a payload that decodes to
+readable text is described as moving no assets.
+
+The localhost page response carries `Content-Security-Policy` (script and style
+pinned by hash, `frame-ancestors 'none'`, `connect-src` limited to the page's
+own loopback WebSocket), `X-Frame-Options: DENY`, `Referrer-Policy:
+no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`,
+so the page holding the launch-fragment token cannot be framed and its token
+cannot leak through a referrer.
+
+Client-visible errors are stable codes. Exception detail (file paths, backend
+and provider messages) is written to the Hermes log instead of the reply.
 
 ## Supported messages
 
@@ -113,13 +134,18 @@ in the approval prompt.
 | `encrypt` / `decrypt` | Encrypts or decrypts extension message payloads. |
 | `channel_key_set` | Stores an encrypted per-channel gateway key from the paired extension. |
 | `slack_setup` | Validates and stores Slack bot/app tokens for the next Hermes restart. |
-| `accounts_request` | Returns the selected wallet address and chain ID. |
+| `accounts_request` | Returns the selected wallet address and chain ID, resolved at most once per minute (repeat requests are served from that snapshot, so a burst cannot drive repeated Touch ID prompts). |
 | `sign_request` | Produces a frozen approval prompt before any keyvault signing. |
 | `sign_approve` | Signs only the request captured by the matching prompt. |
 | `history_get` / `history_clear` | Reads or clears encrypted-at-rest conversation history. |
 
 Large history reads return the newest complete suffix with `truncated: true`;
-stored history is not modified.
+stored history is not modified. `history_result` also carries `status`
+(`ok`, `empty`, `unavailable`, `undecryptable`) so a client can tell an empty
+conversation from history that a re-pairing left unreadable; `turns` stays a
+list in every case. Unreadable history is not preserved: the next chat turn
+saves over it, because the key that sealed it is gone and no surface can ever
+decrypt it again.
 
 ## Gateway message encryption
 
@@ -162,7 +188,7 @@ Ctrl+C and SIGTERM shut the standalone server down cleanly.
 | Reconnects with close code `1002` / `invalid_server_frame` | Update and reload the browser extension and Mordred together, then restart the server. |
 | QR code is absent | Install the `messaging` extra or enter the printed `MORT-...` code manually. |
 | Wallet command says the extra is missing | Install `ethereum` in the same Hermes venv and restart the server. |
-| Background chat cannot open sealed secrets on macOS | Recover onto a fresh unattended key as described in [`USAGE.md` §4.3](./USAGE.md#43-touch-id-prompts--why-several-per-command-and-how-to-silence-them). |
+| Background chat cannot open sealed secrets on macOS | The file-vault key may be attended. `enable-se` cannot change its policy. Keep the server foreground, or preserve the complete vault plus recovery passphrase and re-key a copied vault on a genuinely fresh device/profile with `vault recover`; never delete the working store first. See [`USAGE.md` §4.3](./USAGE.md#43-touch-id-prompts--why-several-per-command-and-how-to-silence-them). |
 
 ## Related references
 

@@ -31,7 +31,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from .policy_writer import _atomic_write_text
+from .._config_io import CONFIG_LIMIT, CanonicalPaths, canonical_session
+from .._private_fs import PrivateFSError
+from .policy_writer import _atomic_write_text, _bounded_utf8, _windows, _write_checked_private
 
 # Same env-name shape rule as env_file_writer -- uppercase, alnum + underscore.
 _VALID_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -67,14 +69,12 @@ class JSONCredentialsWriter:
         mullvad_relay_country: str,
         mullvad_killswitch: bool,
     ) -> None:
-        if not _VALID_ENV_NAME.match(mullvad_account_id_env):
+        if not _VALID_ENV_NAME.fullmatch(mullvad_account_id_env):
             raise ValueError(
-                f"refusing to write account_id_env={mullvad_account_id_env!r}: "
+                "refusing to write account_id_env: "
                 "must be an uppercase POSIX env-var name (the actual secret "
                 "lives in ~/.hermes/.env)"
             )
-        # Dir 0700 -- the parent of .env-adjacent credentials must be private.
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         body = {
             "mullvad": {
                 "account_id_env": mullvad_account_id_env,
@@ -86,4 +86,19 @@ class JSONCredentialsWriter:
         # sort_keys -- the dict-literal order doubles as the documented field
         # order (account_id_env first, then relay, then flags).
         text = json.dumps(body, indent=2, sort_keys=False) + "\n"
+        if _windows():
+            data = _bounded_utf8(text, CONFIG_LIMIT)
+            if path.name != "network.json" or path.parent.name != "credentials" or path.parent.parent.name != "mordred":
+                raise ValueError("credentials must be under canonical home/mordred/credentials")
+            published = False
+            try:
+                with canonical_session(CanonicalPaths(path.parent.parent.parent), scope="policy", create=True):
+                    published = _write_checked_private(path, data)
+            except PrivateFSError as exc:
+                if published:
+                    exc.commit_state = "uncertain"
+                raise
+            return
+        # Preserve the existing POSIX directory creation path.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _atomic_write_text(path, text, mode=0o600)

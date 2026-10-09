@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
     from ..keyvault.anchor import AnchorStore
     from ..keyvault.wrap import NativeBackend
+    from ._flow_session import FlowSession
     from .configure import PromptIO
 
 __all__ = ["disable", "enable", "purge", "reseal"]
@@ -41,12 +42,17 @@ __all__ = ["disable", "enable", "purge", "reseal"]
 _ENV_NAME = ".env"
 
 
-def _default_runtime_probe(*, home: Path) -> tuple[bool, str]:
+def _default_runtime_probe(*, home: Path, runtime_python: Path | None = None) -> tuple[bool, str]:
     """Production runtime probe: can the interpreter that runs ``hermes`` decrypt
-    a sealed ``.env``? Imported lazily so this module stays import-light."""
+    a sealed ``.env``? Imported lazily so this module stays import-light.
+
+    ``runtime_python`` pins a specific interpreter — the gate passes it when
+    probing an interpreter that is running a gateway *right now*; omitted, the
+    probe resolves the expected runtime itself.
+    """
     from ..keyvault._runtime_probe import runtime_env_injection_available
 
-    return runtime_env_injection_available(home=home)
+    return runtime_env_injection_available(home=home, runtime_python=runtime_python)
 
 
 def _runtime_gate(
@@ -59,11 +65,13 @@ def _runtime_gate(
     """Fail-closed macOS gate for the destructive seal.
 
     Returns 1 (after printing actionable guidance) when the interpreter that runs
-    ``hermes`` cannot inject a sealed ``.env`` at startup, else 0. A no-op (0) off
-    macOS — the plaintext is kept there anyway — and when
-    ``force_runtime_unverified`` is set. The gate core is shared with
-    ``config_decrypt_cli`` via :func:`._runtime_gate.runtime_gate`; only the
-    .env-specific guidance text lives here.
+    ``hermes`` — or one that is running a gateway right now — cannot inject a
+    sealed ``.env`` at startup, else 0. A no-op (0) off macOS — the plaintext is
+    kept there anyway — and when ``force_runtime_unverified`` is set. The gate
+    core is shared with ``config_decrypt_cli`` via
+    :func:`._runtime_gate.runtime_gate`; only the .env-specific guidance text
+    lives here (it is reused for both the expected-runtime and the
+    running-gateway refusal).
     """
     return runtime_gate(
         home=home,
@@ -132,6 +140,7 @@ def _restore_plaintext(
     root: Path,
     backend: NativeBackend | None,
     store: AnchorStore | None,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Guarantee a readable plaintext ``<home>/.env`` without losing operator edits.
 
@@ -152,7 +161,7 @@ def _restore_plaintext(
     if not _vault_present(root):
         return 0
 
-    opened = vault_cli._open_hot_path_or_report(root, backend=backend, store=store)
+    opened = vault_cli._open_hot_path_or_report(root, backend=backend, store=store, flow_session=flow_session)
     if opened is None:
         return 0 if env_path.exists() else 1
     with opened:
@@ -203,6 +212,57 @@ def reseal(
     return reseal_env(home=home, root=root, backend=backend, store=store)
 
 
+def _should_reseal_instead(*, platform: str, home: Path, root: Path) -> bool:
+    """Whether ``enable`` should merge-reseal instead of enrolling from scratch.
+
+    The caller has already established that a plaintext ``.env`` is on disk;
+    this is the remaining test — the vault already manages ``.env``, injection
+    is ON (no opt-out marker), and we are on macOS. Together that means a host
+    write slipped a *partial* .env past the seal, so re-enrolling it wholesale
+    would drop every other enrolled secret; merging is the safe path instead.
+    Split out of :func:`enable` for cyclomatic headroom only — same three
+    conditions, same order, same short-circuiting.
+    """
+    return platform == "darwin" and not _env_optout_marker_path(home).exists() and _env_enrolled(root)
+
+
+def _delete_enrolled_plaintext(env_path: Path, enrolled: bytes | None) -> None:
+    """Remove the plaintext ``.env`` after a clean macOS enroll, or explain why not.
+
+    Split out of :func:`enable` for cyclomatic headroom only — the read/compare/
+    unlink sequence, both guard conditions, and both warning messages are
+    unchanged; this always leaves ``enable`` returning 0 either way (a failure
+    here is reported, not propagated as an error code), exactly as before.
+
+    Guards against a concurrent edit between ``add_and_verify()``'s read and
+    now (never delete an on-disk copy that no longer matches what was
+    enrolled) and against an unlink failure being reported as success while
+    the plaintext remains at rest.
+    """
+    try:
+        current: bytes | None = env_path.read_bytes()
+    except OSError:
+        current = None
+    # `enrolled` is bytes whenever add_and_verify returned rc==0, so the None
+    # check is a defensive belt-and-suspenders: if that contract ever loosens,
+    # fail safe and keep the plaintext rather than delete it unverified.
+    if enrolled is None or current != enrolled:
+        _term.emit_warn(
+            ".env was enrolled but the on-disk copy no longer matches the vault "
+            "(changed during enable?) — leaving the plaintext in place; re-run enable."
+        )
+        return
+    try:
+        env_path.unlink()
+    except OSError as exc:
+        _term.emit_warn(
+            f".env enrolled but the plaintext at {env_path} could not be removed: {exc} "
+            "— remove it by hand (it is still readable at rest)."
+        )
+        return
+    print(".env is now vault-managed; the plaintext was removed (the runtime injects it at startup).")
+
+
 def enable(
     *,
     home: Path,
@@ -213,6 +273,7 @@ def enable(
     prompt_io: PromptIO | None = None,
     runtime_probe: RuntimeProbe | None = None,
     force_runtime_unverified: bool = False,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Enroll ``<home>/.env`` into the vault and turn runtime injection on.
 
@@ -228,8 +289,16 @@ def enable(
     step it probes the interpreter that actually runs ``hermes`` (see
     :mod:`...keyvault._runtime_probe`) and refuses (rc 1) when that runtime lacks
     the mordred injection shim — otherwise the deleted plaintext would be
-    undecryptable at startup. ``runtime_probe`` is injectable for tests;
-    ``force_runtime_unverified`` bypasses the check (advanced; seals anyway).
+    undecryptable at startup. The same probe is then run against every *running*
+    ``hermes gateway`` interpreter from a different environment, because that is
+    the process which must unseal the file in practice. ``runtime_probe`` is
+    injectable for tests; ``force_runtime_unverified`` bypasses both checks
+    (advanced; seals anyway).
+
+    ``flow_session`` (a guided flow: ``setup``, ``encryption enable all``, the
+    Telegram / Desktop setup) shares the flow's passphrase, open vault and key
+    policy with its other steps, so the flow asks for a passphrase once and
+    unlocks the vault at most once (see :mod:`._flow_session`).
     """
     from . import vault_cli
 
@@ -259,17 +328,21 @@ def enable(
     # opt-out marker), and we are on macOS, yet a plaintext is on disk. That means
     # a host write slipped a *partial* .env past the seal — re-enrolling it
     # wholesale here would drop every other enrolled secret, so merge instead.
-    if platform == "darwin" and not _env_optout_marker_path(home).exists() and _env_enrolled(root):
+    if _should_reseal_instead(platform=platform, home=home, root=root):
         return reseal(home=home, root=root, backend=backend, store=store)
 
-    rc = vault_cli.ensure_initialised(root=root, prompt_io=prompt_io, backend=backend, store=store)
+    rc = vault_cli.ensure_initialised(
+        root=root, prompt_io=prompt_io, backend=backend, store=store, flow_session=flow_session
+    )
     if rc != 0:
         return rc  # could not create the vault (reason already printed)
 
     # Enroll and read the enrolled copy back through the *same* vault open, so the
     # device key (Secure Enclave / Touch ID) is unlocked once for both — the
     # pre-delete verify below no longer costs a second prompt.
-    rc, enrolled = vault_cli.add_and_verify(root=root, name=_ENV_NAME, source=env_path, backend=backend, store=store)
+    rc, enrolled = vault_cli.add_and_verify(
+        root=root, name=_ENV_NAME, source=env_path, backend=backend, store=store, flow_session=flow_session
+    )
     if rc != 0:
         return rc  # vault_cli.add_and_verify already printed the reason
 
@@ -280,28 +353,7 @@ def enable(
         # concurrent edit between add_and_verify()'s read and now must NOT be
         # deleted unvaulted, and an unlink failure must NOT be reported as success
         # while the plaintext remains at rest.
-        try:
-            current: bytes | None = env_path.read_bytes()
-        except OSError:
-            current = None
-        # `enrolled` is bytes whenever add_and_verify returned rc==0, so the None
-        # check is a defensive belt-and-suspenders: if that contract ever loosens,
-        # fail safe and keep the plaintext rather than delete it unverified.
-        if enrolled is None or current != enrolled:
-            _term.emit_warn(
-                ".env was enrolled but the on-disk copy no longer matches the vault "
-                "(changed during enable?) — leaving the plaintext in place; re-run enable."
-            )
-            return 0
-        try:
-            env_path.unlink()
-        except OSError as exc:
-            _term.emit_warn(
-                f".env enrolled but the plaintext at {env_path} could not be removed: {exc} "
-                "— remove it by hand (it is still readable at rest)."
-            )
-            return 0
-        print(".env is now vault-managed; the plaintext was removed (the runtime injects it at startup).")
+        _delete_enrolled_plaintext(env_path, enrolled)
     else:
         print(
             ".env enrolled into the vault, but the runtime decrypt shim is macOS-only — the plaintext was "
@@ -316,14 +368,16 @@ def disable(
     root: Path,
     backend: NativeBackend | None = None,
     store: AnchorStore | None = None,
+    flow_session: FlowSession | None = None,
 ) -> int:
     """Restore a readable plaintext ``.env`` and stop runtime injection (reversible).
 
     The vault copy is left intact so re-enabling is immediate. Returns 0 on
     success, 1 only when a sealed-away plaintext cannot be recovered from the
-    vault (fail-closed).
+    vault (fail-closed). ``flow_session`` (``uninstall``) lends the flow's
+    already open vault, so restoring several targets unlocks it once.
     """
-    rc = _restore_plaintext(home=home, root=root, backend=backend, store=store)
+    rc = _restore_plaintext(home=home, root=root, backend=backend, store=store, flow_session=flow_session)
     if rc != 0:
         return rc
     _write_optout_marker(home)

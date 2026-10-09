@@ -260,6 +260,8 @@ def _default_helper_finder(platform: str) -> str | None:
         return _seckey_helper._find_helper()
     if platform.startswith("linux"):
         return _seckey_helper.find_tpmkey_helper()
+    if platform == "win32":
+        return _seckey_helper.find_winkey_helper()
     return None
 
 

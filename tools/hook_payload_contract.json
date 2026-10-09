@@ -1,5 +1,5 @@
 {
-  "_comment": "Payload fields Mordred plugins consume per Hermes hook (TODO L474). Keys must match exactly the hooks register()ed by mordred_hermes plugins (tests/test_hook_payload_drift.py enforces this); values are the kwargs the handlers read from the Hermes payload, sorted. Consumers: network/hooks.py on_session_start (session_id), privacy_check + network pre_tool_call (tool_name), llm_guard pre_api_request (base_url, provider). on_session_end only needs the hook to fire.",
+  "_comment": "Payload fields Mordred plugins consume per Hermes hook. Keys must match exactly the hooks registered by mordred_hermes plugins (tests/test_hook_payload_drift.py enforces this); values are the sorted kwargs the handlers read. Consumers: network/hooks.py on_session_start (session_id), privacy_check + network pre_tool_call (tool_name), llm_guard + network pre_api_request (base_url, provider), and extension/gateway_plugin.py pre_gateway_dispatch (event, gateway). on_session_end only needs the hook to fire.",
   "on_session_start": ["session_id"],
   "on_session_end": [],
   "pre_tool_call": ["tool_name"],

@@ -13,16 +13,9 @@ from pathlib import Path
 import pytest
 
 from mordred_hermes.wizard import upgrade
-from mordred_hermes.wizard.policy_writer import PolicySnapshot, PolicyWriter
+from mordred_hermes.wizard.policy_writer import PolicySnapshot
 
-
-def _writer(tmp_path: Path) -> PolicyWriter:
-    return PolicyWriter(
-        config_path=tmp_path / "config.yaml",
-        policy_json_path=tmp_path / "mordred" / "policy.json",
-        mordred_dir=tmp_path / "mordred",
-    )
-
+from ._helpers import _writer
 
 # -----------------------------------------------------------------------------
 # UpgradeOptions dataclass
@@ -404,3 +397,45 @@ class TestRenderReport:
         out = capsys.readouterr().out
         assert "applied" in out
         assert "OpenClaw" in out
+
+
+class TestPluginIdentityMigration:
+    """``upgrade`` switches the pre-0.2.0a0 plugin names to the single ``mordred``."""
+
+    def test_migrates_legacy_names_even_when_the_policy_is_unchanged(self, tmp_path: Path) -> None:
+        w = _writer(tmp_path)
+        snap = PolicySnapshot(policy="lenient")
+        w.write(snap)
+        config = tmp_path / "config.yaml"
+        legacy = "    - mordred_network\n    - mordred_e2e\n"
+        config.write_text(config.read_text(encoding="utf-8").replace("    - mordred\n", legacy), encoding="utf-8")
+
+        report = upgrade.run(
+            options=upgrade.UpgradeOptions(),
+            policy_writer=w,
+            target_snapshot=snap,
+            openclaw_base=tmp_path / "no-openclaw-here",
+        )
+
+        assert report.story1_action == "noop"
+        after = config.read_text(encoding="utf-8")
+        assert "- mordred\n" in after and "mordred_network\n" not in after.split("mordred_privacy_check:")[0]
+        assert report.plugin_notes
+        rendered = upgrade.render_report(report)
+        assert "single 'mordred' plugin" in rendered
+        assert "mordred_network" in rendered
+
+    def test_nothing_to_migrate_adds_no_report_line(self, tmp_path: Path) -> None:
+        w = _writer(tmp_path)
+        snap = PolicySnapshot(policy="lenient")
+        w.write(snap)
+
+        report = upgrade.run(
+            options=upgrade.UpgradeOptions(),
+            policy_writer=w,
+            target_snapshot=snap,
+            openclaw_base=tmp_path / "no-openclaw-here",
+        )
+
+        assert report.plugin_notes == ()
+        assert "Hermes plugin" not in upgrade.render_report(report)

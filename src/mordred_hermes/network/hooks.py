@@ -552,7 +552,7 @@ def _raise_dropped_tool_refusal(*, tool_name: str, audit: _AuditWriter | None) -
 
 
 def wait_until_ready(*, timeout: float = 5.0, poll_interval: float = 0.05) -> bool:
-    """Poll ``api.status().ready`` until True or timeout (TODO §3.1 L295).
+    """Poll ``api.status().ready`` until true or timeout.
 
     Hermes loads bundled / user / project plugins before entry-point
     plugins (HOOK_PAYLOADS.md §1). Sibling plugins whose

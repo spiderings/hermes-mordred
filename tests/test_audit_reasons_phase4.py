@@ -12,9 +12,9 @@ PR2 adds 2 codes (already landed):
   Codex review #4: verify-before-decrypt prevents secret materialization
   on mismatch. Decision ``block``. Fields: ``blob_version``,
   ``event="keyvault.import_backup"``.
-- ``keyvault.seed_display_aborted_screenshot`` — SPEC §Seed phrase
-  display security L352 already references this; PR2 freezes it so the
-  PR4 ``seed_display.py`` emit site has a stable target. Decision
+- ``keyvault.seed_display_aborted_screenshot`` — SPEC §Seed phrase display
+  security requires this stable reason at the ``seed_display.py`` emit site.
+  Decision
   ``block``. Fields: ``event="keyvault.seed_display"``, ``detector``.
 
 PR3 adds 2 codes (this PR) for Secure-Enclave-authorized DEK unwrap.
@@ -109,7 +109,7 @@ def test_keyvault_init_denied_in_freeze() -> None:
 
 def test_keyvault_codes_use_dotted_form() -> None:
     """Naming convention check: ``keyvault.*`` mirrors ``policy.*`` /
-    ``mordred.*`` / ``network.*`` dotted form (POLICY.md L43 note)."""
+    ``mordred.*`` / ``network.*`` dotted form."""
     from mordred_hermes.privacy_check._audit_reasons import ReasonCode
 
     keyvault_codes = [c for c in get_args(ReasonCode) if c.startswith("keyvault")]

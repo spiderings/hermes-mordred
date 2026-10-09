@@ -25,6 +25,7 @@ from mordred_hermes.keyvault._runtime_probe import (
     discover_runtime_python,
     runtime_config_decrypt_available,
     runtime_env_injection_available,
+    runtime_memory_encryption_available,
 )
 
 
@@ -193,11 +194,17 @@ class TestRuntimeInjectionAvailable:
         assert ok is False
         assert "timed out" in detail
 
-    def test_strips_pythonpath_and_pythonhome(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_strips_pythonpath_and_neutralizes_the_config_hook(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # A stray PYTHONPATH must not let the runtime import a mordred it would not
-        # see under the real `hermes` wrapper (which unsets both).
+        # see under the real `hermes` wrapper (which unsets both). MORDRED_CONFIG_DECRYPT=0
+        # matters just as much: with it exported as "1" the config-decrypt .pth hook
+        # force-engages inside the probe process and would open the vault / prompt
+        # Touch ID — including from the read-only `encryption status` path.
         monkeypatch.setenv("PYTHONPATH", "/leak/src")
         monkeypatch.setenv("PYTHONHOME", "/leak/home")
+        monkeypatch.setenv("MORDRED_CONFIG_DECRYPT", "1")
         captured: dict[str, dict[str, str]] = {}
 
         def _fake_run(*_a: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -208,6 +215,7 @@ class TestRuntimeInjectionAvailable:
         runtime_env_injection_available(home=tmp_path, runtime_python=Path("/any/python"))
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONHOME" not in captured["env"]
+        assert captured["env"].get("MORDRED_CONFIG_DECRYPT") == "0"
 
 
 # -----------------------------------------------------------------------------
@@ -270,3 +278,76 @@ class TestRuntimeConfigDecryptAvailable:
         assert "PYTHONPATH" not in captured["env"]
         assert "PYTHONHOME" not in captured["env"]
         assert captured["env"].get("MORDRED_CONFIG_DECRYPT") == "0"
+
+
+# -----------------------------------------------------------------------------
+# runtime_memory_encryption_available — the memories/*.md analogue
+# -----------------------------------------------------------------------------
+class TestRuntimeMemoryEncryptionAvailable:
+    def test_returncode_zero_reports_the_shape(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _fake_run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="A", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        ok, detail = runtime_memory_encryption_available(home=tmp_path, runtime_python=Path("/any/python"))
+        assert ok is True
+        assert "seam A" in detail
+
+    def test_nonzero_returncode_reports_stderr(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _fake_run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args=[], returncode=31, stdout="", stderr="ENTRY_DELIMITER missing")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        ok, detail = runtime_memory_encryption_available(home=tmp_path, runtime_python=Path("/any/python"))
+        assert ok is False
+        assert "ENTRY_DELIMITER missing" in detail
+
+    def test_never_hands_the_memory_key_to_the_child(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No probe needs HERMES_MEMORY_KEY, so it must not reach a child process
+        from here — the probed interpreter is chosen from another process's argv."""
+        monkeypatch.setenv("HERMES_MEMORY_KEY", "c2VjcmV0LW1lbW9yeS1rZXktdmFsdWUtaGVyZQ==")
+        monkeypatch.setenv("PYTHONPATH", "/leak/src")
+        captured: dict[str, dict[str, str]] = {}
+
+        def _fake_run(*_a: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured["env"] = dict(kwargs["env"])  # type: ignore[arg-type]
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="A", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        runtime_memory_encryption_available(home=tmp_path, runtime_python=Path("/any/python"))
+
+        assert "HERMES_MEMORY_KEY" not in captured["env"]
+        assert "PYTHONPATH" not in captured["env"]
+        assert captured["env"].get("MORDRED_CONFIG_DECRYPT") == "0"
+
+    def test_the_env_probe_also_drops_the_memory_key(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HERMES_MEMORY_KEY", "c2VjcmV0LW1lbW9yeS1rZXktdmFsdWUtaGVyZQ==")
+        captured: dict[str, dict[str, str]] = {}
+
+        def _fake_run(*_a: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured["env"] = dict(kwargs["env"])  # type: ignore[arg-type]
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+        runtime_env_injection_available(home=tmp_path, runtime_python=Path("/any/python"))
+
+        assert "HERMES_MEMORY_KEY" not in captured["env"]
+
+
+def test_key_probe_uses_hermes_startup_and_sanitizes_failure(tmp_path, monkeypatch):
+    from mordred_hermes.keyvault import _runtime_probe as probe
+
+    def run(args, **kwargs):
+        assert args[0] == "/runtime/python"
+        script = Path(args[1])
+        assert script.name == "hermes"
+        assert script.is_file()
+        assert "HERMES_MEMORY_KEY" not in kwargs["env"]
+        assert kwargs["env"]["HERMES_HOME"] == str(tmp_path)
+        return subprocess.CompletedProcess(args, 35, "synthetic-secret", "synthetic-secret")
+
+    monkeypatch.setenv("HERMES_MEMORY_KEY", "synthetic-secret")
+    monkeypatch.setattr(subprocess, "run", run)
+    ok, reason = probe.runtime_memory_key_available(home=tmp_path, runtime_python=Path("/runtime/python"))
+    assert not ok
+    assert "synthetic-secret" not in reason

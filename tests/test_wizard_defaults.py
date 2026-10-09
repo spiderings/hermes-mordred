@@ -70,12 +70,25 @@ class TestLazyProductionDefaults:
         assert isinstance(_defaults.resolve_backend(None), _Fake)
 
     def test_store_default_is_keychain_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from mordred_hermes.keyvault import _anchor_keychain
+        from mordred_hermes.keyvault import _anchor_keychain, _seckey_helper
 
         class _Fake:
             pass
 
+        monkeypatch.setattr(_seckey_helper, "find_sekey_helper", lambda: None)
         monkeypatch.setattr(_anchor_keychain, "KeychainAnchorStore", _Fake)
+        assert isinstance(_defaults.resolve_store(None), _Fake)
+
+    def test_store_default_is_helper_owned_when_the_helper_is_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mordred_hermes.keyvault import _anchor_keychain, _seckey_helper
+
+        class _Fake:
+            def __init__(self, *_a: object, **_kw: object) -> None:
+                pass
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(_seckey_helper, "find_sekey_helper", lambda: "/x/mordred-hermes-sekey")
+        monkeypatch.setattr(_anchor_keychain, "HelperAnchorStore", _Fake)
         assert isinstance(_defaults.resolve_store(None), _Fake)
 
     def test_prompt_io_default_is_prompt_toolkit_io(self, monkeypatch: pytest.MonkeyPatch) -> None:

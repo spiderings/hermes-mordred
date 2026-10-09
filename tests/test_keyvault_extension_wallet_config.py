@@ -349,6 +349,54 @@ def test_set_wallet_refuses_symlinked_extension_directory(
     assert not (target / "wallet.json").exists()
 
 
+def test_validate_extension_dir_rejects_symlink_before_repairing_target_mode(
+    tmp_path: Path,
+) -> None:
+    """The symlink check in ``_validate_extension_dir`` must run before the
+    mode-repair chmod: if a reorder let the mode check run first, a
+    world-writable symlink target would get silently chmod'd through the
+    link instead of being rejected untouched."""
+    target = tmp_path / "world-writable"
+    target.mkdir(mode=0o777)
+    os.chmod(target, 0o777)
+    link = tmp_path / "extension"
+    link.symlink_to(target, target_is_directory=True)
+    before_mode = target.stat().st_mode & 0o777
+
+    with pytest.raises(extension_sign.WalletConfigError, match="directory is unsafe"):
+        extension_sign._validate_extension_dir(link, create=True)
+
+    assert target.stat().st_mode & 0o777 == before_mode
+
+
+def test_wallet_cfg_chain_id_checked_before_rpc_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_validate_rpc_cfg`` checks ``chain_id`` before ``rpc_url``: if a
+    reorder made ``rpc_url`` run first, the RPC-url validator this test
+    forbids would run. The facade re-export cannot see that internal call
+    (see ``extension_sign``'s "Module layout" docstring), so the spy patches
+    ``_extension_config`` directly."""
+    from mordred_hermes.keyvault import _extension_config
+
+    directory = tmp_path / "extension"
+    monkeypatch.setattr(extension_sign, "_ext_dir", lambda: directory)
+
+    def fail_if_called(value: object) -> None:
+        pytest.fail("rpc_url must not be validated once chain_id already failed")
+
+    monkeypatch.setattr(_extension_config, "_validate_rpc_url", fail_if_called)
+
+    cfg = {**VALID_RAW, "chain_id": 0, "rpc_url": "https://127.0.0.1/"}
+
+    with pytest.raises(extension_sign.WalletConfigError) as raised:
+        extension_sign.set_wallet(cfg)
+
+    assert str(raised.value) == extension_sign._WALLET_CONFIG_ERROR
+    assert not directory.exists()
+
+
 def test_partial_atomic_write_preserves_previous_wallet_and_cleans_stage(
     wallet_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

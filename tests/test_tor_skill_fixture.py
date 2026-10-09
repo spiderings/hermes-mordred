@@ -1,7 +1,7 @@
 """Unit coverage for the ``tor_skill`` fixture's network probe.
 
-TODO §3.3 L380 (method C): Hermes has no ``skill invoke`` API — a skill
-is a Markdown instruction sheet, not callable code. To verify that a
+Hermes has no ``skill invoke`` API: a skill is a Markdown instruction sheet,
+not callable code. To verify that a
 skill declaring ``network_requirements: tor`` actually routes through
 Tor, the ``tor_skill`` fixture ships ``network_probe.py``: the
 executable counterpart to its ``SKILL.md``.

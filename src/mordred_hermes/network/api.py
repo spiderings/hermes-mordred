@@ -1,9 +1,8 @@
 """Public Python API for the mordred_network plugin.
 
-PR1 defines the surface and the runtime :class:`~typing.Protocol`. PR2
-will land the concrete :class:`mordred_hermes.network.runtime.Runtime`
-singleton, register it via :func:`set_runtime`, and wire the lifecycle
-hooks. Until then, callers pass a runtime explicitly through ``runtime=``.
+The concrete :class:`mordred_hermes.network.runtime.Runtime` is registered as a
+process-wide singleton by the plugin. Tests and embedded callers may pass a
+runtime explicitly through ``runtime=``.
 
 Functions:
 
@@ -14,8 +13,8 @@ Functions:
 
 The module is intentionally stateful (a module-level :data:`_RUNTIME`)
 because Mordred plugins share a single Hermes process and
-``mordred_keyvault`` needs to call :func:`blackout_assert` without
-threading a runtime handle through its own API surface (TODO §4.1 L397).
+``mordred_keyvault`` needs to call :func:`blackout_assert` without threading a
+runtime handle through its own API surface.
 Tests use :func:`reset_runtime_for_tests` to drop the registration.
 """
 
@@ -151,8 +150,8 @@ def _default_probe() -> bool:
     which would leak the all-clear to the keyvault Seed-Phrase blackout
     while the host can still egress over IPv6.
 
-    PR1 ships this default; Phase 4 :mod:`keyvault.network_fallback` may
-    swap it with an OS-API probe (TODO §4.1 L397).
+    :mod:`keyvault.network_fallback` may replace this default with an OS-API
+    probe.
     """
     targets = (
         (socket.AF_INET, ("1.1.1.1", 53)),

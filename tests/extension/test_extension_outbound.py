@@ -22,17 +22,13 @@ from __future__ import annotations
 import asyncio
 import secrets
 import sys
+import time
 from enum import Enum
 from types import SimpleNamespace
 
 import pytest
 
 from mordred_hermes.extension import crypto, e2e, gateway_plugin, outbound, pairing
-
-
-@pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)
@@ -1426,3 +1422,389 @@ def test_gateway_hook_does_not_release_plaintext_without_reply_context(monkeypat
         "action": "skip",
         "reason": "mordred-outbound-encryption-unavailable",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Channel-binding outbound policy (proactive / agent-initiated sends)
+#
+# The reply-in-kind registry only knows conversations Mordred has SEEN
+# ciphertext in, and on Slack the adapter's synthetic per-message thread root
+# keeps even that mark off the ``(channel, None)`` bucket. Anything the agent
+# starts on its own — cron output, a proactive notification — therefore found no
+# mark and left in CLEARTEXT into a channel the operator had configured as a
+# ciphertext-only transport. A bound K_chan is the durable signal that the
+# channel's members can decrypt.
+# --------------------------------------------------------------------------- #
+
+_BOUND_TEAM = "T0BOUNDTEAM"
+
+
+def _bind_channel_key(chat_id: str, *, platform: str = "slack", scope: str = _BOUND_TEAM) -> bytes:
+    """Store a key under the composite id a real extension push uses."""
+    raw_key = secrets.token_bytes(32)
+    pairing.save_channel_key(f"{platform}:{scope}:{chat_id}", raw_key)
+    return raw_key
+
+
+def test_slack_proactive_send_into_key_bound_channel_is_encrypted():
+    """No thread, no inbound mark, bound key: the send must be ciphertext."""
+    _seed_master_key()
+    chat_id = "C-proactive-1"
+    chan_key = _bind_channel_key(chat_id)
+
+    adapter = FakeSlackAdapter()
+    reply = "cron: nightly report is ready"
+    res = asyncio.run(adapter.send(chat_id, reply))
+
+    posts = adapter._client.posts
+    assert not any(p.get("PLAINTEXT_LEAK") for p in posts)
+    assert len(posts) == 1
+    assert reply not in posts[0]["text"]
+    assert posts[0]["text"].startswith(crypto.ENC_PREFIX_V3)
+    assert "thread_ts" not in posts[0]
+    assert (
+        _decrypt_v3_replies(
+            [posts[0]["text"]],
+            chan_key,
+            platform="slack",
+            chat_id=chat_id,
+            thread_root=None,
+        )
+        == reply
+    )
+    assert res.success is True
+
+
+def test_slack_proactive_send_into_unbound_channel_is_unchanged():
+    """Only the channel that actually holds a key changes behaviour."""
+    _seed_master_key()
+    _bind_channel_key("C-somewhere-else")
+
+    adapter = FakeSlackAdapter()
+    reply = "no key is bound to this channel"
+    res = asyncio.run(adapter.send("C-unbound-1", reply))
+
+    posts = adapter._client.posts
+    assert len(posts) == 1
+    assert posts[0]["PLAINTEXT_LEAK"] is True
+    assert posts[0]["text"] == reply
+    assert res.success is True
+
+
+def test_slack_bound_channel_still_encrypts_after_the_reply_ttl_expires():
+    """The 24h reply-in-kind TTL must not re-open a cleartext path.
+
+    Expiry drops both the encryption verdict AND the remembered kid, so this
+    also pins that the key is recovered from the channel binding alone.
+    """
+    _seed_master_key()
+    chat_id, thread_ts = "C-ttl-bound", "1710000009.0009"
+    chan_key = _bind_channel_key(chat_id)
+    e2e.mark_encrypted_thread("slack", chat_id, thread_ts, crypto.key_id(chan_key))
+    e2e._ENC_THREADS[("slack", chat_id, thread_ts)] = (time.time() - 1, crypto.key_id(chan_key))
+
+    adapter = FakeSlackAdapter()
+    reply = "after the reply TTL"
+    res = asyncio.run(adapter.send(chat_id, reply, metadata={"thread_ts": thread_ts}))
+
+    posts = adapter._client.posts
+    assert not any(p.get("PLAINTEXT_LEAK") for p in posts)
+    assert posts[0]["text"].startswith(crypto.ENC_PREFIX_V3)
+    assert (
+        _decrypt_v3_replies(
+            [posts[0]["text"]],
+            chan_key,
+            platform="slack",
+            chat_id=chat_id,
+            thread_root=thread_ts,
+        )
+        == reply
+    )
+    assert res.success is True
+
+
+def test_unbound_channel_returns_to_plaintext_when_the_reply_ttl_expires():
+    """TTL semantics are unchanged where there is no key to encrypt with."""
+    _seed_master_key()
+    chat_id, thread_ts = "C-ttl-unbound", "1710000010.0010"
+    e2e.mark_encrypted_thread("slack", chat_id, thread_ts, "kidkidki")
+    e2e._ENC_THREADS[("slack", chat_id, thread_ts)] = (time.time() - 1, "kidkidki")
+
+    adapter = FakeSlackAdapter()
+    reply = "the mark has expired"
+    res = asyncio.run(adapter.send(chat_id, reply, metadata={"thread_ts": thread_ts}))
+
+    posts = adapter._client.posts
+    assert len(posts) == 1
+    assert posts[0]["PLAINTEXT_LEAK"] is True
+    assert posts[0]["text"] == reply
+    assert res.success is True
+
+
+def test_needs_key_notice_into_a_key_bound_channel_stays_plaintext():
+    """The setup notice is the ONE cleartext send left in a bound channel.
+
+    Encrypting it would make it unreadable by its only audience — the sender
+    who has no key — and #88 records the notice's plaintext path as
+    load-bearing. It is a fixed string with no agent or user content.
+    """
+    _seed_master_key()
+    chat_id = "C-notice-bound"
+    _bind_channel_key(chat_id)
+
+    adapter = FakeSlackAdapter()
+    gateway = SimpleNamespace(adapters={FakePlatform.SLACK: adapter})
+
+    assert _dispatch(gateway, _plaintext_slack_event(chat_id)) == [_SKIP_UNENCRYPTED]
+
+    posts = adapter._client.posts
+    assert len(posts) == 1
+    assert posts[0]["PLAINTEXT_LEAK"] is True
+    assert posts[0]["text"] == gateway_plugin._NEEDS_KEY_NOTICE
+
+
+def test_control_notice_marker_does_not_leak_into_a_normal_send():
+    """The bypass is scoped to the notice, not to the channel or the process."""
+    _seed_master_key()
+    chat_id = "C-notice-scope"
+    _bind_channel_key(chat_id)
+
+    with e2e.control_notice_send():
+        assert e2e.outbound_must_encrypt("slack", chat_id, None) is False
+    assert e2e.outbound_must_encrypt("slack", chat_id, None) is True
+
+
+def test_reply_in_kind_notice_into_a_marked_thread_is_still_encrypted():
+    """The bypass relaxes only the new channel-binding rule.
+
+    A conversation Mordred has seen ciphertext in was already answered in kind,
+    notice included; that behaviour predates this rule and must not regress.
+    """
+    _seed_master_key()
+    chat_id, thread_ts = "C-notice-marked", "1710000011.0011"
+    chan_key = _bind_channel_key(chat_id)
+    e2e.mark_encrypted_thread("slack", chat_id, thread_ts, crypto.key_id(chan_key))
+
+    with e2e.control_notice_send():
+        assert e2e.outbound_must_encrypt("slack", chat_id, thread_ts) is True
+
+
+def test_discord_proactive_send_into_key_bound_channel_is_encrypted():
+    _seed_master_key()
+    chat_id = "700000000000000001"
+    chan_key = _bind_channel_key(chat_id, platform="discord", scope="800000000000000009")
+
+    client = FakeDiscordClient()
+    channel = client.add_channel(chat_id)
+    adapter = FakeDiscordAdapter(client)
+    reply = "cron: discord report is ready"
+    res = asyncio.run(adapter.send(chat_id, reply))
+
+    assert not any(m.startswith("PLAINTEXT_LEAK:") for m in channel.sent)
+    assert channel.sent
+    assert all(m.startswith(crypto.ENC_PREFIX_V3) for m in channel.sent)
+    assert (
+        _decrypt_v3_replies(
+            channel.sent,
+            chan_key,
+            platform="discord",
+            chat_id=chat_id,
+            thread_root=None,
+        )
+        == reply
+    )
+    assert res.success is True
+
+
+def test_discord_proactive_send_into_unbound_channel_is_unchanged():
+    _seed_master_key()
+    chat_id = "700000000000000002"
+    client = FakeDiscordClient()
+    channel = client.add_channel(chat_id)
+    adapter = FakeDiscordAdapter(client)
+    reply = "no discord key bound here"
+
+    asyncio.run(adapter.send(chat_id, reply))
+
+    assert channel.sent == [f"PLAINTEXT_LEAK:{reply}"]
+
+
+def test_ambiguous_channel_bindings_send_a_locked_notice_not_a_guess():
+    """Two different keys bound to one channel must not resolve to either.
+
+    ``save_channel_key`` keys by the extension's full composite id and never
+    evicts, so a re-pairing or workspace change leaves the old binding in place
+    beside the new one. The store has no bound-at timestamp and updates an id
+    in place, so insertion order records first-binding, not recency — picking
+    the first match would reliably choose the STALE key and post ciphertext
+    nobody holds, while ``reply_key`` still resolves it and the send reports
+    success.
+    """
+    _seed_master_key()
+    chat_id = "C-ambiguous"
+    old_key = _bind_channel_key(chat_id, scope="T0OLDTEAM")
+    new_key = _bind_channel_key(chat_id, scope="T0NEWTEAM")
+    assert crypto.key_id(old_key) != crypto.key_id(new_key)
+
+    adapter = FakeSlackAdapter()
+    secret = "must not go out under a guessed key"
+    res = asyncio.run(adapter.send(chat_id, secret))
+
+    posts = adapter._client.posts
+    assert not any(p.get("PLAINTEXT_LEAK") for p in posts)  # still a ciphertext-only channel
+    assert len(posts) == 1
+    assert posts[0]["text"] == outbound._LOCKED_NOTICE
+    assert secret not in posts[0]["text"]
+    assert res.success is False
+
+    # The policy question and the key question are answered separately.
+    assert e2e.outbound_must_encrypt("slack", chat_id, None) is True
+    assert e2e.bound_channel_key_id("slack", chat_id) is None
+    assert sorted(e2e.bound_channel_key_ids("slack", chat_id)) == sorted(
+        {crypto.key_id(old_key), crypto.key_id(new_key)}
+    )
+
+
+def test_one_key_bound_under_several_ids_is_not_ambiguous():
+    """The SAME key pushed under two composite ids is one binding, not two."""
+    _seed_master_key()
+    chat_id = "C-duplicate-binding"
+    chan_key = secrets.token_bytes(32)
+    pairing.save_channel_key(chat_id, chan_key)
+    pairing.save_channel_key(f"slack:{_BOUND_TEAM}:{chat_id}", chan_key)
+
+    assert e2e.bound_channel_key_ids("slack", chat_id) == [crypto.key_id(chan_key)]
+    assert e2e.bound_channel_key_id("slack", chat_id) == crypto.key_id(chan_key)
+
+    adapter = FakeSlackAdapter()
+    reply = "single binding, two ids"
+    asyncio.run(adapter.send(chat_id, reply))
+
+    posts = adapter._client.posts
+    assert not any(p.get("PLAINTEXT_LEAK") for p in posts)
+    assert (
+        _decrypt_v3_replies(
+            [posts[0]["text"]],
+            chan_key,
+            platform="slack",
+            chat_id=chat_id,
+            thread_root=None,
+        )
+        == reply
+    )
+
+
+def test_ambiguous_bindings_still_reply_in_kind_with_the_inbound_key():
+    """A live conversation never reaches the ambiguous case."""
+    _seed_master_key()
+    chat_id, thread_ts = "C-ambiguous-reply", "1710000012.0012"
+    _bind_channel_key(chat_id, scope="T0OLDTEAM")
+    new_key = _bind_channel_key(chat_id, scope="T0NEWTEAM")
+    e2e.mark_encrypted_thread("slack", chat_id, thread_ts, crypto.key_id(new_key))
+
+    adapter = FakeSlackAdapter()
+    reply = "answered with the key the sender used"
+    asyncio.run(adapter.send(chat_id, reply, metadata={"thread_ts": thread_ts}))
+
+    posts = adapter._client.posts
+    assert not any(p.get("PLAINTEXT_LEAK") for p in posts)
+    assert (
+        _decrypt_v3_replies(
+            [posts[0]["text"]],
+            new_key,
+            platform="slack",
+            chat_id=chat_id,
+            thread_root=thread_ts,
+        )
+        == reply
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Control-notice marker across task boundaries
+# --------------------------------------------------------------------------- #
+
+
+def test_control_notice_marker_does_not_cross_a_task_boundary():
+    """A concurrent send must not inherit an in-flight notice's bypass.
+
+    Mirrors the real shape: ``gateway_plugin._safe_send`` enters the marker
+    INSIDE the coroutine the notice task runs, so a task created outside it
+    (any ordinary reply) keeps its own context.
+    """
+
+    async def main() -> dict[str, bool]:
+        notice_entered = asyncio.Event()
+        observed_outside = asyncio.Event()
+        seen: dict[str, bool] = {}
+
+        async def notice() -> None:
+            with e2e.control_notice_send():
+                notice_entered.set()
+                await observed_outside.wait()
+                seen["inside_after_concurrent_send"] = e2e.in_control_notice()
+
+        async def ordinary_send() -> None:
+            await notice_entered.wait()
+            seen["concurrent_task"] = e2e.in_control_notice()
+            observed_outside.set()
+
+        await asyncio.gather(asyncio.create_task(notice()), asyncio.create_task(ordinary_send()))
+        seen["after_gather"] = e2e.in_control_notice()
+        return seen
+
+    assert asyncio.run(main()) == {
+        "concurrent_task": False,
+        "inside_after_concurrent_send": True,
+        "after_gather": False,
+    }
+
+
+def test_a_task_created_inside_the_marker_inherits_the_bypass():
+    """Documented leak vector: asyncio copies the context at task creation.
+
+    Not reachable today (adapters await their send inline), but it is why the
+    marker must wrap only the single delivering ``await`` — never adapter setup
+    or any fan-out that spawns tasks.
+    """
+
+    async def main() -> list[bool]:
+        seen: list[bool] = []
+
+        async def child() -> None:
+            seen.append(e2e.in_control_notice())
+
+        with e2e.control_notice_send():
+            task = asyncio.create_task(child())
+        await task
+        return seen
+
+    assert asyncio.run(main()) == [True]
+
+
+def test_control_notice_marker_is_reset_after_an_exception():
+    """A failing notice send must not leave the bypass latched on."""
+    with pytest.raises(RuntimeError, match="notice send blew up"), e2e.control_notice_send():
+        raise RuntimeError("notice send blew up")
+    assert e2e.in_control_notice() is False
+
+
+def test_failed_notice_send_leaves_later_sends_encrypted():
+    """End-to-end version of the reset: the adapter raises, the next send is
+    still classified by the channel binding."""
+    _seed_master_key()
+    chat_id = "C-notice-raises"
+    chan_key = _bind_channel_key(chat_id)
+
+    class ExplodingAdapter:
+        async def send(self, target, content, reply_to=None, metadata=None):
+            raise RuntimeError("slack is down")
+
+    async def run() -> None:
+        await gateway_plugin._safe_send(ExplodingAdapter(), chat_id, "notice", None)
+
+    asyncio.run(run())
+
+    assert e2e.in_control_notice() is False
+    assert e2e.outbound_must_encrypt("slack", chat_id, None) is True
+    assert e2e.bound_channel_key_id("slack", chat_id) == crypto.key_id(chan_key)

@@ -14,6 +14,9 @@ Message protocol: ``Mordred-Extension/SPEC.ja.md`` §6 and the extension's
 - ``discord_channel_resolve`` → Discord channel/thread metadata via the configured bot token
 - ``accounts_request`` → keyvault address (``accounts_result``)
 - ``sign_request`` → analyze + ``sign_prompt``; ``sign_approve`` → keyvault sign → ``sign_result``
+- ``telegram_status`` / ``telegram_sync`` / ``telegram_dialogs`` → read-only Telegram importer
+- ``telegram_ask`` → Venice private-model answer streamed as ``telegram_ask_meta`` +
+  ``telegram_ask_chunk*`` + ``telegram_ask_end`` (or ``telegram_ask_error``)
 
 Server-initiated frames: ``ping`` (app-level keepalive, see
 ``_Connection.keepalive``) and ``error`` (malformed JSON / crashed handler).
@@ -35,7 +38,7 @@ from urllib.parse import quote, urlsplit
 
 from aiohttp import WSMsgType, web
 
-from . import pairing
+from . import page_headers, pairing
 from .crypto import (
     DecryptError,
     decrypt_message,
@@ -50,6 +53,7 @@ from .discord_context import (
     DiscordContextError,
     resolve_discord_channel,
 )
+from .errors import wire_error_code
 from .wallet import _do_sign, _get_account_snapshot, _prepare_sign, analyze_sign
 from .webauthn import InvalidWebAuthnPublicKey
 
@@ -70,8 +74,17 @@ _SLACK_APP_TOKEN_RE = re.compile(r"xapp-[A-Za-z0-9-]+")
 # delivered out-of-band in the launch URL's fragment (never in an HTTP response)
 # and removed from browser history by the page bootstrap. Any handler added to
 # the `authed` table is refused for page sessions unless it is added here too.
+#
+# These are the page's *own* actions, not a read-only set: ``history_clear``
+# deletes the encrypted store. It is allowed because the bundled page triggers
+# it from an explicit, confirmed user action on data the page is already showing
+# — never on the page's behalf and never automatically. What stays out is
+# everything that acts beyond the page: credential/key writes, the K_master
+# crypto oracle, and the wallet signer.
+# ``test_page_allowlist_entries_are_all_used_by_the_shipped_page`` pins each
+# entry to a call site in the shipped bundle.
 _PAGE_ALLOWED = frozenset({"chat", "accounts_request", "history_get", "history_clear"})
-_EXTENSION_CAPABILITIES = ["discord_channel_resolve_v1"]
+_EXTENSION_CAPABILITIES = ["discord_channel_resolve_v1", "telegram_import_v1"]
 
 # A sign_request entry leaves _pending_sign only on approve/reject (or when the
 # socket dies), so an authed client that never approves would grow it without
@@ -98,6 +111,13 @@ DEFAULT_KEEPALIVE_INTERVAL = 20.0
 ChatHandler = Callable[[str, dict[str, Any]], AsyncIterator[str]]
 DiscordResolver = Callable[[str, str], Awaitable[DiscordChannelContext]]
 
+# Telegram requests carry at most this many selected dialog ids.
+_MAX_TELEGRAM_DIALOG_IDS = 50
+# Questions run as their own tasks (a Venice answer can take minutes and must
+# not stall the socket's other frames); cap how many one socket may run.
+_MAX_TELEGRAM_ASKS_PER_SOCKET = 2
+_TELEGRAM_DIALOG_ID_RE = re.compile(r"-?[0-9]{1,20}")
+
 
 def _serialize_frame(payload: dict[str, Any]) -> str:
     """Serialize every outbound frame deterministically as ASCII.
@@ -113,16 +133,23 @@ def _bounded_history_result(
     turns: list[dict[str, str]],
     *,
     max_chars: int = MAX_WS_FRAME_CHARS,
+    status: str = "ok",  # history.STATUS_OK (kept a literal: history imports lazily)
 ) -> dict[str, Any]:
     """Return all projected turns or the longest complete newest suffix.
 
     The encrypted history itself is never modified. Per-turn serialization is
     reused to compute the exact compact JSON frame size without repeatedly
     serializing progressively smaller copies of a potentially large history.
+
+    ``status`` is an ADDITIVE field (``ok`` / ``empty`` / ``unavailable`` /
+    ``undecryptable``): ``turns`` stays a list of the same shape, so a client
+    built against the older frame keeps working while a newer one can tell an
+    empty conversation from one it can no longer decrypt.
     """
     full = {
         "id": request_id,
         "type": "history_result",
+        "status": status,
         "turns": turns,
         "truncated": False,
     }
@@ -217,6 +244,7 @@ class ExtensionAPIServer:
         port: int = DEFAULT_PORT,
         chat_handler: ChatHandler | None = None,
         discord_resolver: DiscordResolver | None = None,
+        telegram_service: Any = None,
         keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL,
     ) -> None:
         if not _is_loopback_host(host):
@@ -225,6 +253,9 @@ class ExtensionAPIServer:
         self.port = port
         self.chat_handler: ChatHandler = chat_handler or _default_chat_handler
         self.discord_resolver: DiscordResolver = discord_resolver or resolve_discord_channel
+        # One importer per server process (it owns the single running sync).
+        # Built lazily so a server without the Telegram extra never imports it.
+        self._telegram_service = telegram_service
         self.keepalive_interval = keepalive_interval
         self._runner: web.AppRunner | None = None
         # Per-process page principal. It is printed only as a URL fragment by
@@ -236,6 +267,14 @@ class ExtensionAPIServer:
             f"http://[::1]:{port}",
             _loopback_origin(host, port),
         }
+
+    @property
+    def telegram_service(self) -> Any:
+        if self._telegram_service is None:
+            from .telegram.service import TelegramService
+
+            self._telegram_service = TelegramService()
+        return self._telegram_service
 
     @property
     def page_url(self) -> str:
@@ -270,12 +309,13 @@ class ExtensionAPIServer:
 
     async def _handle_page(self, request: web.Request) -> web.Response:
         if not _request_is_loopback(request):
-            return web.Response(status=403, text="loopback only")
+            return web.Response(status=403, text="loopback only", headers=page_headers.plain_response_headers())
         index = _WEB_DIR / "index.html"
         if not index.exists():
             return web.Response(
                 status=503,
                 text="Mordred web app not built. Run `npm run build:page` in the extension repo.",
+                headers=page_headers.plain_response_headers(),
             )
         # The shared bundle retains the legacy placeholder so older Hermes
         # releases can inject their page token. This server launches with a
@@ -285,14 +325,13 @@ class ExtensionAPIServer:
         return web.Response(
             text=html,
             content_type="text/html",
-            headers={
-                # The fragment token is process-bound. Avoid retaining even the
-                # token-free shell across restarts and keep security headers
-                # deterministic for both "/" and "/app".
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-                "Referrer-Policy": "no-referrer",
-            },
+            # Derived from the bytes actually being served (see page_headers):
+            # the bundle is built in the extension repo, so a refreshed bundle
+            # must not be able to ship a page its own policy blocks.
+            headers=page_headers.security_headers(
+                html,
+                connect_origins=page_headers.websocket_origins(self._local_origins),
+            ),
         )
 
     # -- connection ---------------------------------------------------------
@@ -317,6 +356,7 @@ class ExtensionAPIServer:
             ws,
             self.chat_handler,
             discord_resolver=self.discord_resolver,
+            telegram_service=self.telegram_service,
             page_token=page_token,
             client_origin=origin,
         )
@@ -330,6 +370,7 @@ class ExtensionAPIServer:
                     break
         finally:
             keepalive.cancel()
+            conn.cancel_background_tasks()
         return ws
 
 
@@ -342,12 +383,14 @@ class _Connection:
         chat_handler: ChatHandler,
         *,
         discord_resolver: DiscordResolver = resolve_discord_channel,
+        telegram_service: Any = None,
         page_token: str | None = None,
         client_origin: str | None = None,
     ) -> None:
         self.ws = ws
         self.chat_handler = chat_handler
         self.discord_resolver = discord_resolver
+        self.telegram_service = telegram_service
         self.page_token = page_token  # set only for local-origin (page) sockets
         self.client_origin = client_origin
         self.authed = False
@@ -359,6 +402,13 @@ class _Connection:
         self._page_authenticated = False
         self._nonce = b""
         self._pending_sign: dict[str, dict[str, Any]] = {}
+        self._telegram_asks: dict[str, asyncio.Task[None]] = {}
+
+    def cancel_background_tasks(self) -> None:
+        """Stop work that would otherwise outlive this socket (and keep billing)."""
+        for task in list(self._telegram_asks.values()):
+            task.cancel()
+        self._telegram_asks.clear()
 
     async def _send(self, payload: dict[str, Any]) -> bool:
         # A client that disconnected mid-turn (e.g. during a slow local-LLM
@@ -427,6 +477,11 @@ class _Connection:
             "webauthn_register": self._on_webauthn_register,
             "history_get": self._on_history_get,
             "history_clear": self._on_history_clear,
+            "telegram_status": self._on_telegram_status,
+            "telegram_sync": self._on_telegram_sync,
+            "telegram_dialogs": self._on_telegram_dialogs,
+            "telegram_ask": self._on_telegram_ask,
+            "telegram_ask_cancel": self._on_telegram_ask_cancel,
         }
         try:
             if mtype in pre_auth:
@@ -469,6 +524,7 @@ class _Connection:
         # An approval captured under a revoked principal must not survive a
         # re-authentication with a replacement pairing.
         self._pending_sign.clear()
+        self.cancel_background_tasks()
 
     def _authentication_is_current(self) -> bool:
         """Fail closed unless this socket still names the active principal."""
@@ -681,7 +737,10 @@ class _Connection:
                     return
             await self._send({"id": mid, "type": "chat_end"})
         except Exception as exc:
-            await self._send({"id": mid, "type": "chat_error", "reason": str(exc)})
+            # An injected chat handler's exception text is not ours to publish
+            # (agent internals, provider URLs, file paths): reply with a code.
+            reason = wire_error_code(exc, fallback="agent_error", context="chat")
+            await self._send({"id": mid, "type": "chat_error", "reason": reason})
         finally:
             aclose = getattr(gen, "aclose", None)
             if aclose is not None:
@@ -767,7 +826,8 @@ class _Connection:
                 return
             await _reply(True, note="tokens written to ~/.hermes/.env — restart Hermes to apply")
         except Exception as exc:
-            await _reply(False, error=str(exc))
+            # Typically an OSError naming ~/.hermes/.env — logged, not returned.
+            await _reply(False, error=wire_error_code(exc, fallback="slack_setup_failed", context="slack_setup"))
 
     async def _on_discord_channel_resolve(self, msg: dict[str, Any]) -> None:
         """Resolve a Discord route without exposing the configured bot token."""
@@ -848,12 +908,13 @@ class _Connection:
     async def _on_history_get(self, msg: dict[str, Any]) -> None:
         from . import history as extension_history
 
-        turns = await asyncio.get_event_loop().run_in_executor(None, extension_history.projected_turns)
+        projection = await asyncio.get_event_loop().run_in_executor(None, extension_history.projected_history)
         await self._send(
             _bounded_history_result(
                 msg.get("id"),
-                turns,
+                projection.turns,
                 max_chars=MAX_WS_FRAME_CHARS,
+                status=projection.status,
             )
         )
 
@@ -862,6 +923,183 @@ class _Connection:
 
         extension_history.clear()
         await self._send({"id": msg.get("id"), "type": "history_cleared", "ok": True})
+
+    # -- Telegram import (read-only) -----------------------------------------
+    #
+    # Personal content (account label, chat titles, answers) is sealed with
+    # K_extchat on the wire, like chat. The question must arrive sealed too: a
+    # plaintext question is refused rather than downgraded. Page sessions never
+    # reach these handlers (not in _PAGE_ALLOWED).
+
+    def _telegram_seal(self, ek: bytes, text: str) -> str:
+        return encrypt_message_v2(ek, text, key_id(ek))
+
+    def _telegram_key(self) -> bytes | None:
+        try:
+            return self._extchat_key()
+        except Exception:
+            _log.exception("extension telegram key could not be loaded")
+            return None
+
+    def _telegram_ready(self) -> Any:
+        return self.telegram_service
+
+    async def _on_telegram_status(self, msg: dict[str, Any]) -> None:
+        from .telegram.service import error_code
+
+        mid = msg.get("id")
+        ek = self._telegram_key()
+        if ek is None:
+            await self._send(
+                {"id": mid, "type": "telegram_status_result", "ok": False, "error": "encryption_key_unavailable"}
+            )
+            return
+        try:
+            status = await self._telegram_ready().status()
+        except Exception as exc:
+            code = error_code(exc, "telegram_unavailable")
+            await self._send({"id": mid, "type": "telegram_status_result", "ok": False, "error": code})
+            return
+        status["account_label"] = self._telegram_seal(ek, status.get("account_label") or "")
+        await self._send({"id": mid, "type": "telegram_status_result", "ok": True, "status": status})
+
+    async def _on_telegram_sync(self, msg: dict[str, Any]) -> None:
+        from .telegram.client import SyncOptions
+        from .telegram.service import error_code
+
+        mid = msg.get("id")
+        raw = msg.get("options")
+        options: SyncOptions | None = None
+        if raw is not None:
+            if not isinstance(raw, dict):
+                await self._send({"id": mid, "type": "telegram_sync_result", "ok": False, "error": "invalid_request"})
+                return
+            limit = raw.get("limit_per_dialog")
+            if limit is not None and (
+                not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1_000_000
+            ):
+                await self._send({"id": mid, "type": "telegram_sync_result", "ok": False, "error": "invalid_request"})
+                return
+            # Fields the client sent override the scope saved at setup.
+            overrides = {
+                "include_channels": raw["include_channels"] if isinstance(raw.get("include_channels"), bool) else None,
+                "include_archived": raw["include_archived"] if isinstance(raw.get("include_archived"), bool) else None,
+                "limit_per_dialog": limit,
+            }
+            options = self._telegram_ready().sync_options(overrides)
+        try:
+            await self._telegram_ready().start_sync(options)
+        except Exception as exc:
+            code = error_code(exc, "telegram_sync_failed")
+            await self._send({"id": mid, "type": "telegram_sync_result", "ok": False, "error": code})
+            return
+        await self._send({"id": mid, "type": "telegram_sync_result", "ok": True})
+
+    async def _on_telegram_dialogs(self, msg: dict[str, Any]) -> None:
+        from .telegram.service import error_code
+
+        mid = msg.get("id")
+        ek = self._telegram_key()
+        if ek is None:
+            await self._send(
+                {"id": mid, "type": "telegram_dialogs_result", "ok": False, "error": "encryption_key_unavailable"}
+            )
+            return
+        try:
+            dialogs = await self._telegram_ready().dialogs()
+        except Exception as exc:
+            code = error_code(exc, "telegram_unavailable")
+            await self._send({"id": mid, "type": "telegram_dialogs_result", "ok": False, "error": code})
+            return
+        for dialog in dialogs:
+            dialog["title"] = self._telegram_seal(ek, dialog["title"])
+        await self._send({"id": mid, "type": "telegram_dialogs_result", "ok": True, "dialogs": dialogs})
+
+    def _parse_telegram_ask(self, msg: dict[str, Any], ek: bytes) -> Any:
+        """Return an AskRequest, or a wire error code string."""
+        from .telegram.ask import AskRequest
+
+        question = msg.get("question")
+        if not isinstance(question, str) or not is_encrypted(question):
+            return "invalid_request"
+        try:
+            question = decrypt_message(ek, question)
+        except DecryptError:
+            return "undecryptable"
+        raw_ids = msg.get("dialog_ids", [])
+        if not isinstance(raw_ids, list) or len(raw_ids) > _MAX_TELEGRAM_DIALOG_IDS:
+            return "invalid_request"
+        if not all(isinstance(d, str) and _TELEGRAM_DIALOG_ID_RE.fullmatch(d) for d in raw_ids):
+            return "invalid_request"
+        since = msg.get("since")
+        if since is not None and (not isinstance(since, int) or isinstance(since, bool) or since < 0):
+            return "invalid_request"
+        return AskRequest(
+            question=question,
+            dialog_ids=tuple(int(d) for d in raw_ids),
+            since=since,
+            pseudonymize=msg.get("pseudonymize") is not False,
+        )
+
+    async def _on_telegram_ask(self, msg: dict[str, Any]) -> None:
+        mid = msg.get("id")
+        ek = self._telegram_key()
+        if ek is None:
+            await self._send({"id": mid, "type": "telegram_ask_error", "reason": "encryption_key_unavailable"})
+            return
+        request = self._parse_telegram_ask(msg, ek)
+        if isinstance(request, str):
+            await self._send({"id": mid, "type": "telegram_ask_error", "reason": request})
+            return
+        if not isinstance(mid, str) or not mid or mid in self._telegram_asks:
+            await self._send({"id": mid, "type": "telegram_ask_error", "reason": "invalid_request"})
+            return
+        if len(self._telegram_asks) >= _MAX_TELEGRAM_ASKS_PER_SOCKET:
+            await self._send({"id": mid, "type": "telegram_ask_error", "reason": "too_many_requests"})
+            return
+        task = asyncio.create_task(self._run_telegram_ask(mid, request, ek))
+        self._telegram_asks[mid] = task
+        task.add_done_callback(lambda _t: self._telegram_asks.pop(mid, None))
+
+    async def _on_telegram_ask_cancel(self, msg: dict[str, Any]) -> None:
+        """Stop a running question (the popup closed). No reply: the id is gone."""
+        mid = msg.get("id")
+        task = self._telegram_asks.get(mid) if isinstance(mid, str) else None
+        if task is not None:
+            task.cancel()
+
+    async def _run_telegram_ask(self, mid: str, request: Any, ek: bytes) -> None:
+        from .telegram.service import AskResult, error_code
+
+        meta: list[AskResult] = []
+        gen = self._telegram_ready().ask(request, meta.append)
+        sent_meta = False
+        try:
+            async for chunk in gen:
+                if not sent_meta and meta:
+                    sent_meta = True
+                    await self._send(
+                        {
+                            "id": mid,
+                            "type": "telegram_ask_meta",
+                            "model": meta[0].model,
+                            "message_count": meta[0].message_count,
+                            "dialog_count": meta[0].dialog_count,
+                            "truncated": meta[0].truncated,
+                        }
+                    )
+                sealed = self._telegram_seal(ek, chunk)
+                if not await self._send({"id": mid, "type": "telegram_ask_chunk", "content": sealed}):
+                    return
+            await self._send({"id": mid, "type": "telegram_ask_end"})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._send(
+                {"id": mid, "type": "telegram_ask_error", "reason": error_code(exc, "telegram_ask_failed")}
+            )
+        finally:
+            await gen.aclose()
 
     # -- Web3 ---------------------------------------------------------------
 
@@ -872,8 +1110,10 @@ class _Connection:
         except Exception as exc:
             # This is an accounts RPC failure, not a chat stream failure. The
             # generic correlated error lets every client reject immediately
-            # rather than waiting for its accounts_result timeout.
-            await self._send({"id": mid, "type": "error", "reason": f"wallet: {exc}"})
+            # rather than waiting for its accounts_result timeout. The keyvault
+            # detail (wallet paths, backend state) stays in the server log.
+            reason = wire_error_code(exc, fallback="wallet_unavailable", context="accounts_request")
+            await self._send({"id": mid, "type": "error", "reason": reason})
             return
         await self._send(
             {
@@ -917,12 +1157,13 @@ class _Connection:
                 msg.get("rpc_url"),
             )
         except Exception as exc:
+            detail = wire_error_code(exc, fallback="", context="sign_request")
             await self._send(
                 {
                     "id": mid,
                     "type": "sign_result",
                     "request_id": request_id,
-                    "error": f"transaction_prepare_failed: {exc}",
+                    "error": f"transaction_prepare_failed: {detail}" if detail else "transaction_prepare_failed",
                 }
             )
             return
@@ -991,7 +1232,8 @@ class _Connection:
                 pend.get("expected_signer"),
             )
         except Exception as exc:
-            await self._send({"id": mid, "type": "sign_result", "request_id": request_id, "error": str(exc)})
+            error = wire_error_code(exc, fallback="sign_failed", context="sign_approve")
+            await self._send({"id": mid, "type": "sign_result", "request_id": request_id, "error": error})
             return
         await self._send({"id": mid, "type": "sign_result", "request_id": request_id, "signature": signature})
 

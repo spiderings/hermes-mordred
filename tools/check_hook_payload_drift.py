@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect Hermes hook *payload field* drift (TODO §Cross-cutting L474).
+"""Detect drift in the Hermes hook payload fields Mordred consumes.
 
 This tool statically verifies both halves of Mordred's Hermes hook contract:
 the contract hook names still exist in ``hermes_cli.plugins.VALID_HOOKS``, and

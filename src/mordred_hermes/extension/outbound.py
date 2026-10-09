@@ -7,9 +7,16 @@ adapter's ``send`` at plugin load. The wrapper diverts ONLY encrypted-thread
 replies to an encrypted send; every other message goes to the original,
 unmodified ``send``.
 
-Fail-closed: once a thread is known-encrypted, the wrapper never falls back to
-plaintext — a missing key returns a failure (Slack also posts a locked notice),
-exactly like the vendored fork's adapter edits.
+Fail-closed: once a conversation must be encrypted, the wrapper never falls back
+to plaintext — a missing key returns a failure (Slack also posts a locked
+notice), exactly like the vendored fork's adapter edits.
+
+"Must be encrypted" is :func:`e2e.outbound_must_encrypt`: a conversation that
+recently carried ciphertext, OR any channel with a bound ``K_chan`` on a
+mandatory-E2E platform. The second rule covers every send that has no inbound
+thread context to inherit — cron output, proactive notifications, agent-initiated
+messages — which otherwise left in cleartext into a ciphertext-only channel.
+Mordred's own needs-key notice is the sole exception (``e2e.control_notice_send``).
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ def _SendResult() -> Any:
 async def _slack_encrypted_send(self: Any, chat_id: str, content: str, thread_ts: str | None) -> Any:
     SendResult = _SendResult()
     client = self._get_client(chat_id)
-    kid = e2e.thread_key_id("slack", chat_id, thread_ts)
+    kid = e2e.outbound_key_id("slack", chat_id, thread_ts)
     key = e2e.reply_key(kid)
     if key is None:
         kw = {"channel": chat_id, "text": _LOCKED_NOTICE, "mrkdwn": False}
@@ -103,7 +110,7 @@ def _wrap_slack(cls: Any) -> None:
         if getattr(self, "_app", None):
             try:
                 thread_ts = self._resolve_thread_ts(reply_to, metadata)
-                encrypted = e2e.is_encrypted_thread("slack", chat_id, thread_ts)
+                encrypted = e2e.outbound_must_encrypt("slack", chat_id, thread_ts)
             except Exception as exc:
                 # Context resolution is part of the confidentiality boundary.
                 # Adapter API drift or a registry failure must not turn a
@@ -143,7 +150,7 @@ async def _discord_encrypted_send(self: Any, chat_id: str, content: str, thread_
 
     kid = None
     for cid in lookup:
-        kid = e2e.thread_key_id("discord", cid, thread_id)
+        kid = e2e.outbound_key_id("discord", cid, thread_id)
         if kid:
             break
     key = e2e.reply_key(kid)
@@ -175,8 +182,12 @@ def _wrap_discord(cls: Any) -> None:
             try:
                 raw_thread_id = (metadata or {}).get("thread_id")
                 thread_id = str(raw_thread_id) if raw_thread_id not in (None, "") else None
+                # Only the ids this call carries. A Discord thread inherits its
+                # parent's key, but the parent is resolved from the live client
+                # inside _discord_encrypted_send, so a proactive send addressed
+                # to a bare thread id can still miss the channel-binding rule.
                 ids = [x for x in {str(chat_id), str(thread_id or "")} if x]
-                encrypted = any(e2e.is_encrypted_thread("discord", x, thread_id) for x in ids)
+                encrypted = any(e2e.outbound_must_encrypt("discord", x, thread_id) for x in ids)
             except Exception as exc:
                 # As with Slack, an indeterminate encryption context is a send
                 # failure. Falling through would expose the reply via orig_send.

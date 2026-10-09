@@ -1,8 +1,10 @@
-"""Phase 0 acceptance test: all 5 plugins import and expose register().
+"""Phase 0 acceptance test: the ``mordred`` plugin and its components import and expose register().
 
 Hermes loads entry-point plugins by importing the module and calling
-getattr(module, 'register'). Entry points point at the module (not module:attr).
-See hermes_cli/plugins.py:_load_entrypoint_module + _load_plugin.
+getattr(module, 'register'). The single entry point, ``mordred``, points at
+the module ``mordred_hermes.plugin`` (not module:attr), whose register() calls
+each component's register(). See hermes_cli/plugins.py:_load_entrypoint_module
++ _load_plugin.
 """
 
 import importlib
@@ -18,6 +20,9 @@ PLUGINS = [
     "mordred_hermes.network",
     "mordred_hermes.keyvault",
 ]
+
+#: The Hermes entry point itself, which registers every component above.
+ENTRY_MODULE = "mordred_hermes.plugin"
 
 
 class _FakeContext:
@@ -36,7 +41,7 @@ class _FakeContext:
         return None
 
 
-@pytest.mark.parametrize("module_path", PLUGINS)
+@pytest.mark.parametrize("module_path", [*PLUGINS, ENTRY_MODULE])
 def test_plugin_imports(module_path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Isolate HERMES_HOME before calling the real register() below. On any machine
     # that has actually run `hermes-mordred keyvault init` (including this repo's
@@ -56,6 +61,10 @@ def test_plugin_imports(module_path: str, tmp_path: Path, monkeypatch: pytest.Mo
     register = getattr(module, "register", None)
     assert callable(register), f"{module_path}.register must be callable"
     assert register(_FakeContext()) is None
+    if module_path == ENTRY_MODULE:
+        # Every component registered; a contained failure would only show here.
+        assert module.component_errors() == {}
+        assert set(module.component_hooks()) == {component for component, _ in module.COMPONENTS}
 
 
 def test_entry_points_resolve() -> None:
@@ -63,25 +72,19 @@ def test_entry_points_resolve() -> None:
     from importlib.metadata import entry_points
 
     eps = entry_points(group="hermes_agent.plugins")
-    mordred_eps = {ep.name: ep for ep in eps if ep.name.startswith("mordred_")}
-    expected = {
-        "mordred_network",
-        "mordred_privacy_check",
-        "mordred_llm_guard",
-        "mordred_keyvault",
-        "mordred_wizard",
-        "mordred_e2e",
-    }
-    assert set(mordred_eps.keys()) == expected, f"missing entry points: {expected - set(mordred_eps.keys())}"
-    for name, ep in mordred_eps.items():
-        loaded = ep.load()
-        assert isinstance(loaded, ModuleType), f"entry point {name} must load to a module (got {type(loaded).__name__})"
-        register = getattr(loaded, "register", None)
-        assert callable(register), f"entry point {name} module must expose callable register()"
+    mordred_eps = {ep.name: ep for ep in eps if ep.name.startswith("mordred")}
+    assert set(mordred_eps) == {"mordred"}, f"expected exactly one Mordred entry point, got {sorted(mordred_eps)}"
+    ep = mordred_eps["mordred"]
+    assert ep.value == "mordred_hermes.plugin"
+    loaded = ep.load()
+    assert isinstance(loaded, ModuleType), f"entry point must load to a module (got {type(loaded).__name__})"
+    assert callable(getattr(loaded, "register", None)), "entry point module must expose callable register()"
+    components = [module for _component, module in loaded.COMPONENTS]
+    assert sorted(components) == sorted([*PLUGINS, "mordred_hermes.extension.gateway_plugin"])
 
 
 def test_hermes_plugin_manager_discovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """End-to-end: Hermes PluginManager discovers all 5 mordred plugins via entry points.
+    """End-to-end: Hermes PluginManager discovers the single ``mordred`` plugin via its entry point.
 
     Guards against drift between (a) our entry-point declarations in pyproject.toml
     and (b) Hermes loader expectations (`getattr(module, 'register')` on the loaded module).
@@ -101,16 +104,8 @@ def test_hermes_plugin_manager_discovery(tmp_path: Path, monkeypatch: pytest.Mon
 
     mgr = PluginManager()
     mgr.discover_and_load(force=True)
-    mordred = {k: p for k, p in mgr._plugins.items() if p.manifest.source == "entrypoint" and k.startswith("mordred_")}
-    expected = {
-        "mordred_network",
-        "mordred_privacy_check",
-        "mordred_llm_guard",
-        "mordred_keyvault",
-        "mordred_wizard",
-        "mordred_e2e",
-    }
-    assert set(mordred.keys()) == expected, f"missing: {expected - set(mordred.keys())}"
+    mordred = {k: p for k, p in mgr._plugins.items() if p.manifest.source == "entrypoint" and k.startswith("mordred")}
+    assert set(mordred.keys()) == {"mordred"}, f"unexpected Mordred plugins: {sorted(mordred)}"
     for k, p in mordred.items():
         if p.error and "not enabled in config" not in p.error:
             raise AssertionError(f"{k} failed to load: {p.error}")

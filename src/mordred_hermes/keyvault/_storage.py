@@ -251,7 +251,7 @@ def _check_file_mode(path: Path) -> None:
 def ensure_layout(root: Path) -> None:
     """Idempotently create the keyvault directory tree.
 
-    Layout (PATHS.md L255-262):
+    Layout (PATHS.md §Expected substructure):
 
     - ``root/`` (mode ``0o700``)
     - ``root/.lock`` (mode ``0o600``, empty; fcntl.flock target)
@@ -272,14 +272,13 @@ def ensure_layout(root: Path) -> None:
         _ensure_layout_locked(root)
 
 
-def _ensure_layout_locked(root: Path) -> None:
-    """Implement :func:`ensure_layout` while its lifecycle lock is held."""
-    # Check the stable parent journal before creating ``root``. A crash may
-    # leave the journal after rmtree already removed the old generation; an
-    # initializer must not publish an empty successor tree over that pending
-    # reset transaction.
-    assert_keyvault_active(root)
-    root_existed = root.exists()
+def _ensure_layout_root(root: Path) -> None:
+    """Materialize/validate the keyvault root directory itself.
+
+    Split out of :func:`_ensure_layout_locked` for cyclomatic headroom only.
+    The caller samples ``root.exists()`` for the generation-epoch decision
+    *before* calling this, so the pre-existing double stat is unchanged.
+    """
     if root.exists():
         if not root.is_dir():
             raise KeyvaultPermissionError(errno.ENOTDIR, "keyvault root exists but is not a directory", str(root))
@@ -294,10 +293,13 @@ def _ensure_layout_locked(root: Path) -> None:
         else:
             os.chmod(root, _DIR_MODE)
 
-    # A root created at this pathname is a new generation even if the
-    # filesystem immediately reuses the predecessor's dev/inode pair.
-    ensure_generation_epoch(root, force_new=not root_existed)
 
+def _ensure_layout_subdirs(root: Path) -> None:
+    """Materialize/validate ``digests/`` and ``ciphertexts/`` at ``0o700``.
+
+    Split out of :func:`_ensure_layout_locked` for cyclomatic headroom only;
+    the per-subdirectory exists/mkdir/race-validate sequence is unchanged.
+    """
     for sub in ("digests", "ciphertexts"):
         d = root / sub
         if d.exists():
@@ -309,6 +311,23 @@ def _ensure_layout_locked(root: Path) -> None:
                 _check_dir_mode(d)
             else:
                 os.chmod(d, _DIR_MODE)
+
+
+def _ensure_layout_locked(root: Path) -> None:
+    """Implement :func:`ensure_layout` while its lifecycle lock is held."""
+    # Check the stable parent journal before creating ``root``. A crash may
+    # leave the journal after rmtree already removed the old generation; an
+    # initializer must not publish an empty successor tree over that pending
+    # reset transaction.
+    assert_keyvault_active(root)
+    root_existed = root.exists()
+    _ensure_layout_root(root)
+
+    # A root created at this pathname is a new generation even if the
+    # filesystem immediately reuses the predecessor's dev/inode pair.
+    ensure_generation_epoch(root, force_new=not root_existed)
+
+    _ensure_layout_subdirs(root)
 
     lock = root / ".lock"
     ensure_lock_file(lock)
@@ -708,8 +727,28 @@ def _lock_inode_identity(st: os.stat_result) -> tuple[int, int, int]:
     return (st.st_dev, st.st_ino, st.st_ctime_ns)
 
 
+#: Attempts for :func:`_open_validated_lock` when only the change time moved.
+_LOCK_OPEN_ATTEMPTS = 3
+
+
 def _open_validated_lock(path: Path, *, label: str) -> int:
-    """Open a lock without following/blocking on special files or inode swaps."""
+    """Open a lock without following/blocking on special files or inode swaps.
+
+    macOS can advance ``st_ctime`` of an untouched file on its own (e.g. when
+    it attaches the ``com.apple.provenance`` extended attribute the first time
+    a new process opens it), which looks like a swap. Each retry repeats every
+    check from scratch, so a real swap still fails after the last attempt.
+    """
+    for attempt in range(_LOCK_OPEN_ATTEMPTS):
+        try:
+            return _open_validated_lock_once(path, label=label)
+        except KeyvaultPermissionError as exc:
+            if exc.errno != errno.EAGAIN or attempt == _LOCK_OPEN_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _open_validated_lock_once(path: Path, *, label: str) -> int:
     before = path.lstat()
     _validate_lock_stat(before, path, label=label, from_lstat=True)
     try:

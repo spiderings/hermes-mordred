@@ -69,7 +69,7 @@ def inject_vault_env(
     """
     from dotenv import dotenv_values
 
-    from . import vault
+    from . import anchor, vault
 
     key_id = anchor_label = vault_identity(root)
     backend, store = resolve_backend_store(backend, store)
@@ -78,16 +78,20 @@ def inject_vault_env(
     # on disk while the anchor is gone (vault.artifacts_present), that is
     # anomalous and we fail closed rather than silently no-op. A read *error*
     # (e.g. a locked Keychain) is likewise never swallowed: it propagates
-    # fail-closed, since we cannot prove the vault absent.
-    if store.read(anchor_label) is None:
+    # fail-closed, since we cannot prove the vault absent. The open's own anchor
+    # read doubles as the presence check (AnchorMissing is raised only when the
+    # item is absent), so a start reads the Keychain item once, not twice.
+    try:
+        opened = vault.open_vault(root, key_id=key_id, backend=backend, store=store, anchor_label=anchor_label)
+    except anchor.AnchorMissing as exc:
         if vault.artifacts_present(root):
             raise vault.VaultError(
                 f"vault artifacts present at {root} but the device anchor is missing "
                 "— refusing to start (possible anchor deletion)."
-            )
+            ) from exc
         return 0
 
-    with vault.open_vault(root, key_id=key_id, backend=backend, store=store, anchor_label=anchor_label) as opened:
+    with opened:
         if name not in opened.list_files():
             return 0
         plaintext = opened.read_file(name)

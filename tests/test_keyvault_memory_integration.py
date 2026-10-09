@@ -1,16 +1,21 @@
 """Integration: vault ``.env`` → env shim → usable ``HERMES_MEMORY_KEY``.
 
-Proves the at-rest vault composes with Hermes's built-in agent-memory encryption
-(upstream ``tools/memory_tool.py``, AES-256-GCM keyed by ``HERMES_MEMORY_KEY``):
+No Hermes release to date (verified through hermes-agent 0.20.0 and GitHub HEAD) implements agent-memory
+encryption — nothing upstream consumes ``HERMES_MEMORY_KEY`` today. This is
+**not** a test of Hermes's built-in agent-memory encryption; it proves the
+*intended* contract for a future Mordred-owned memory-encryption runtime
+(a Mordred-owned runtime tracked in docs/dev/TODO.md), which will be the actual consumer:
 
   vault-enrolled ``.env`` (``HERMES_MEMORY_KEY=...``)
     → ``_runtime_env.inject_vault_env`` lands it in ``os.environ`` at startup
-    → the value decodes to a 32-byte AES-256 key the memory encryptor accepts.
+    → the value decodes to a 32-byte AES-256 key a memory encryptor would accept.
 
-The memory encryptor itself is upstream; rather than import it (cross-package
-coupling), these tests reproduce its key contract — URL-safe base64, exactly 32
-bytes, AES-256-GCM with a filename-bound AAD — so the proof is self-contained and
-runs on any platform via the software fakes (real P-256 ECDH + in-memory anchor).
+The AES-256-GCM key format (URL-safe base64, exactly 32 bytes, with a
+filename-bound AAD) mirrors upstream ``tools/memory_tool.py``'s documented
+contract, reproduced here rather than imported (cross-package coupling; and
+that module does not exist upstream today) — so the proof is self-contained
+and runs on any platform via the software fakes (real P-256 ECDH + in-memory
+anchor).
 """
 
 from __future__ import annotations

@@ -332,8 +332,8 @@ def test_find_tpmkey_helper_path_lookup(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_find_winkey_helper_env_authoritative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    target = tmp_path / "win-helper"
-    target.write_text("#!/bin/sh\n")
+    target = tmp_path / "win-helper.exe"
+    target.write_bytes(b"MZ")
     monkeypatch.setenv("MORDRED_WINKEY_HELPER", str(target))
     assert find_winkey_helper() == str(target)
 
@@ -343,11 +343,15 @@ def test_find_winkey_helper_env_missing_returns_none(tmp_path: Path, monkeypatch
     assert find_winkey_helper() is None
 
 
-def test_find_winkey_helper_path_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_find_winkey_helper_path_lookup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mordred_hermes import _home
+
     monkeypatch.delenv("MORDRED_WINKEY_HELPER", raising=False)
-    monkeypatch.setattr(Path, "home", lambda: Path("/nonexistent-home"))
-    monkeypatch.setattr(_seckey_helper.shutil, "which", lambda name: "/opt/bin/" + name)
-    assert find_winkey_helper() == "/opt/bin/" + _WIN_HELPER_NAME
+    monkeypatch.setattr(_home, "hermes_home", lambda: tmp_path / "empty-home")
+    target = tmp_path / _WIN_HELPER_NAME
+    target.write_bytes(b"MZ")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert find_winkey_helper() == str(target)
 
 
 def test_find_sekey_and_legacy_find_helper_agree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

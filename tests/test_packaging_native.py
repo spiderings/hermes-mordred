@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -30,7 +31,7 @@ def _build_wheel(out_dir: Path, *, uv_cache_dir: Path) -> Path:
     if uv is None:
         pytest.skip("uv not available to build the wheel")
     proc = subprocess.run(
-        [uv, "build", "--wheel", "--out-dir", str(out_dir)],
+        [uv, "build", "--out-dir", str(out_dir)],
         cwd=_PKG_ROOT,
         capture_output=True,
         text=True,
@@ -43,11 +44,15 @@ def _build_wheel(out_dir: Path, *, uv_cache_dir: Path) -> Path:
 
 
 @pytest.fixture(scope="module")
-def wheel_names(tmp_path_factory: pytest.TempPathFactory) -> frozenset[str]:
-    """Build once with a test-owned cache and share the immutable manifest."""
+def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the wheel from the sdist once with a test-owned cache."""
     root = tmp_path_factory.mktemp("native-wheel")
-    wheel = _build_wheel(root / "dist", uv_cache_dir=root / "uv-cache")
-    with zipfile.ZipFile(wheel) as archive:
+    return _build_wheel(root / "dist", uv_cache_dir=root / "uv-cache")
+
+
+@pytest.fixture(scope="module")
+def wheel_names(built_wheel: Path) -> frozenset[str]:
+    with zipfile.ZipFile(built_wheel) as archive:
         return frozenset(archive.namelist())
 
 
@@ -78,3 +83,36 @@ def test_wheel_bundles_tpmkey_helper_sources(wheel_names: frozenset[str]) -> Non
 def test_wheel_excludes_rust_target_artifacts(wheel_names: frozenset[str]) -> None:
     names = wheel_names
     assert not any("tpmkey-helper/target/" in n for n in names), "Rust target/ artifacts must not ship in the wheel"
+
+
+def test_wheel_bundles_winkey_helper_sources(wheel_names: frozenset[str]) -> None:
+    prefix = "mordred_hermes/_native/winkey-helper/"
+    for name in (
+        "Cargo.toml",
+        "Cargo.lock",
+        "build.ps1",
+        "README.md",
+        "src/main.rs",
+        "src/cng.rs",
+        "src/key_lock.rs",
+        "tests/protocol.rs",
+        "tests/live_cng.rs",
+    ):
+        assert prefix + name in wheel_names
+    assert not any("winkey-helper/target/" in name for name in wheel_names)
+
+
+def test_sdist_bundles_winkey_sources_without_build_artifacts(built_wheel: Path) -> None:
+    archives = list(built_wheel.parent.glob("*.tar.gz"))
+    assert len(archives) == 1
+    with tarfile.open(archives[0]) as archive:
+        names = {name.partition("/")[2] for name in archive.getnames()}
+    for name in ("Cargo.toml", "Cargo.lock", "build.ps1", "README.md", "src/cng.rs", "tests/live_cng.rs"):
+        assert "native/winkey-helper/" + name in names
+    assert not any("/target/" in name for name in names)
+
+
+def test_sdist_ships_native_installer(built_wheel: Path) -> None:
+    with tarfile.open(next(built_wheel.parent.glob("*.tar.gz"))) as archive:
+        names = {name.partition("/")[2] for name in archive.getnames()}
+    assert "scripts/install.ps1" in names

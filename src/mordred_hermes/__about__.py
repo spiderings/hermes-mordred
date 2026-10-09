@@ -7,10 +7,10 @@
 # /src, /tests, /README.md, /pyproject.toml, /native, /packaging/pth
 # (see [tool.hatch.build.targets.sdist] in pyproject.toml); docs/ is excluded,
 # so a wheel built from that sdist can't see the docs-tree VERSION marker
-# (TODO 0.5 L64). Keeping the canonical value here is the
+# Keeping the canonical value here is the
 # build-isolation-safe resolution of that follow-up.
 #
 # Bump with `python tools/bump_version.py <new-version>`, which rewrites this
 # file, the docs VERSION marker, and every plugin.yaml in lockstep. The
 # consistency is pinned by tests/test_packaging_versions.py.
-__version__ = "0.1.0a16"
+__version__ = "0.2.0a1"

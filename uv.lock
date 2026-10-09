@@ -1401,6 +1401,7 @@ name = "hermes-mordred"
 source = { editable = "." }
 dependencies = [
     { name = "hermes-agent" },
+    { name = "psutil" },
     { name = "ruamel-yaml" },
 ]
 
@@ -1452,6 +1453,15 @@ macos = [
 messaging = [
     { name = "qrcode" },
 ]
+telegram = [
+    { name = "aiohttp" },
+    { name = "aiohttp-socks" },
+    { name = "cryptography" },
+    { name = "python-socks" },
+    { name = "requests", extra = ["socks"] },
+    { name = "telethon" },
+    { name = "urllib3" },
+]
 tor-control = [
     { name = "stem" },
 ]
@@ -1459,8 +1469,10 @@ tor-control = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'extension'", specifier = ">=3.9" },
+    { name = "aiohttp", marker = "extra == 'telegram'", specifier = ">=3.9" },
     { name = "aiohttp-socks", marker = "extra == 'extension'", specifier = ">=0.10" },
     { name = "aiohttp-socks", marker = "extra == 'integration'", specifier = ">=0.10" },
+    { name = "aiohttp-socks", marker = "extra == 'telegram'", specifier = ">=0.10" },
     { name = "anthropic", marker = "extra == 'integration'", specifier = ">=0.40" },
     { name = "argon2-cffi", marker = "extra == 'ethereum'", specifier = ">=23" },
     { name = "argon2-cffi", marker = "extra == 'keyvault'", specifier = ">=23" },
@@ -1473,6 +1485,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'extension'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'keyvault'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'macos'", specifier = ">=42" },
+    { name = "cryptography", marker = "extra == 'telegram'", specifier = ">=42" },
     { name = "eth-account", marker = "extra == 'ethereum'", specifier = ">=0.13" },
     { name = "eth-hash", extras = ["pycryptodome"], marker = "extra == 'ethereum'", specifier = ">=0.5" },
     { name = "eth-keys", marker = "extra == 'ethereum'", specifier = ">=0.6" },
@@ -1481,21 +1494,26 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], marker = "extra == 'integration'", specifier = ">=0.27" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==2.1.0" },
     { name = "openai", marker = "extra == 'integration'", specifier = ">=1.40" },
+    { name = "psutil", specifier = ">=7.2.2" },
     { name = "pyobjc-framework-quartz", marker = "extra == 'macos'", specifier = ">=10.0" },
     { name = "pyobjc-framework-security", marker = "extra == 'macos'", specifier = ">=10.0" },
     { name = "pyobjc-framework-systemconfiguration", marker = "extra == 'macos'", specifier = ">=10.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "python-socks", extras = ["asyncio"], marker = "extra == 'telegram'", specifier = ">=2.4" },
     { name = "qrcode", marker = "extra == 'messaging'", specifier = ">=7.4" },
     { name = "requests", extras = ["socks"], marker = "extra == 'extension'", specifier = ">=2.32" },
     { name = "requests", extras = ["socks"], marker = "extra == 'integration'", specifier = ">=2.32" },
+    { name = "requests", extras = ["socks"], marker = "extra == 'telegram'", specifier = ">=2.32" },
     { name = "rlp", marker = "extra == 'ethereum'", specifier = ">=4" },
     { name = "ruamel-yaml", specifier = ">=0.18" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.13" },
     { name = "stem", marker = "extra == 'tor-control'", specifier = ">=1.8.0,<2" },
+    { name = "telethon", marker = "extra == 'telegram'", specifier = ">=1.40,<2" },
     { name = "urllib3", marker = "extra == 'extension'", specifier = ">=2" },
+    { name = "urllib3", marker = "extra == 'telegram'", specifier = ">=2" },
 ]
-provides-extras = ["dev", "ethereum", "extension", "integration", "keyvault", "macos", "messaging", "tor-control"]
+provides-extras = ["dev", "ethereum", "extension", "integration", "keyvault", "macos", "messaging", "telegram", "tor-control"]
 
 [[package]]
 name = "hexbytes"
@@ -2383,6 +2401,12 @@ wheels = [
 ]
 
 [[package]]
+name = "pyaes"
+version = "1.6.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/66/2c17bae31c906613795711fc78045c285048168919ace2220daa372c7d72/pyaes-1.6.1.tar.gz", hash = "sha256:02c1b1405c38d3c370b085fb952dd8bea3fadcee6411ad99f312cc129c536d8f", size = 28536, upload-time = "2017-09-20T21:17:54.23Z" }
+
+[[package]]
 name = "pyasn1"
 version = "0.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -3005,6 +3029,18 @@ wheels = [
 ]
 
 [[package]]
+name = "rsa"
+version = "4.9.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyasn1" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/da/8a/22b7beea3ee0d44b1916c0c1cb0ee3af23b700b6da9f04991899d0c555d4/rsa-4.9.1.tar.gz", hash = "sha256:e7bdbfdb5497da4c07dfd35530e1a902659db6ff241e39d9953cad06ebd0ae75", size = 29034, upload-time = "2025-04-16T09:51:18.218Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/8d/0133e4eb4beed9e425d9a98ed6e081a55d195481b7632472be1af08d2f6b/rsa-4.9.1-py3-none-any.whl", hash = "sha256:68635866661c6836b8d39430f97a996acbd61bfa49406748ea243539fe239762", size = 34696, upload-time = "2025-04-16T09:51:17.142Z" },
+]
+
+[[package]]
 name = "ruamel-yaml"
 version = "0.18.17"
 source = { registry = "https://pypi.org/simple" }
@@ -3146,6 +3182,19 @@ name = "stem"
 version = "1.8.2"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/c6/b2258155546f966744e78b9862f62bd2b8671b422bb9951a1330e4c8fd73/stem-1.8.2.tar.gz", hash = "sha256:83fb19ffd4c9f82207c006051480389f80af221a7e4783000aedec4e384eb582", size = 2859640, upload-time = "2023-06-06T06:37:21.251Z" }
+
+[[package]]
+name = "telethon"
+version = "1.45.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyaes" },
+    { name = "rsa" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d5/07/b23b6cc73cd994763fbd641d196904f56cc966035eda841275b5689c6e5f/telethon-1.45.0.tar.gz", hash = "sha256:4cb7ae269b8ab9dad9fc490b859f0bc2f885121e990f5b20407b1faa0db2a1d9", size = 728057, upload-time = "2026-09-10T14:28:04.739Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/ac/241c09e6905215f225d8088438ceb1f32cc4b4865f3f49068cb402debfd7/telethon-1.45.0-py3-none-any.whl", hash = "sha256:339e24c83aedc9f12cbe389264627edc49779e4289c535aa90aafc4ce62f7972", size = 804098, upload-time = "2026-09-10T14:28:03.115Z" },
+]
 
 [[package]]
 name = "tenacity"

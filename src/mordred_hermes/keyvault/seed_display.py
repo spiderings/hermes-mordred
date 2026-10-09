@@ -1,7 +1,6 @@
 """mordred_keyvault.seed_display — Seed phrase display flow orchestrator.
 
-Phase 4 PR7. SPEC.md §Seed phrase display security + TODO.md §4.1
-L419-421.
+The current contract is documented in SPEC.md §Seed phrase display security.
 
 :func:`display_seed` runs the security-critical flow that puts a BIP39
 seed phrase on screen exactly once:

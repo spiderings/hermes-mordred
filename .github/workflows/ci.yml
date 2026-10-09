@@ -53,6 +53,114 @@ permissions:
   contents: read
 
 jobs:
+  windows-private-fs:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install scoped dependencies in an isolated venv
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -e ".[dev,keyvault,extension]" uv
+      - name: Bisect A5a wizard config portable
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >-
+          .\.venv\Scripts\python.exe .github/diag/run_bounded.py 300 -q -o addopts= -v -p no:cacheprovider tests/test_wizard_config_windows.py
+      - name: Bisect A5b wizard config native
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >-
+          .\.venv\Scripts\python.exe .github/diag/run_bounded.py 300 -q -o addopts= -v -p no:cacheprovider tests/test_wizard_config_native_windows.py
+      - name: Bisect B custody profile (bounded)
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >-
+          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=300 -v -p no:cacheprovider
+          tests/test_windows_custody_profile.py
+      - name: Bisect C custody
+        timeout-minutes: 10
+        continue-on-error: true
+        run: >-
+          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=300 -v -p no:cacheprovider
+          tests/test_windows_custody.py
+      - name: Build a wheel from the sdist and smoke outside the checkout
+        run: |
+          .\.venv\Scripts\uv.exe build --sdist --out-dir dist-private-fs
+          if ($LASTEXITCODE -ne 0) { throw 'sdist build failed' }
+          $source = (Get-ChildItem dist-private-fs/*.tar.gz).FullName
+          .\.venv\Scripts\uv.exe build --wheel $source --out-dir dist-private-fs
+          if ($LASTEXITCODE -ne 0) { throw 'wheel build failed' }
+          $wheel = (Get-ChildItem dist-private-fs/*.whl).FullName
+          # RUNNER_TEMP is on a broadly writable data volume; use the checked profile.
+          $smoke = Join-Path $env:USERPROFILE 'mordred-private-fs-wheel'
+          python -m venv "$smoke/venv"
+          & "$smoke/venv/Scripts/python.exe" -m pip install --no-deps $wheel
+          if ($LASTEXITCODE -ne 0) { throw 'wheel install failed' }
+          $env:PYTHONPATH = ''
+          @'
+          from pathlib import Path
+          import mordred_hermes
+          from mordred_hermes._private_fs import open_private_directory
+          from mordred_hermes.keyvault import extension_sign
+          assert 'site-packages' in Path(mordred_hermes.__file__).parts
+          with open_private_directory(Path.cwd() / 'private', create=True) as d, d.transaction() as tx:
+              tx.create_bytes('secret', b'old')
+              tx.replace_bytes('secret', b'new')
+              assert d.read_bytes('secret', max_bytes=3) == b'new'
+          extension_sign._ext_dir = lambda: Path.cwd() / 'wallet'
+          selection = {'kind': 'raw', 'key_id': 'synthetic', 'envelope_id': 'test'}
+          extension_sign.set_wallet(selection)
+          assert extension_sign._load_wallet_cfg() == selection
+          extension_sign.set_wallet(selection | {'envelope_id': 'replacement'})
+          assert extension_sign._load_wallet_cfg()['envelope_id'] == 'replacement'
+          from mordred_hermes._audit_io import audit_session, decode_audit_bytes
+          from mordred_hermes._log_rotation import rotate_audit
+          with audit_session(Path.cwd() / 'audit' / 'custom.log', create=True) as session:
+              session.create('custom.log', b'{}\n')
+              result = rotate_audit(session, '2026-10-08')
+              snapshot = session.snapshot(result.gzip_name, max_bytes=1024)
+          assert decode_audit_bytes(snapshot.data, max_output_bytes=3) == b'{}\n'
+          print(mordred_hermes.__file__)
+          '@ | Set-Content -LiteralPath "$smoke/check.py" -Encoding utf8
+          Set-Location $smoke
+          & "$smoke/venv/Scripts/python.exe" check.py
+          if ($LASTEXITCODE -ne 0) { throw 'private filesystem wheel smoke failed' }
+
+  # Scoped helper validation. Hosted runners do not establish real TPM support;
+  # live_cng remains ignored unless explicitly run on an isolated hardware host.
+  winkey-helper:
+    # VS 2022 keeps linker discovery compatible with the Rust 1.85 MSRV.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Install scoped Python dependencies
+        run: python -m pip install -e ".[dev,keyvault,extension]"
+      - name: Native formatting
+        run: cargo fmt --manifest-path native/winkey-helper/Cargo.toml --check
+      - name: Native lint
+        run: cargo clippy --manifest-path native/winkey-helper/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Native tests (hardware tests explicitly ignored)
+        run: cargo test --manifest-path native/winkey-helper/Cargo.toml --locked
+      - name: Install declared MSRV
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: MSRV tests
+        run: cargo +1.85.0 test --manifest-path native/winkey-helper/Cargo.toml --locked
+      - name: Windows discovery and real build/install tests
+        env:
+          MORDRED_WINKEY_BUILD_TEST: "1"
+        run: python -m pytest tests/test_keyvault_winkey_helper.py tests/test_winkey_build.py tests/integration/test_keyvault_windows.py -o addopts='' -q
+
   test:
     strategy:
       fail-fast: false
@@ -114,10 +222,10 @@ jobs:
 
       - name: pytest
         env:
-          # README.md's documented canonical test invocation always pins
-          # HERMES_HOME to an isolated path — without it, _home.py's
-          # module-level HERMES_BASE resolves against the runner's real
-          # $HOME/.hermes instead of a throwaway directory.
+          # Pinned to a known path on purpose. The root tests/conftest.py
+          # would isolate a bare run anyway (it defaults HERMES_HOME to a
+          # temp dir before _home.py freezes HERMES_BASE), but an explicit
+          # value keeps CI's home deterministic and easy to inspect.
           HERMES_HOME: /tmp/hermes-mordred-ci-home
         run: pytest -q --cov=mordred_hermes --cov-report=xml
 
@@ -144,10 +252,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install Ethereum, messaging, and Tor-control extras
+      - name: Install Ethereum, messaging, Tor-control, and Telegram extras
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,keyvault,extension,ethereum,messaging,tor-control]"
+          pip install -e ".[dev,keyvault,extension,ethereum,messaging,tor-control,telegram]"
 
       - name: Require and exercise every feature dependency
         run: |
@@ -161,6 +269,7 @@ jobs:
           import requests
           import rlp
           import socks
+          import telethon
           import urllib3
           from stem.control import Controller
 
@@ -173,6 +282,7 @@ jobs:
           assert socks.socksocket
           assert urllib3.HTTPSConnectionPool
           assert callable(Controller.from_port)
+          assert telethon.TelegramClient
 
           qr = qrcode.QRCode(border=1)
           qr.add_data("MORT-CI000000-CI000000")
@@ -195,7 +305,8 @@ jobs:
             tests/test_wizard_keyvault_eth_cli.py \
             tests/extension/test_extension_sign_tx.py \
             tests/test_paths_tor.py \
-            tests/test_wizard_extension_pair_cli.py
+            tests/test_wizard_extension_pair_cli.py \
+            tests/extension/test_telegram_import.py
 
   # Build by the same sdist -> wheel path used by release.yml, install that
   # wheel into a fresh venv outside the checkout, and smoke the public package
@@ -262,14 +373,7 @@ jobs:
               for ep in dist.entry_points
               if ep.group == "hermes_agent.plugins"
           }
-          expected_plugins = {
-              "mordred_e2e",
-              "mordred_keyvault",
-              "mordred_llm_guard",
-              "mordred_network",
-              "mordred_privacy_check",
-              "mordred_wizard",
-          }
+          expected_plugins = {"mordred"}
           assert set(plugin_eps) == expected_plugins
           for name, entry_point in plugin_eps.items():
               module = entry_point.load()
@@ -586,3 +690,22 @@ jobs:
           TCTI: swtpm:host=127.0.0.1,port=2321
           MORDRED_TPM_TEST: "1"
         run: cargo test --locked -- --test-threads=1
+
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build helper and validate Linux memory/Telegram against swtpm
+        working-directory: ${{ github.workspace }}
+        env:
+          TCTI: swtpm:host=127.0.0.1,port=2321
+          MORDRED_TPM_TEST: "1"
+          HERMES_HOME: /tmp/mordred-ci-telegram-home
+          MORDRED_LINUX_TELEGRAM_TEST: "1"
+          MORDRED_TPMKEY_HELPER: ${{ github.workspace }}/native/tpmkey-helper/target/debug/mordred-hermes-tpmkey
+        run: |
+          cargo build --locked --manifest-path native/tpmkey-helper/Cargo.toml
+          python -m venv .venv
+          .venv/bin/python -m pip install -e ".[dev,keyvault,extension,telegram]"
+          .venv/bin/python -m pytest -v -o addopts="" tests/integration/test_linux_telegram_tpm.py

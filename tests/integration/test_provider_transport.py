@@ -1,4 +1,4 @@
-"""Provider transport verification — TODO §0.8 L110-117.
+"""Provider transport verification.
 
 For each Hermes provider, verify empirically whether the SDK's HTTP
 transport honours a ``socks5h://`` proxy supplied through the standard

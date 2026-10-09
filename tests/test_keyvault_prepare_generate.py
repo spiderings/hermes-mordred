@@ -59,7 +59,7 @@ class TestPrepareGenerateSignature:
 class TestPrepareGenerateCanonicalVector:
     """ASCII canonical inputs reproduce SPEC.md §"Fixed test vector" digest.
 
-    The digest table at SPEC L355-362 is the regression anchor for the
+    The canonical digest vector in SPEC is the regression anchor for the
     whole compute_digest algorithm. Re-pinning the final digest at the
     api.py layer guards against silent normalization regressions that
     would only surface at recovery time.

@@ -13,7 +13,7 @@ Mullvad CLI is fully mocked — no real client install touched. Tests cover:
 - ``health`` parses ``wg show`` latest-handshake-age and accepts fresh handshakes
 - ``health`` rejects stale handshakes (> 180s default ceiling)
 
-See TODO §3.1 L305-313 for the operational contract this module implements.
+The operational contract is documented in SPEC.md §Plugin: `mordred_network`.
 """
 
 from __future__ import annotations

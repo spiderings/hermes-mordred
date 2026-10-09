@@ -17,6 +17,15 @@ from mordred_hermes.privacy_check import _runtime, hooks
 from mordred_hermes.privacy_check._exceptions import MordredIntegrityRefused
 
 
+@pytest.fixture(autouse=True)
+def _tool_egress_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests cover the legacy strict tool-name gate only; the tool-egress
+    levels have their own suite (test_privacy_check_egress.py)."""
+    from mordred_hermes.privacy_check import egress
+
+    monkeypatch.setattr(egress, "load_policy", lambda *a, **k: egress.EgressPolicy(level="off"))
+
+
 def _audit_entries(log_path: Path) -> list[dict[str, object]]:
     if not log_path.exists():
         return []
@@ -42,12 +51,7 @@ def strict_config(tmp_path: Path) -> Path:
         """\
 plugins:
   enabled:
-    - mordred_privacy_check
-    - mordred_wizard
-    - mordred_llm_guard
-    - mordred_network
-    - mordred_keyvault
-    - mordred_e2e
+    - mordred
   mordred_privacy_check:
     policy: strict
 """,
@@ -113,7 +117,7 @@ class TestOnSessionStartStrictAbort:
             )
             for name in _runtime.SIBLING_PLUGINS
         }
-        plugins["mordred_network"].error = "synthetic register failure"
+        plugins["mordred"].error = "synthetic register failure"
         manager = SimpleNamespace(_plugins=plugins)
 
         with pytest.raises(MordredIntegrityRefused):
@@ -136,7 +140,7 @@ class TestOnSessionStartStrictAbort:
             )
             for name in _runtime.SIBLING_PLUGINS
         }
-        plugins["mordred_llm_guard"].hooks_registered.remove("pre_api_request")
+        plugins["mordred"].hooks_registered.remove("pre_api_request")
 
         with pytest.raises(MordredIntegrityRefused):
             hooks.check_plugin_integrity(
@@ -148,8 +152,10 @@ class TestOnSessionStartStrictAbort:
             tmp_path / "config.yaml",
             """\
 plugins:
+  enabled:
+    - mordred
   disabled:
-    - mordred_network
+    - mordred
   mordred_privacy_check:
     policy: strict
 """,
@@ -163,7 +169,7 @@ plugins:
         block_entries = [e for e in entries if e.get("decision") == "block"]
         assert len(block_entries) == 1
         assert block_entries[0]["reason"] == "mordred.degraded.disable_unprotected"
-        assert "mordred_network" in block_entries[0]["disabled_siblings"]
+        assert block_entries[0]["disabled_siblings"] == ["mordred"]
         # Process is poisoned
         assert _runtime.is_poisoned()
 
@@ -180,8 +186,10 @@ plugins:
             tmp_path / "config.yaml",
             """\
 plugins:
+  enabled:
+    - mordred
   disabled:
-    - mordred_network
+    - mordred
   mordred_privacy_check:
     policy: strict
 """,
@@ -194,34 +202,16 @@ plugins:
             hooks.on_session_start()
         assert _runtime.is_poisoned()
 
-    def test_strict_with_enabled_allowlist_excluding_sibling_raises(self, tmp_path: Path) -> None:
-        """Opt-in allowlist that excludes a sibling counts as 'disabled'."""
+    def test_shared_integrity_hook_detects_disabled_mordred_plugin(self, tmp_path: Path) -> None:
+        """The integrity gate still refuses when the whole plugin is disabled."""
         config = _write_config(
             tmp_path / "config.yaml",
             """\
 plugins:
   enabled:
-    - mordred_privacy_check
-    - mordred_network
-    - mordred_llm_guard
-    - mordred_keyvault
-    # mordred_wizard intentionally absent
-  mordred_privacy_check:
-    policy: strict
-""",
-        )
-        _runtime.ensure_state(config_path=config, audit_path=tmp_path / "audit.log")
-        with pytest.raises(MordredIntegrityRefused):
-            hooks.on_session_start()
-
-    def test_shared_integrity_hook_detects_disabled_privacy_plugin(self, tmp_path: Path) -> None:
-        """Another runtime sibling still protects strict mode when privacy is disabled."""
-        config = _write_config(
-            tmp_path / "config.yaml",
-            """\
-plugins:
+    - mordred
   disabled:
-    - mordred_privacy_check
+    - mordred
   mordred_privacy_check:
     policy: strict
 """,
@@ -231,20 +221,107 @@ plugins:
             hooks.check_plugin_integrity()
         assert _runtime.is_poisoned()
 
-    def test_shared_integrity_hook_detects_disabled_e2e_plugin(self, tmp_path: Path) -> None:
+    def test_strict_with_only_legacy_plugin_names_raises_with_migration_hint(self, tmp_path: Path) -> None:
+        """An unmigrated config lists the pre-0.2.0a0 names, which Hermes no longer loads."""
         config = _write_config(
             tmp_path / "config.yaml",
             """\
 plugins:
-  disabled:
+  enabled:
+    - mordred_privacy_check
+    - mordred_network
+    - mordred_llm_guard
+    - mordred_keyvault
+    - mordred_wizard
     - mordred_e2e
   mordred_privacy_check:
     policy: strict
 """,
         )
         _runtime.ensure_state(config_path=config, audit_path=tmp_path / "audit.log")
-        with pytest.raises(MordredIntegrityRefused):
+        with pytest.raises(MordredIntegrityRefused, match="hermes-mordred plugins migrate"):
+            hooks.on_session_start()
+
+    def test_strict_with_allowlist_missing_mordred_raises(self, tmp_path: Path) -> None:
+        """Opt-in allowlist that excludes ``mordred`` counts as 'disabled'."""
+        config = _write_config(
+            tmp_path / "config.yaml",
+            """\
+plugins:
+  enabled:
+    - some_other_plugin
+  mordred_privacy_check:
+    policy: strict
+""",
+        )
+        _runtime.ensure_state(config_path=config, audit_path=tmp_path / "audit.log")
+        with pytest.raises(MordredIntegrityRefused) as excinfo:
             hooks.check_plugin_integrity()
+        assert "plugins migrate" not in str(excinfo.value)
+        assert _runtime.is_poisoned()
+
+    def test_legacy_disabled_name_alone_no_longer_disables_anything(self, tmp_path: Path) -> None:
+        """Hermes ignores the old per-component names; ``mordred`` enabled means loadable."""
+        config = _write_config(
+            tmp_path / "config.yaml",
+            """\
+plugins:
+  enabled:
+    - mordred
+  disabled:
+    - mordred_network
+  mordred_privacy_check:
+    policy: strict
+""",
+        )
+        _runtime.ensure_state(config_path=config, audit_path=tmp_path / "audit.log")
+        hooks.check_plugin_integrity()
+        assert not _runtime.is_poisoned()
+
+
+class TestComponentIntegrity:
+    """The single plugin reports a failed component like a failed sibling plugin used to be reported."""
+
+    def _manager(self, plugin_module: Any) -> SimpleNamespace:
+        loaded = SimpleNamespace(
+            enabled=True,
+            error=None,
+            module=plugin_module,
+            hooks_registered=sorted(_runtime.SIBLING_REQUIRED_HOOKS["mordred"]),
+        )
+        return SimpleNamespace(_plugins={"mordred": loaded})
+
+    def test_failed_component_is_refused_in_strict(
+        self, strict_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mordred_hermes import plugin
+
+        hooks_by_component = dict(plugin.COMPONENT_REQUIRED_HOOKS)
+        hooks_by_component.pop("network")
+        monkeypatch.setattr(plugin, "component_errors", lambda: {"network": "RuntimeError: boom"})
+        monkeypatch.setattr(plugin, "component_hooks", lambda: hooks_by_component)
+        _runtime.ensure_state(config_path=strict_config, audit_path=tmp_path / "audit.log")
+
+        with pytest.raises(MordredIntegrityRefused, match="mordred/network"):
+            hooks.check_plugin_integrity(plugin_manager=self._manager(plugin))
+
+    def test_component_missing_a_promised_hook_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mordred_hermes import plugin
+
+        hooks_by_component = dict(plugin.COMPONENT_REQUIRED_HOOKS)
+        hooks_by_component["keyvault"] = frozenset({"on_session_start"})
+        monkeypatch.setattr(plugin, "component_errors", dict)
+        monkeypatch.setattr(plugin, "component_hooks", lambda: hooks_by_component)
+
+        assert _runtime.find_unloaded_siblings(self._manager(plugin)) == {"mordred/keyvault"}
+
+    def test_complete_components_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mordred_hermes import plugin
+
+        monkeypatch.setattr(plugin, "component_errors", dict)
+        monkeypatch.setattr(plugin, "component_hooks", lambda: dict(plugin.COMPONENT_REQUIRED_HOOKS))
+
+        assert _runtime.find_unloaded_siblings(self._manager(plugin)) == set()
 
 
 class TestOnSessionStartLenientWithDisabled:
@@ -253,8 +330,10 @@ class TestOnSessionStartLenientWithDisabled:
             tmp_path / "config.yaml",
             """\
 plugins:
+  enabled:
+    - mordred
   disabled:
-    - mordred_network
+    - mordred
   mordred_privacy_check:
     policy: lenient
 """,
@@ -455,8 +534,10 @@ class TestAuditWriteFailureCannotBypassEnforcement:
             tmp_path / "config.yaml",
             """\
 plugins:
+  enabled:
+    - mordred
   disabled:
-    - mordred_network
+    - mordred
   mordred_privacy_check:
     policy: strict
 """,

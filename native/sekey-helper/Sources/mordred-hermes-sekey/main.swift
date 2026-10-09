@@ -16,6 +16,19 @@
 //   {"cmd":"delete","tag_hex":".."}
 //   {"cmd":"ecdh","tag_hex":"..","peer_pub_hex":".."}
 //   {"cmd":"probe"}
+//   {"cmd":"anchor_get","account":".."}
+//   {"cmd":"anchor_add","account":"..","value_hex":".."}
+//   {"cmd":"anchor_set","account":"..","value_hex":".."}
+//   {"cmd":"anchor_delete","account":".."}
+//
+// The anchor_* commands keep the vault's freshness anchor (a small non-secret
+// record) in a login-keychain generic-password item that THIS binary creates
+// and reads. A legacy keychain item trusts only the binary that created it;
+// when the Python interpreter wrote it, every other interpreter (a dev venv,
+// Hermes's managed Python, an upgraded Python) triggered a keychain password
+// dialog on each access. One helper binary serves every Python process, so the
+// item's ACL keeps matching. The service name is fixed below: the helper can
+// only address Mordred's own anchor items, never an arbitrary keychain item.
 //
 // "unattended" (generate only, default false): when false the key is created
 // with a Touch-ID/passcode-gated access control, so every ECDH prompts. When
@@ -24,7 +37,7 @@
 // the session is unlocked, for autonomous use. The choice is baked into the
 // key's dataRepresentation at generation time and cannot change afterward.
 // Success (stdout, exit 0):
-//   {"public_key_hex":"04.."}   {"shared_hex":".."}   {"ok":true}
+//   {"public_key_hex":"04.."}   {"shared_hex":".."}   {"ok":true}   {"value_hex":".."}
 // Failure (stdout, exit 1):
 //   {"error":{"domain":"OSStatus","status":-25300,"message":".."}}
 //
@@ -60,6 +73,8 @@ struct Request: Decodable {
     let label: String?
     let peer_pub_hex: String?
     let unattended: Bool?
+    let account: String?
+    let value_hex: String?
 }
 
 struct HelperError: Error {
@@ -558,6 +573,141 @@ func probe() throws {
     }
 }
 
+// MARK: - Vault anchor items (login keychain, owned by this binary)
+
+let anchorServiceBase = "mordred-hermes.vault.anchor.sekey"
+let anchorMaxValueBytes = 4096
+let anchorMaxAccountBytes = 128
+
+// MORDRED_SEKEY_ANCHOR_NAMESPACE (live tests only) appends ".<namespace>" to the
+// fixed service so a test never touches a real vault's anchor. It can only
+// narrow the helper to another Mordred-prefixed service, never widen it.
+func anchorService() throws -> String {
+    let env = ProcessInfo.processInfo.environment
+    guard let namespace = env["MORDRED_SEKEY_ANCHOR_NAMESPACE"], !namespace.isEmpty else {
+        return anchorServiceBase
+    }
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
+    guard namespace.utf8.count <= 32, namespace.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+        throw HelperError(domain: "helper", status: -1, message: "invalid MORDRED_SEKEY_ANCHOR_NAMESPACE")
+    }
+    return anchorServiceBase + "." + namespace
+}
+
+func requireAccount(_ req: Request) -> String {
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    guard let account = req.account, !account.isEmpty, account.utf8.count <= anchorMaxAccountBytes,
+          account.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+        fail("missing or invalid account")
+    }
+    return account
+}
+
+func requireAnchorValue(_ req: Request) -> Data {
+    guard let hex = req.value_hex, let value = hexDecode(hex), !value.isEmpty, value.count <= anchorMaxValueBytes else {
+        fail("missing or invalid value_hex")
+    }
+    return value
+}
+
+func keychainError(_ status: OSStatus, _ what: String) -> HelperError {
+    let detail = (SecCopyErrorMessageString(status, nil) as String?) ?? "OSStatus \(status)"
+    return HelperError(domain: "OSStatus", status: Int(status), message: "\(what): \(detail)")
+}
+
+// The legacy (file-based) login keychain, like the former in-process Python
+// path: the data-protection keychain would need the keychain-access-groups
+// entitlement, which an ad-hoc-signed binary cannot carry.
+func anchorQuery(account: String) throws -> [String: Any] {
+    [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: try anchorService(),
+        kSecAttrAccount as String: account,
+    ]
+}
+
+func anchorGet(account: String) throws -> Data {
+    var query = try anchorQuery(account: account)
+    query[kSecReturnData as String] = true
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecItemNotFound {
+        throw HelperError(domain: "OSStatus", status: errItemNotFound, message: "no anchor item")
+    }
+    guard status == errSecSuccess else {
+        throw keychainError(status, "SecItemCopyMatching failed")
+    }
+    guard let data = result as? Data else {
+        // Success without data would read as a present-but-empty anchor.
+        throw HelperError(domain: "helper", status: -1, message: "SecItemCopyMatching returned no data")
+    }
+    return data
+}
+
+func anchorAdd(account: String, value: Data) throws -> OSStatus {
+    var attrs = try anchorQuery(account: account)
+    attrs[kSecValueData as String] = value
+    // ThisDeviceOnly: never synced or migrated to another device; the anchor's
+    // whole point is a pin that an imaged / stolen disk cannot carry along.
+    attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    attrs[kSecAttrLabel as String] = "Mordred vault anchor"
+    return SecItemAdd(attrs as CFDictionary, nil)
+}
+
+// Add only: a duplicate is reported, never overwritten (used by migration, so
+// a concurrent writer's newer pin cannot be rolled back).
+func anchorAddOnly(account: String, value: Data) throws {
+    let status = try anchorAdd(account: account, value: value)
+    if status == errSecDuplicateItem {
+        throw HelperError(domain: "OSStatus", status: errDuplicateItem, message: "anchor item already exists")
+    }
+    guard status == errSecSuccess else {
+        throw keychainError(status, "SecItemAdd failed")
+    }
+}
+
+func anchorUpdate(account: String, value: Data) throws -> OSStatus {
+    // Re-assert ThisDeviceOnly on every update so it can never be inherited as
+    // something weaker from an older item.
+    let update: [String: Any] = [
+        kSecValueData as String: value,
+        kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+    ]
+    return SecItemUpdate(try anchorQuery(account: account) as CFDictionary, update as CFDictionary)
+}
+
+// Upsert, update first: every vault commit rewrites an anchor that already
+// exists, so that is one keychain access; only a vault's first pin falls
+// through to the add (and a lost add race updates the winner's item).
+func anchorSet(account: String, value: Data) throws {
+    let updated = try anchorUpdate(account: account, value: value)
+    if updated == errSecSuccess {
+        return
+    }
+    guard updated == errSecItemNotFound else {
+        throw keychainError(updated, "SecItemUpdate failed")
+    }
+    let added = try anchorAdd(account: account, value: value)
+    if added == errSecSuccess {
+        return
+    }
+    guard added == errSecDuplicateItem else {
+        throw keychainError(added, "SecItemAdd failed")
+    }
+    let retried = try anchorUpdate(account: account, value: value)
+    guard retried == errSecSuccess else {
+        throw keychainError(retried, "SecItemUpdate failed")
+    }
+}
+
+func anchorDelete(account: String) throws {
+    let status = SecItemDelete(try anchorQuery(account: account) as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw keychainError(status, "SecItemDelete failed")
+    }
+}
+
 // MARK: - Output
 
 func emit(_ obj: [String: Any]) {
@@ -607,6 +757,17 @@ do {
         emit(["shared_hex": hexEncode(try ecdh(tagHex: requireTagHex(request), peerPub: peer))])
     case "probe":
         try probe()
+        emit(["ok": true])
+    case "anchor_get":
+        emit(["value_hex": hexEncode(try anchorGet(account: requireAccount(request)))])
+    case "anchor_add":
+        try anchorAddOnly(account: requireAccount(request), value: requireAnchorValue(request))
+        emit(["ok": true])
+    case "anchor_set":
+        try anchorSet(account: requireAccount(request), value: requireAnchorValue(request))
+        emit(["ok": true])
+    case "anchor_delete":
+        try anchorDelete(account: requireAccount(request))
         emit(["ok": true])
     default:
         fail("unknown cmd: \(request.cmd)")

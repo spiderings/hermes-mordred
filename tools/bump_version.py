@@ -7,8 +7,6 @@ release version also appears in surfaces that are not auto-derived from it:
 
   - src/mordred_hermes/__about__.py    (__version__ — the canonical source)
   - docs/dev/VERSION                 (docs-tree marker; a human mirror)
-  - src/mordred_hermes/*/plugin.yaml    (each plugin manifest's ``version:``)
-  - README.md                        (status line + every install pin)
   - docs/dev/setup.md                (the ``--reinstall`` install pin)
   - packaging/mordred-hermes-compat/pyproject.toml
                                       (shim version + exact forwarded deps)
@@ -38,25 +36,15 @@ from packaging.version import InvalidVersion, Version
 _PKG_ROOT = Path(__file__).resolve().parent.parent
 _ABOUT = _PKG_ROOT / "src" / "mordred_hermes" / "__about__.py"
 _DOC_VERSION = _PKG_ROOT / "docs" / "dev" / "VERSION"
-_README = _PKG_ROOT / "README.md"
 _SETUP_MD = _PKG_ROOT / "docs" / "dev" / "setup.md"
 _COMPAT_PYPROJECT = _PKG_ROOT / "packaging" / "mordred-hermes-compat" / "pyproject.toml"
 
 _ABOUT_VALUE_RE = re.compile(r"""(?m)^__version__\s*=\s*["']([^"']+)["']\s*$""")
 _ABOUT_LINE_RE = re.compile(r"""(?m)^__version__\s*=\s*["'][^"']+["'][^\n]*$""")
-_MANIFEST_LINE_RE = re.compile(r"(?m)^version:[^\n]*$")
-#: `hermes-mordred[extra1,extra2]==<version>` copy-paste install pins. The
-#: version must start with a digit, which deliberately excludes README's
-#: `==<new-version>` Upgrading-section placeholders — those are prose, not a
-#: pin to rewrite.
+#: `hermes-mordred[extra1,extra2]==<version>` copy-paste install pins.
 _INSTALL_PIN_RE = re.compile(r"(hermes-mordred\[[^\]]*\]==)[0-9][^\s\"']*")
-_README_STATUS_RE = re.compile(r"(current release `)[^`]+(`)")
 _COMPAT_VERSION_RE = re.compile(r"""(?m)^version\s*=\s*["'][^"']+["']\s*$""")
 _COMPAT_REQUIREMENT_RE = re.compile(r"(hermes-mordred(?:\[[^\]]+\])?==)[0-9][^\s\"']*")
-
-
-def _plugin_manifests() -> list[Path]:
-    return sorted(_PKG_ROOT.glob("src/mordred_hermes/*/plugin.yaml"))
 
 
 def _current_version() -> str:
@@ -128,10 +116,6 @@ def main(argv: list[str] | None = None) -> int:
         targets.append((_DOC_VERSION, re.compile(r"(?s).*"), f"{new_str}\n", 1))
     else:
         print(f"warning: docs marker {_DOC_VERSION} absent — skipping", file=sys.stderr)
-    for manifest in _plugin_manifests():
-        targets.append((manifest, _MANIFEST_LINE_RE, f"version: {new_str}", 1))
-    targets.append((_README, _README_STATUS_RE, lambda m: f"{m.group(1)}{new_str}{m.group(2)}", 1))
-    targets.append((_README, _INSTALL_PIN_RE, lambda m: f"{m.group(1)}{new_str}", 0))
     if _SETUP_MD.exists():
         targets.append((_SETUP_MD, _INSTALL_PIN_RE, lambda m: f"{m.group(1)}{new_str}", 0))
     else:

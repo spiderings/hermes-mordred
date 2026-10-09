@@ -52,8 +52,15 @@ trap 'exit 143' TERM
 # Resolve output directory before building (--show-bin-path exits immediately).
 BIN_DIR="$(swift build -c release --show-bin-path)"
 
-echo "==> swift build -c release"
-swift build -c release
+# `-Xlinker -S` drops the linker's debug map (N_OSO stabs carrying absolute
+# object-file paths and mtimes). Without it the binary -- and so its ad-hoc
+# code hash -- changes with the checkout / site-packages path and the build
+# time. The login-keychain item that stores the vault anchor trusts the helper
+# by that code hash, so a hash that changes on every reinstall would bring the
+# keychain password dialog back once per reinstall. With it, the same source and
+# toolchain always produce the same binary.
+echo "==> swift build -c release (reproducible: no debug map)"
+swift build -c release -Xlinker -S
 
 BUILT_BIN="$BIN_DIR/$BINARY_NAME"
 if [[ ! -f "$BUILT_BIN" ]]; then

@@ -7,8 +7,8 @@ name = "hermes-mordred"
 # Version is sourced dynamically from src/mordred_hermes/__about__.py (see
 # [tool.hatch.version] below) rather than hardcoded here. The single source
 # of truth lives inside the importable package so sdist->wheel builds — which
-# run in an isolated dir without the repo's docs tree — can still resolve it
-# (TODO 0.5 L64). Bump everything in lockstep via `tools/bump_version.py`.
+# run in an isolated dir without the repo's docs tree — can still resolve it.
+# Bump everything in lockstep via `tools/bump_version.py`.
 dynamic = ["version"]
 description = "Privacy-preserving plugin bundle for the Hermes agent (NousResearch/hermes-agent)"
 readme = "README.md"
@@ -26,6 +26,7 @@ dependencies = [
   # suite minus the two latest-tracking drift detectors (see ci.yml).
   "hermes-agent>=0.13.0",
   "ruamel.yaml>=0.18",
+  "psutil>=7.2.2",
 ]
 
 [project.optional-dependencies]
@@ -102,8 +103,17 @@ messaging = [
 tor-control = [
   "stem>=1.8.0,<2",
 ]
-# TODO §0.8 L110-122: real-traffic SOCKS5h library + provider transport
-# verification. Heavy and optional — only the `integration-tor` CI job
+# Read-only Telegram import for the extension server
+# (mordred_hermes.extension.telegram). Telethon speaks MTProto as a user
+# client; python-socks gives it the explicit Tor/proxy route. Optional because
+# only operators who import their own Telegram account need it.
+telegram = [
+  "hermes-mordred[extension]",
+  "telethon>=1.40,<2",
+  "python-socks[asyncio]>=2.4",
+]
+# Real-traffic SOCKS5h library and provider-transport verification dependencies.
+# Heavy and optional — only the `integration-tor` CI job
 # and operators running `pytest -m integration` need it. The SOCKS
 # client libraries back `tests/integration/test_socks5h_libs.py`; the
 # provider SDKs back `test_provider_transport.py` and are
@@ -132,16 +142,17 @@ dev = [
   "mypy==2.1.0",
 ]
 
-# Entry points point at the MODULE (not module:register). Hermes loader
-# (hermes_cli/plugins.py:_load_entrypoint_module) calls ep.load() and then
-# getattr(module, "register"), so module-only is what works in practice.
+# One plugin, `mordred`. mordred_hermes.plugin.register() wires every
+# component (keyvault, llm_guard, network, privacy_check, e2e, wizard) in a
+# fixed order. Releases up to 0.1.0a20 shipped six entry points
+# (mordred_network, mordred_privacy_check, ...); config writers migrate those
+# names in plugins.enabled/disabled (mordred_hermes._plugin_identity).
+# Hermes builds entry-point manifests from the entry-point name plus the
+# distribution's version and Summary; it never reads a plugin.yaml for them.
+# The entry point names the MODULE (not module:register): the Hermes loader
+# calls ep.load() and then getattr(module, "register").
 [project.entry-points."hermes_agent.plugins"]
-mordred_network = "mordred_hermes.network"
-mordred_privacy_check = "mordred_hermes.privacy_check"
-mordred_llm_guard = "mordred_hermes.llm_guard"
-mordred_keyvault = "mordred_hermes.keyvault"
-mordred_wizard = "mordred_hermes.wizard"
-mordred_e2e = "mordred_hermes.extension.gateway_plugin"
+mordred = "mordred_hermes.plugin"
 
 # Standalone console script -- `hermes-mordred ...` always works.
 # Historically it was the ONLY form: Hermes did not iterate
@@ -161,15 +172,15 @@ mordred_e2e = "mordred_hermes.extension.gateway_plugin"
 # Keep this console_script regardless: the dependency floor is
 # hermes-agent>=0.13.0, and on 0.13.0-0.18.x the registered host subcommand
 # still falls through to top-level usage. The console script is also the only
-# form available before `configure` enables the plugins in
+# form available before `configure` enables the plugin in
 # ~/.hermes/config.yaml, since the subcommand is registered by the
-# mordred_wizard plugin.
+# `mordred` plugin's wizard component.
 [project.scripts]
 hermes-mordred = "mordred_hermes.wizard.cli:main"
 
 [project.urls]
-Documentation = "https://github.com/InternetMaximalism/hermes-mordred/tree/main/docs"
-Source = "https://github.com/InternetMaximalism/hermes-mordred"
+Documentation = "https://github.com/mordredagent/hermes-mordred/tree/main/docs"
+Source = "https://github.com/mordredagent/hermes-mordred"
 
 [tool.mordred]
 min-hermes-version = "0.13.0"
@@ -203,6 +214,12 @@ packages = ["src/mordred_hermes"]
 "native/tpmkey-helper/Cargo.lock" = "mordred_hermes/_native/tpmkey-helper/Cargo.lock"
 "native/tpmkey-helper/src" = "mordred_hermes/_native/tpmkey-helper/src"
 "native/tpmkey-helper/README.md" = "mordred_hermes/_native/tpmkey-helper/README.md"
+"native/winkey-helper/build.ps1" = "mordred_hermes/_native/winkey-helper/build.ps1"
+"native/winkey-helper/Cargo.toml" = "mordred_hermes/_native/winkey-helper/Cargo.toml"
+"native/winkey-helper/Cargo.lock" = "mordred_hermes/_native/winkey-helper/Cargo.lock"
+"native/winkey-helper/src" = "mordred_hermes/_native/winkey-helper/src"
+"native/winkey-helper/tests" = "mordred_hermes/_native/winkey-helper/tests"
+"native/winkey-helper/README.md" = "mordred_hermes/_native/winkey-helper/README.md"
 # config.yaml at-rest transparent decrypt (ROADMAP v2-F8). The .pth lands at the
 # site-packages root and runs a cheap inline guard at every interpreter start;
 # only a Hermes invocation (or MORDRED_CONFIG_DECRYPT=1) imports _pth_bootstrap.
@@ -236,6 +253,7 @@ include = ["/src", "/tests", "/README.md", "/LICENSE", "/pyproject.toml", "/nati
 # hit this, but exclude them explicitly so local and CI sdists are identical.
 exclude = [
   "native/tpmkey-helper/target",
+  "native/winkey-helper/target",
   "native/sekey-helper/.build",
   # Dev-era PoC harnesses for the extension plugin; their behavior is
   # mirrored by tests/extension/, so downstream builds don't need them.
@@ -251,6 +269,7 @@ testpaths = ["tests"]
 addopts = "-q --strict-markers -m 'not integration'"
 markers = [
     "integration: requires external services, live network, or device hardware; excluded from default runs",
+    "memory_plain: run without the autouse 'agent memory is encrypted' stub (Telegram guard tests)",
 ]
 xfail_strict = true
 
@@ -340,6 +359,8 @@ follow_imports = "skip"
 # Treat all as untyped so `mypy --strict src` resolves cross-platform.
 [[tool.mypy.overrides]]
 module = [
+    "psutil",
+    "psutil.*",
     "eth_keys",
     "eth_keys.*",
     "eth_account",
@@ -370,6 +391,10 @@ module = [
     # locally and in CI without an environment-dependent ignore at the call site.
     "stem",
     "stem.*",
+    # telethon lives in the optional `telegram` extra and ships no py.typed;
+    # extension/telegram/client.py imports it lazily.
+    "telethon",
+    "telethon.*",
 ]
 ignore_missing_imports = true
 

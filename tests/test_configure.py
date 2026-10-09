@@ -36,6 +36,8 @@ from mordred_hermes.wizard.configure import (
 )
 from mordred_hermes.wizard.policy_writer import PolicySnapshot, PolicyWriter
 
+from ._helpers import _writer
+
 # -----------------------------------------------------------------------------
 # Test doubles.
 # -----------------------------------------------------------------------------
@@ -93,14 +95,6 @@ class _SetupRunnerSpy:
         return self.returncode
 
 
-def _writer(tmp_path: Path) -> PolicyWriter:
-    return PolicyWriter(
-        config_path=tmp_path / "config.yaml",
-        policy_json_path=tmp_path / "mordred" / "policy.json",
-        mordred_dir=tmp_path / "mordred",
-    )
-
-
 # The core prompts collected by ``configure`` after the network split.
 # Order: policy, allow_cloud_llm, [allowlist], local endpoint, local model,
 # cloud attempt action, agent harness. The allowlist prompt (a checkbox
@@ -129,6 +123,27 @@ def _core_answers(
 
 
 class TestCollectAnswers:
+    def test_lenient_explains_that_remaining_prompts_can_keep_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        messages: list[str] = []
+        monkeypatch.setattr(configure, "_emit_prompt_help", messages.append)
+
+        collect_answers(_ScriptedPromptIO(answers=_core_answers(policy="lenient")))
+
+        assert messages == [configure._LENIENT_MODE_NOTE]
+        note = messages[0].lower()
+        assert "strict mode" in note
+        assert "enter" in note
+        assert "defaults" in note
+
+    @pytest.mark.parametrize("policy", ["strict", "off"])
+    def test_non_lenient_modes_do_not_show_lenient_note(self, policy: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        messages: list[str] = []
+        monkeypatch.setattr(configure, "_emit_prompt_help", messages.append)
+
+        collect_answers(_ScriptedPromptIO(answers=_core_answers(policy=policy)))
+
+        assert messages == []
+
     def test_strict_with_anthropic_allowlist(self) -> None:
         prompts = _ScriptedPromptIO(
             answers=_core_answers(

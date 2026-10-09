@@ -10,10 +10,14 @@ single-sources what used to be near-verbatim duplicated across
   byte-identical to ``keyvault.log_encryption``'s pre-refactor inline
   collision loop across a table of existing-file scenarios.
 * :func:`sweep_retention` -- age-based deletion of rotated siblings.
+* :func:`rotate_and_compress` -- the whole rotate-then-gzip-then-sweep body,
+  which ``privacy_check.audit`` and ``keyvault.log_encryption`` carried
+  byte-for-byte identical copies of apart from the logger they warned on.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -21,7 +25,13 @@ from pathlib import Path
 
 import pytest
 
-from mordred_hermes._log_rotation import next_rotation_target, sweep_retention, today_utc_date, utcnow_iso
+from mordred_hermes._log_rotation import (
+    next_rotation_target,
+    rotate_and_compress,
+    sweep_retention,
+    today_utc_date,
+    utcnow_iso,
+)
 
 _ISO_MS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -203,3 +213,87 @@ def test_sweep_retention_tolerates_file_removed_between_iterdir_and_stat(tmp_pat
     # The file itself was never actually removed by the sweep (only its
     # stat() was intercepted), so it is still present afterward.
     assert victim.exists()
+
+
+# --------------------------------------------------------------------------- #
+# rotate_and_compress -- the shared rotate/gzip/sweep body                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_rotate_and_compress_gzips_aside_and_leaves_the_active_path_free(tmp_path: Path) -> None:
+    log = tmp_path / "audit.log"
+    log.write_bytes(b'{"ts":"x"}\n')
+
+    rotate_and_compress(log, "2026-05-16", retention_days=30, log=logging.getLogger("test.rotate"))
+
+    assert not log.exists()
+    assert (tmp_path / "audit.log.2026-05-16.gz").is_file()
+    assert not (tmp_path / "audit.log.2026-05-16").exists()
+
+
+def test_rotate_and_compress_is_a_no_op_when_there_is_nothing_to_rotate(tmp_path: Path) -> None:
+    rotate_and_compress(tmp_path / "audit.log", "2026-05-16", retention_days=30, log=logging.getLogger("test.rotate"))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_rotate_and_compress_sweeps_expired_siblings(tmp_path: Path) -> None:
+    log = tmp_path / "audit.log"
+    log.write_bytes(b"active\n")
+    stale = tmp_path / "audit.log.2020-01-01.gz"
+    stale.write_bytes(b"old")
+    old = (datetime.now(UTC) - timedelta(days=99)).timestamp()
+    os.utime(stale, (old, old))
+
+    rotate_and_compress(log, "2026-05-16", retention_days=30, log=logging.getLogger("test.rotate"))
+
+    assert not stale.exists()
+    assert (tmp_path / "audit.log.2026-05-16.gz").is_file()
+
+
+def test_rotate_and_compress_keeps_the_raw_file_and_warns_on_the_callers_logger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A gzip failure loses nothing, and the warning carries the *caller's* logger.
+
+    The logger is the one thing the two former copies did not share
+    (``mordred.privacy_check.audit`` vs ``mordred.keyvault.log_encryption``), so
+    it must stay caller-supplied rather than becoming this module's own.
+    """
+    from mordred_hermes import _log_rotation
+
+    def failing_gzip(source: Path, target: Path) -> None:
+        raise OSError("gzip exploded")
+
+    monkeypatch.setattr(_log_rotation, "compress_rotated_file", failing_gzip)
+
+    log = tmp_path / "audit.log"
+    log.write_bytes(b"payload\n")
+
+    with caplog.at_level(logging.WARNING, logger="test.caller.logger"):
+        rotate_and_compress(log, "2026-05-16", retention_days=30, log=logging.getLogger("test.caller.logger"))
+
+    assert [record.name for record in caplog.records] == ["test.caller.logger"]
+    assert "audit gzip rotation failed" in caplog.text
+    # The rotated content survived un-gzipped -- nothing was lost.
+    assert (tmp_path / "audit.log.2026-05-16").read_bytes() == b"payload\n"
+
+
+def test_rotate_and_compress_fails_closed_when_the_path_is_swapped_mid_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The inode re-check is what stops a fresh active file landing on a foreign inode."""
+    log = tmp_path / "audit.log"
+    log.write_bytes(b"payload\n")
+    impostor = tmp_path / "impostor"
+    impostor.write_bytes(b"not ours\n")
+
+    real_replace = os.replace
+
+    def replace_then_swap(src: object, dst: object) -> None:
+        real_replace(src, dst)  # type: ignore[arg-type]
+        real_replace(impostor, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", replace_then_swap)
+
+    with pytest.raises(OSError, match="audit path changed during rotation"):
+        rotate_and_compress(log, "2026-05-16", retention_days=30, log=logging.getLogger("test.rotate"))

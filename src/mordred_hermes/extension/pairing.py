@@ -40,18 +40,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, TypeGuard, cast
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover — non-POSIX platform
-    fcntl = None  # type: ignore[assignment]
+from typing import Any, Final, NoReturn, TypeGuard, cast
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
+from .._file_lock import private_flock
 from ..keyvault._storage import atomic_write, safe_read
 from . import webauthn as _webauthn
 from .crypto import b64u_decode, b64u_encode, derive_shared_key, x25519_public_raw
@@ -186,9 +182,6 @@ _E2E_REPLAY_WARN_THRESHOLD = (_E2E_REPLAY_MAX_IDENTITIES * 9) // 10
 _LOG = logging.getLogger("mordred.extension.pairing")
 _PAIRING_CODE_DIGEST_FIELD = "paired_code_sha256"
 _STATE_THREAD_LOCK = threading.RLock()
-_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class PairError(Exception):
@@ -271,6 +264,17 @@ def _read_json_strict(path: Path, purpose: str) -> dict[str, Any]:
     return data
 
 
+def _reject_unsafe_state_lock(_lock_path: Path) -> NoReturn:
+    """Fail closed when ``.lock`` is not a private regular file.
+
+    Kept in this module (rather than inside ``private_flock``) so the raised
+    exception stays byte-identical: a single-argument :exc:`OSError` with no
+    ``errno``, unlike the ``EPERM``-tagged three-argument form the wizard
+    writers raise.
+    """
+    raise OSError("extension state lock must be a mode-0600 regular file")
+
+
 @contextlib.contextmanager
 def _state_lock() -> Iterator[None]:
     """Cross-process mutex for read-modify-write cycles on the JSON stores.
@@ -281,27 +285,16 @@ def _state_lock() -> Iterator[None]:
     both consume the same one-time code. Locked sections must stay synchronous
     (no awaits): callers run on the gateway's event loop and rely on the lock
     being held only for a quick file round-trip.
+
+    The descriptor lifecycle (private ``O_NOFOLLOW`` open, mode-0600 assertion
+    on the opened inode, ``flock`` / unlock / close ordering) is
+    :func:`mordred_hermes._file_lock.private_flock`; ``_ext_dir()`` still owns
+    creating and validating the parent directory, and the raise in
+    :func:`_reject_unsafe_state_lock` still happens in this module so its
+    exact one-argument :exc:`OSError` is unchanged.
     """
-    with _STATE_THREAD_LOCK:
-        lock_path = _ext_dir() / ".lock"
-        fd = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | _O_CLOEXEC | _O_NOFOLLOW | _O_NONBLOCK,
-            0o600,
-        )
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-                raise OSError("extension state lock must be a mode-0600 regular file")
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+    with _STATE_THREAD_LOCK, private_flock(_ext_dir() / ".lock", on_unsafe=_reject_unsafe_state_lock):
+        yield
 
 
 # --------------------------------------------------------------------------- #

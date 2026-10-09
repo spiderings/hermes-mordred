@@ -39,8 +39,8 @@ swaps, B2 unattended SE):
   anchor's pinned counter and reject a rewind. (An *in-place* generation
   edit without re-MACing is caught here, by the MAC.)
 
-Like its keyvault crypto siblings it imports :mod:`cryptography` (through
-``.kek``) and is only importable where the ``[macos]`` extra is installed.
+It imports :mod:`cryptography` through ``.kek`` from the cross-platform
+``keyvault`` extra; the codec itself has no platform dependency.
 """
 
 from __future__ import annotations

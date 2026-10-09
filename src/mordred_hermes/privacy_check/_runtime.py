@@ -26,39 +26,36 @@ from typing import Any, Final, cast
 
 from .._audit_support import build_audit_writer
 from .._home import HERMES_BASE, hermes_home
+from .._plugin_identity import LEGACY_PLUGIN_NAMES, PLUGIN_NAME
 from .._policy_io import (
     policy_transaction_marker_for_config,
     policy_transaction_pending,
 )
 from .._policy_types import POLICY_MODES
 from .._yaml_io import load_plugin_section, load_yaml_mapping
+from ..plugin import COMPONENT_REQUIRED_HOOKS, COMPONENTS
 from .audit import Writer
 from .policy import PolicyMode
 
 _LOG = logging.getLogger("mordred.privacy_check")
 
-SIBLING_PLUGINS: Final = (
-    "mordred_privacy_check",
-    "mordred_network",
-    "mordred_llm_guard",
-    "mordred_keyvault",
-    "mordred_e2e",
-    "mordred_wizard",
-)
+# Mordred is one Hermes plugin (``mordred``, :mod:`mordred_hermes.plugin`).
+# The name "siblings" survives from the six-plugin layout; the gate now checks
+# that plugin plus each of its components (reported as ``mordred/<component>``).
+SIBLING_PLUGINS: Final = (PLUGIN_NAME,)
 
-# Minimum runtime surface each sibling promises. ``hooks_registered`` is
-# populated by Hermes only after register() returns successfully, so checking
-# it catches both swallowed registration errors and partial/upstream-drifted
-# registrations. The wizard is CLI-only and therefore has no hook requirement;
-# it still must be loaded and error-free.
+# Minimum runtime surface the plugin promises: the union of its components'
+# hooks. ``hooks_registered`` is populated by Hermes only after register()
+# returns successfully, so checking it catches both swallowed registration
+# errors and partial/upstream-drifted registrations. Per-component coverage is
+# checked separately against the plugin's own record (see
+# :func:`_unloaded_components`), because one component's hook would otherwise
+# mask another's missing one.
 SIBLING_REQUIRED_HOOKS: Final[dict[str, frozenset[str]]] = {
-    "mordred_privacy_check": frozenset({"on_session_start", "pre_tool_call"}),
-    "mordred_network": frozenset({"on_session_start", "on_session_end", "pre_api_request", "pre_tool_call"}),
-    "mordred_llm_guard": frozenset({"on_session_start", "pre_api_request"}),
-    "mordred_keyvault": frozenset({"on_session_start", "on_session_end"}),
-    "mordred_e2e": frozenset({"on_session_start", "pre_gateway_dispatch"}),
-    "mordred_wizard": frozenset(),
+    PLUGIN_NAME: frozenset().union(*COMPONENT_REQUIRED_HOOKS.values()),
 }
+
+_PLUGIN_MODULE: Final = "mordred_hermes.plugin"
 
 # Backwards-compat aliases — pre-Phase-1.3 code (and in-module uses below)
 # read these names directly. The resolver itself was promoted to
@@ -301,8 +298,8 @@ def _load_state(config_path: Path, audit_path_override: Path | None) -> PluginSt
     audit_path = audit_path_override
     if audit_path is None:
         audit_path = _resolve_audit_path(section.get("audit_log_path"))
-    # L465: encrypt the audit log once the keyvault is initialized. The
-    # factory fails open to plaintext NDJSON. keyvault_home is the Hermes
+    # Encrypt the audit log once the keyvault is initialized. The factory
+    # fails open to plaintext NDJSON. keyvault_home is the Hermes
     # home — the directory holding config.yaml.
     # All Mordred plugins share one process-wide writer per normalized path.
     # Reloading this PluginState therefore reuses the active writer (and, for
@@ -435,9 +432,9 @@ def find_disabled_siblings(
     *,
     config_path: Path | None = None,
 ) -> set[str]:
-    """Return Mordred sibling plugins that are not loadable.
+    """Return Mordred plugins that are not loadable per config.
 
-    A sibling is considered disabled if it appears in ``plugins.disabled`` or
+    A plugin is considered disabled if it appears in ``plugins.disabled`` or
     is absent from the opt-in ``plugins.enabled`` list.  Hermes 0.13+ treats a
     missing or malformed allow-list (reported here as ``None``) as "nothing
     enabled", not "everything loadable", so every sibling is disabled in that
@@ -453,11 +450,22 @@ def find_disabled_siblings(
     return {s for s in siblings if s in deny or s not in allow}
 
 
+def find_legacy_plugin_names(*, config_path: Path | None = None) -> set[str]:
+    """Pre-0.2.0a0 per-component plugin names still listed in the config.
+
+    Hermes ignores them now; they only explain why ``mordred`` is missing
+    (an unmigrated config) and point at the migration command.
+    """
+    listed = set(get_disabled_plugins(config_path))
+    listed |= get_enabled_plugins(config_path) or set()
+    return listed & set(LEGACY_PLUGIN_NAMES)
+
+
 def find_unloaded_siblings(
     plugin_manager: Any,
     siblings: Iterable[str] = SIBLING_PLUGINS,
 ) -> set[str]:
-    """Return configured siblings absent or incomplete in Hermes's live state."""
+    """Return configured plugins/components absent or incomplete in Hermes's live state."""
     raw_plugins = getattr(plugin_manager, "_plugins", None)
     if not isinstance(raw_plugins, dict):
         # Manager shape drift means no live sibling can be proven loaded.
@@ -468,17 +476,38 @@ def find_unloaded_siblings(
         if loaded is None:
             failed.add(sibling)
             continue
-        if (
-            getattr(loaded, "enabled", False) is not True
-            or bool(getattr(loaded, "error", None))
-            or getattr(loaded, "module", None) is None
-        ):
+        module = getattr(loaded, "module", None)
+        if getattr(loaded, "enabled", False) is not True or bool(getattr(loaded, "error", None)) or module is None:
             failed.add(sibling)
             continue
         hooks = getattr(loaded, "hooks_registered", None)
         required = SIBLING_REQUIRED_HOOKS.get(sibling, frozenset())
         if not isinstance(hooks, list) or not required.issubset(hook for hook in hooks if isinstance(hook, str)):
             failed.add(sibling)
+            continue
+        if sibling == PLUGIN_NAME and getattr(module, "__name__", None) == _PLUGIN_MODULE:
+            failed |= _unloaded_components(module)
+    return failed
+
+
+def _unloaded_components(plugin_module: Any) -> set[str]:
+    """``mordred/<component>`` for each component that failed or lacks a promised hook.
+
+    Reads the record kept by the loaded :mod:`mordred_hermes.plugin` module. A
+    component that raised is reported even though Hermes shows the plugin as
+    loaded — the bundle contains the failure so the other components keep
+    protecting the process, exactly as a failed sibling plugin used to.
+    """
+    try:
+        errors = plugin_module.component_errors()
+        hooks = plugin_module.component_hooks()
+    except Exception:
+        return {f"{PLUGIN_NAME}/{component}" for component, _module in COMPONENTS}
+    failed: set[str] = set()
+    for component, _module in COMPONENTS:
+        registered = hooks.get(component)
+        if component in errors or registered is None or not COMPONENT_REQUIRED_HOOKS[component] <= registered:
+            failed.add(f"{PLUGIN_NAME}/{component}")
     return failed
 
 

@@ -1,4 +1,4 @@
-"""Tests for ``tools/check_hook_payload_drift.py`` (TODO §Cross-cutting L474).
+"""Tests for ``tools/check_hook_payload_drift.py``.
 
 The drift tool statically verifies both ``VALID_HOOKS`` membership and every
 core ``invoke_hook("<name>", key=value, ...)`` payload consumed by Mordred.

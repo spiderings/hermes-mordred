@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +24,60 @@ from typing import Any
 # --------------------------------------------------------------------------- #
 
 _ACCOUNT_BOUND_METHODS = frozenset({"personal_sign", "eth_signTypedData_v4"})
+
+# Resolving the account snapshot is not free: it derives the address through the
+# keyvault backend, which on a Secure-Enclave host means one authorization
+# (Touch ID prompt) and one audit row per call. ``accounts_request`` is reachable
+# by the *page* principal — a lower-privilege browser document — so without a
+# bound anything holding the page token can drive prompts and audit growth at
+# frame rate.
+#
+# The snapshot is public data (the address the extension already hands to dapps
+# plus the configured chain id), so the bound is a short-lived cache rather than
+# a refusal: caching is precisely what stops the repeated prompts, and it leaks
+# nothing across principals because every principal that reaches this handler is
+# entitled to the same value. The window mirrors
+# ``gateway_plugin._NEEDS_KEY_RATE_LIMIT_SECONDS`` (PR #93).
+_ACCOUNT_SNAPSHOT_TTL_SECONDS = 60.0
+_clock: Callable[[], float] = time.monotonic
+_account_snapshot_lock = threading.Lock()
+
+
+class _CachedSnapshotFailure(RuntimeError):
+    """A previous resolution failure, replayed within the cooldown window.
+
+    Only the message and the original class name are kept. Caching the original
+    exception would pin its traceback — and every frame local it references,
+    which on a failure inside the keyvault can include key material — alive for
+    the whole window.
+
+    A FRESH instance is raised per replay. Re-raising one cached instance made
+    Python append the raise site to its ``__traceback__`` every time, so a
+    client polling ``accounts_request`` grew both the object and every logged
+    traceback without bound (quadratic in the number of replays).
+    """
+
+    def __init__(self, message: str, original_type_name: str) -> None:
+        super().__init__(message)
+        self.original_type_name = original_type_name
+
+
+@dataclass(frozen=True, slots=True)
+class _AccountSnapshotEntry:
+    """One resolved (or failed) snapshot, valid until ``expires_at``.
+
+    A failure is stored as plain text (message + class name), never as the
+    exception object, so nothing about the failing call survives the window.
+    """
+
+    fingerprint: tuple[object, ...]
+    expires_at: float
+    value: tuple[str, str] | None
+    error_message: str | None = None
+    error_type_name: str | None = None
+
+
+_account_snapshot_cache: _AccountSnapshotEntry | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,11 +97,83 @@ def _get_address() -> str:
     return extension_sign.get_address()
 
 
-def _get_account_snapshot() -> tuple[str, str]:
+def _load_account_snapshot() -> tuple[str, str]:
+    """Resolve ``(address, chain_id_hex)`` through the keyvault (uncached)."""
     from mordred_hermes.keyvault import extension_sign
 
     address, chain_id = extension_sign.account_snapshot()
     return address, hex(chain_id)
+
+
+def _wallet_config_fingerprint() -> tuple[object, ...]:
+    """Identity of the wallet config a cached snapshot was resolved from.
+
+    Reconfiguring the wallet (``set_wallet``, an operator editing
+    ``wallet.json``) rewrites the file, so stat identity is the invalidation
+    hook. The path itself is part of the fingerprint: a different
+    ``HERMES_HOME`` — profile switch, isolated test — is a different wallet.
+
+    KNOWN GAP: with no ``wallet.json`` the account is discovered from the
+    stored HD seeds (``_resolve_account_from_cfg``), and storing a seed does
+    not touch this path. Such a change is therefore visible only after the TTL
+    (≤60 s) — bounded and never silent (0→1 seed turns a cached
+    ``WalletNotConfigured`` into an address; 1→2 turns it into an explicit
+    "pin one" error). Enumerating the seed directory here would reach into the
+    keyvault's on-disk layout on every request to close a one-minute window.
+    """
+    from mordred_hermes.keyvault import extension_sign
+
+    try:
+        path = extension_sign._ext_dir() / extension_sign._WALLET_FILE
+    except Exception:  # pragma: no cover - only if the home cannot be resolved
+        return ("unresolved-wallet-path",)
+    try:
+        stat_result = path.stat()
+    except OSError:
+        # No explicit config: the account is discovered from the stored seeds.
+        return (str(path), None)
+    return (str(path), stat_result.st_mtime_ns, stat_result.st_size, stat_result.st_ino)
+
+
+def reset_account_snapshot_cache() -> None:
+    """Forget the cached snapshot (tests, and any explicit reconfiguration)."""
+    global _account_snapshot_cache
+    with _account_snapshot_lock:
+        _account_snapshot_cache = None
+
+
+def _get_account_snapshot() -> tuple[str, str]:
+    """Return ``(address, chain_id_hex)``, at most one resolution per window.
+
+    Failures are cached for the same window as successes: a bound that only
+    covers the happy path is bypassable by whatever made the resolution fail
+    (a denied Touch ID prompt re-prompts on the next frame otherwise).
+
+    The resolution runs under the lock so a burst of concurrent requests
+    collapses into one keyvault call instead of racing to authorize N times.
+    """
+    global _account_snapshot_cache
+    fingerprint = _wallet_config_fingerprint()
+    with _account_snapshot_lock:
+        now = _clock()
+        entry = _account_snapshot_cache
+        if entry is not None and now < entry.expires_at and entry.fingerprint == fingerprint:
+            if entry.value is not None:
+                return entry.value
+            # ``from None``: the replay carries no chained context, so its
+            # traceback is exactly this raise site every time.
+            raise _CachedSnapshotFailure(
+                entry.error_message or "wallet_snapshot_unavailable",
+                entry.error_type_name or "RuntimeError",
+            ) from None
+        expires_at = now + _ACCOUNT_SNAPSHOT_TTL_SECONDS
+        try:
+            value = _load_account_snapshot()
+        except Exception as exc:
+            _account_snapshot_cache = _AccountSnapshotEntry(fingerprint, expires_at, None, str(exc), type(exc).__name__)
+            raise
+        _account_snapshot_cache = _AccountSnapshotEntry(fingerprint, expires_at, value)
+        return value
 
 
 def _addresses_match(left: str, right: str) -> bool:
@@ -328,6 +457,16 @@ def _send_prepared_transaction(
 # this later; keeping it deterministic makes it testable and offline-safe.
 # --------------------------------------------------------------------------- #
 
+# A bare 32-byte personal_sign payload is the shape of a Safe transaction hash
+# or a meta-transaction digest — signable authority the operator cannot inspect.
+_OPAQUE_HASH_BYTES = 32
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_MESSAGE_PREVIEW_CHARS = 512
+_OPAQUE_PAYLOAD_WARNING = (
+    "内容を検証できない不透明なデータです。Safe やメタトランザクションのダイジェストである場合、"
+    "この署名だけでコントラクト操作や資産の移動がオフチェーンで承認される可能性があります。"
+)
+
 _ERC20_TRANSFER = "a9059cbb"
 _ERC20_APPROVE = "095ea7b3"
 _ERC20_CALLDATA_HEX_LEN = 8 + 64 + 64
@@ -339,9 +478,108 @@ def _is_canonical_erc20_call(data: str, selector: str) -> bool:
     return len(data) == _ERC20_CALLDATA_HEX_LEN and data[:8] == selector and data[8:32] == "0" * 24
 
 
+def _is_readable_text(text: str) -> bool:
+    """Whether a decoded payload is something the operator can actually read."""
+    if not text.strip():
+        return False
+    return all(char.isprintable() or char in "\n\r\t" for char in text)
+
+
+def _signer_hex_body(payload: str) -> str | None:
+    """The hex body ``personal_sign`` will decode, or ``None`` if it will not.
+
+    Mirrors ``keyvault/extension_sign.py`` ``personal_sign`` exactly:
+    ``encode_defunct(hexstr=message) if message.startswith("0x")``. Three rules
+    have to match byte for byte, because classifying different bytes than the
+    ones being signed is how "no asset movement" ends up on a digest:
+
+    * the prefix test is CASE-SENSITIVE — ``0X…`` is signed as literal text;
+    * an odd-length body is LEFT-PADDED with one ``0``
+      (``eth_utils.to_bytes(hexstr=…)``), so ``0x`` + 63 hex chars signs the
+      same 32 bytes as the padded 64-char digest;
+    * the decoder is ``binascii.unhexlify``, which rejects every non-hex
+      character INCLUDING whitespace (``bytes.fromhex`` would accept it). Such
+      a payload cannot be signed at all, so it is never described as readable.
+
+    eth_utils is not imported here: it lives in the optional ``ethereum``
+    extra, which the ``extension`` install does not guarantee.
+    """
+    if not payload.startswith("0x"):
+        return None
+    body = payload[2:]
+    if any(char not in _HEX_DIGITS for char in body):
+        return None
+    return f"0{body}" if len(body) % 2 else body
+
+
+def _classify_personal_sign_payload(payload: Any) -> tuple[str, str | None]:
+    """Return ``(kind, readable_text)`` for a ``personal_sign`` message param.
+
+    ``kind`` is ``"text"`` for an EIP-191 message the operator can read (plain
+    or hex-encoded UTF-8), ``"opaque_hash"`` for a 32-byte digest — a Safe
+    transaction hash, a meta-transaction digest — and ``"opaque_bytes"`` for
+    anything else, including malformed params (this runs on unvalidated input).
+
+    32 signed bytes are opaque BY RULE, not by readability: an attacker who
+    wants a digest that also decodes to printable ASCII needs roughly 2**44
+    keccak attempts, which is grindable. Length wins at 32 bytes; only other
+    lengths may be reported as readable text.
+
+    A hex-prefixed payload the signer cannot decode is classified opaque
+    (over-warning) rather than shown as its own literal text.
+    """
+    if not isinstance(payload, str):
+        return "opaque_bytes", None
+    if not payload.startswith("0x"):
+        # The signer signs the literal characters (encode_defunct(text=…)); the
+        # 32-byte rule applies to those bytes too — a readable string whose
+        # UTF-8 encoding is exactly 32 bytes signs the same digest-shaped input
+        # as its hex spelling and must not be shown as harmless text.
+        if len(payload.encode("utf-8")) == _OPAQUE_HASH_BYTES:
+            return "opaque_hash", None
+        return ("text", payload) if _is_readable_text(payload) else ("opaque_bytes", None)
+    hex_body = _signer_hex_body(payload)
+    if hex_body is None:
+        return "opaque_bytes", None
+    raw = bytes.fromhex(hex_body)
+    if len(raw) == _OPAQUE_HASH_BYTES:
+        return "opaque_hash", None
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "opaque_bytes", None
+    return ("text", decoded) if _is_readable_text(decoded) else ("opaque_bytes", None)
+
+
+def _analyze_personal_sign(payload: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Risk/decode for ``personal_sign``.
+
+    The old copy promised "資産移動なし" (no asset movement) for *every*
+    payload. That is only true for a message the operator can read: an opaque
+    digest may be a Safe transaction hash or a meta-transaction, where the
+    signature alone authorizes contract actions or asset movement off-chain.
+    """
+    kind, text = _classify_personal_sign_payload(payload)
+    if kind == "text":
+        full = text or ""
+        decoded: dict[str, Any] = {"payload_kind": kind, "message_preview": full[:_MESSAGE_PREVIEW_CHARS]}
+        if len(full) > _MESSAGE_PREVIEW_CHARS:
+            # The prompt must never look complete when it is not: an operator
+            # who reads a truncated message could miss the part that matters.
+            decoded["preview_truncated"] = True
+        return ({"risk": "low", "summary": "メッセージ署名(資産移動なし)", "warnings": []}, decoded)
+    warnings = [_OPAQUE_PAYLOAD_WARNING]
+    if kind == "opaque_hash":
+        summary = "不透明な32バイトハッシュへの署名(内容を検証できません)"
+        warnings.append("32バイトのダイジェストは Safe のトランザクションハッシュ等である可能性があります。")
+    else:
+        summary = "不透明なバイト列への署名(内容を検証できません)"
+    return ({"risk": "medium", "summary": summary, "warnings": warnings}, {"payload_kind": kind})
+
+
 def analyze_sign(method: str, params: list[Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     if method == "personal_sign":
-        return ({"risk": "low", "summary": "メッセージ署名(資産移動なし)", "warnings": []}, {})
+        return _analyze_personal_sign(params[0] if params else None)
     if method == "eth_signTypedData_v4":
         return (
             {"risk": "medium", "summary": "EIP-712 typed data 署名", "warnings": ["許可(permit)の可能性に注意"]},

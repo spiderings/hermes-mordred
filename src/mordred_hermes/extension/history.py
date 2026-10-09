@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,39 @@ from .crypto import decrypt_message, encrypt_message
 from .pairing import load_pairing
 
 logger = logging.getLogger(__name__)
+
+# Load outcomes. "empty" and "undecryptable" used to be the same ``[]``: after a
+# re-pairing the stored blob is encrypted under a key that no longer exists, and
+# a viewer rendered that as "you have never talked to Hermes" rather than "your
+# history is here but unreadable".
+STATUS_OK = "ok"
+STATUS_EMPTY = "empty"
+STATUS_UNAVAILABLE = "unavailable"  # not paired — no key to decrypt with
+STATUS_UNDECRYPTABLE = "undecryptable"
+
+# One warning per process for an undecryptable store, not one per read (the
+# page polls ``history_get``) and not one per message.
+_undecryptable_warned = False
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryLoad:
+    """One history read: the messages plus *why* the list looks like it does."""
+
+    messages: list[dict[str, Any]]
+    status: str
+
+    @property
+    def undecryptable(self) -> bool:
+        return self.status == STATUS_UNDECRYPTABLE
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryProjection:
+    """Viewer-facing turns plus the status of the read they came from."""
+
+    turns: list[dict[str, str]]
+    status: str
 
 
 def _history_path() -> Path:
@@ -56,32 +90,71 @@ def save_messages(messages: list[dict[str, Any]]) -> None:
         logger.debug("extension history save failed", exc_info=True)
 
 
-def load_messages() -> list[dict[str, Any]]:
-    """Decrypt and return the stored agent message list ([] if none)."""
+def _warn_undecryptable_once() -> None:
+    global _undecryptable_warned
+    if _undecryptable_warned:
+        return
+    _undecryptable_warned = True
+    logger.warning(
+        "extension history is undecryptable and is being served as an empty "
+        "conversation (a re-pairing replaces the key the blob was sealed with)",
+        exc_info=True,
+    )
+
+
+def load_history() -> HistoryLoad:
+    """Decrypt the stored agent message list and report why it is what it is."""
+    global _undecryptable_warned
     key = _key()
     if key is None:
-        return []
+        return HistoryLoad([], STATUS_UNAVAILABLE)
     path = _history_path()
     if not path.exists():
-        return []
+        return HistoryLoad([], STATUS_EMPTY)
     try:
         blob = path.read_text("utf-8").strip()
         data = json.loads(decrypt_message(key, blob))
-        return data if isinstance(data, list) else []
     except Exception:
-        logger.debug("extension history load failed", exc_info=True)
-        return []
+        _warn_undecryptable_once()
+        return HistoryLoad([], STATUS_UNDECRYPTABLE)
+    if not isinstance(data, list):
+        _warn_undecryptable_once()
+        return HistoryLoad([], STATUS_UNDECRYPTABLE)
+    _undecryptable_warned = False
+    return HistoryLoad(data, STATUS_OK)
+
+
+def load_messages() -> list[dict[str, Any]]:
+    """Decrypt and return the stored agent message list ([] if none).
+
+    Retained for callers that only need the messages (the chat turn loop).
+    Anything that *renders* history should use :func:`load_history` so it can
+    tell "no history" from "history that no longer decrypts".
+    """
+    return load_history().messages
 
 
 def clear() -> None:
+    global _undecryptable_warned
     with contextlib.suppress(OSError):
         _history_path().unlink()
+    _undecryptable_warned = False
+
+
+def projected_history() -> HistoryProjection:
+    """A viewer-friendly projection plus the status of the underlying read."""
+    loaded = load_history()
+    return HistoryProjection(_projected_turns(loaded.messages), loaded.status)
 
 
 def projected_turns() -> list[dict[str, str]]:
     """A viewer-friendly [{role, content}] projection (user + assistant text)."""
+    return _projected_turns(load_messages())
+
+
+def _projected_turns(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
-    for msg in load_messages():
+    for msg in messages:
         role = msg.get("role")
         if role not in ("user", "assistant"):
             continue

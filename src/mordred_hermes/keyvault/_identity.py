@@ -76,13 +76,15 @@ def resolve_store(store: AnchorStore | None) -> AnchorStore:
     """Return ``store``, or build the production Keychain anchor store.
 
     Same single-definition contract (and same function-local import rule) as
-    :func:`resolve_backend`.
+    :func:`resolve_backend`. The production store is helper-owned when the
+    Secure Enclave helper is installed (see
+    :func:`._anchor_keychain.default_anchor_store`).
     """
     if store is not None:
         return store
-    from ._anchor_keychain import KeychainAnchorStore
+    from ._anchor_keychain import default_anchor_store
 
-    return KeychainAnchorStore()
+    return default_anchor_store()
 
 
 def resolve_backend_store(

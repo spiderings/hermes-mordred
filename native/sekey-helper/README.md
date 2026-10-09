@@ -58,6 +58,10 @@ Send a single JSON object on stdin; read a single JSON object on stdout.
 | `{"cmd":"delete","tag_hex":".."}` | `{"ok":true}` |
 | `{"cmd":"ecdh","tag_hex":"..","peer_pub_hex":".."}` | `{"shared_hex":".."}` |
 | `{"cmd":"probe"}` | `{"ok":true}` |
+| `{"cmd":"anchor_get","account":".."}` | `{"value_hex":".."}` |
+| `{"cmd":"anchor_add","account":"..","value_hex":".."}` | `{"ok":true}` (fails with `-25299` if present) |
+| `{"cmd":"anchor_set","account":"..","value_hex":".."}` | `{"ok":true}` (update, else add) |
+| `{"cmd":"anchor_delete","account":".."}` | `{"ok":true}` (idempotent) |
 
 Failure (any command), exit code 1:
 
@@ -152,3 +156,41 @@ echo '{"cmd":"probe"}' | ~/.local/bin/mordred-hermes-sekey
 
 When found, it becomes the SE backend; otherwise the keyvault falls back to
 pyobjc and then a software P-256 key (see `_seckey_backend.py`).
+
+## Vault anchor items (`anchor_*`)
+
+The at-rest vault pins a small non-secret freshness anchor (`SHA-256(wmk)` and
+the manifest generation) in a login-keychain generic-password item. Items in
+the legacy login keychain trust only the binary that created them (by code
+hash, plus a `cdhash:` partition id for ad-hoc-signed code); any other binary
+that reads, updates or deletes the item makes macOS ask for the login password
+("... wants to use your confidential information stored in ... in your
+keychain"). When Python wrote the item in-process, every other interpreter -- a
+development venv, Hermes's managed Python, an upgraded Python -- triggered that
+dialog on each access, several times per setup flow.
+
+The `anchor_*` commands move the item behind this helper: the helper creates
+and reads it, so every Python process on the machine goes through one binary
+whose code hash the item trusts. Details:
+
+- **Fixed service.** The helper only ever addresses service
+  `mordred-hermes.vault.anchor.sekey`; Python passes the account (the vault's
+  anchor label) and the value. It cannot be used to read arbitrary keychain
+  items. `MORDRED_SEKEY_ANCHOR_NAMESPACE` (lowercase letters, digits, `-`; live
+  tests only) appends `.<namespace>` to that service.
+- **Same protection as before.** `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`,
+  legacy login keychain (the data-protection keychain needs the
+  `keychain-access-groups` entitlement, which ad-hoc-signed code cannot hold),
+  default ACL = this binary only. No "allow all applications".
+- **Migration.** When the helper item is absent, Python reads the old
+  in-process item (`mordred-hermes.vault.anchor`) once -- the one access that
+  may still ask for the password, when the running interpreter did not write
+  it -- copies it with `anchor_add` (add-only: a concurrent newer pin is never
+  overwritten), and tries to delete the old item without prompting.
+- **Older helpers** answer `unknown cmd`; Python then keeps using the
+  in-process item for that process, as before.
+- **Reproducible build.** `build.sh` links with `-Xlinker -S` so the binary (and
+  its ad-hoc code hash) does not depend on the source path or build time.
+  Rebuilding the same source with the same toolchain keeps the item trusted; a
+  helper built from changed source asks once per anchor item -- answer
+  **Always Allow** so the new binary is added to the item's ACL.

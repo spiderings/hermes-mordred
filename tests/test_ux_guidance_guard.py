@@ -78,7 +78,6 @@ def test_no_user_facing_space_form_guidance() -> None:
 def test_markdown_uses_canonical_cli_spelling() -> None:
     markdown_files = [
         _REPO_ROOT / "README.md",
-        _PACKAGE_ROOT / "wizard" / "README.md",
         *sorted((_REPO_ROOT / "docs").rglob("*.md")),
         *sorted((_REPO_ROOT / "tests" / "fixtures").rglob("*.md")),
     ]

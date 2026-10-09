@@ -1,15 +1,13 @@
 """Tests for ``mordred_hermes.network.provider_transport_flagger``.
 
-PR1 ships the v1 baseline ``KNOWN_PROVIDERS`` dict with an
-``unverified_baseline=True`` flag on every entry. PR3 will run the
-real-traffic checks from TODO §0.8 L110-117 (anthropic/openai/gemini
-through HTTPS_PROXY, Wireshark / Tor circuit verification) and flip the
-flag to ``False`` per entry.
+``KNOWN_PROVIDERS`` records verified and conservative provider-transport
+facts. Integration checks clear `unverified_baseline` only where current
+evidence supports it.
 
 Tests cover:
 
-- Baseline dict has the 6 documented providers (TODO §3.1 L320).
-- Every PR1 entry carries ``unverified_baseline=True``.
+- Baseline dict includes the six original providers.
+- Verification state matches the available integration evidence.
 - Tor + ``respects_socks5h=False`` provider under strict → ``abort`` flag.
 - Tor + ``respects_socks5h=True`` provider → no flag.
 - Clearnet + ``respects_proxy=False`` provider → ``warning`` flag.
@@ -33,7 +31,7 @@ def test_known_providers_includes_v1_baseline() -> None:
 
 
 def test_baseline_verification_state() -> None:
-    """TODO §0.8 L110-117: providers whose transport is empirically backed
+    """Providers whose transport is empirically backed
     by ``tests/integration/test_provider_transport.py`` have
     ``unverified_baseline`` cleared. ``bedrock`` is only partially verified
     (``respects_socks5h=False`` confirmed; the ``dns_quirk`` / IPv6 facts

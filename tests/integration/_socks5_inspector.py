@@ -1,8 +1,8 @@
 """In-process SOCKS5 inspector proxy for hermetic ``socks5h://`` verification.
 
 A real (relaying) SOCKS5 server that records the address type (``ATYP``)
-of every CONNECT request it receives. This is the empirical core of
-TODO §0.8 L118-122 ("SOCKS5h library 互換性テスト"):
+of every CONNECT request it receives. This is the empirical core of the
+SOCKS5h compatibility tests:
 
 - ``socks5h://`` clients MUST send the destination **hostname**
   (``ATYP=0x03`` DOMAINNAME) so the proxy resolves DNS server-side. No

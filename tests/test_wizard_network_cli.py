@@ -218,7 +218,7 @@ class TestNetworkUseAtomicity:
 
     Detection strategy: PolicyWriter's ``_ensure_plugins_enabled`` adds
     the full Mordred-plugin list to ``plugins.enabled`` on every write
-    (HOOK_PAYLOADS.md §1 / TODO.md §0.5 L128). A plain ``Path.write_text``
+    (HOOK_PAYLOADS.md §1). A plain ``Path.write_text``
     would not produce that side effect. Asserting the side effect proves
     the write went through PolicyWriter and therefore got atomic-rename
     semantics — without us having to interrupt a write to test atomicity
@@ -244,16 +244,8 @@ class TestNetworkUseAtomicity:
             "PolicyWriter must add plugins.enabled — network_cli regressed to a non-atomic write path"
         )
         enabled = data["plugins"]["enabled"]
-        # All Mordred plugin names must be present (PolicyWriter contract).
-        for name in (
-            "mordred_privacy_check",
-            "mordred_wizard",
-            "mordred_llm_guard",
-            "mordred_network",
-            "mordred_keyvault",
-            "mordred_e2e",
-        ):
-            assert name in enabled, f"{name} missing from plugins.enabled after network_cli write"
+        # The single Mordred plugin must be enabled (PolicyWriter contract).
+        assert "mordred" in enabled, "mordred missing from plugins.enabled after network_cli write"
 
     def test_use_does_not_leave_tmp_artifact(self, tmp_path: Path) -> None:
         """PolicyWriter's ``_atomic_write_text`` writes to ``<name>.tmp``

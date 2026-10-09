@@ -17,8 +17,8 @@ Like :mod:`mordred_hermes.keyvault.digest`, this module takes an
 already-normalized seed — Unicode normalization is the caller's
 responsibility (``api._normalize_seed_phrase``).
 
-``blake3`` ships prebuilt wheels for all platforms, so this module
-imports everywhere; the macOS-only gating sits on ``crypto`` / native.
+``blake3`` is part of the cross-platform ``keyvault`` extra; native backend
+selection happens outside this pure module.
 """
 
 from __future__ import annotations

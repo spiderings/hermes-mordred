@@ -35,8 +35,26 @@ registration time.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
+
+from ._config_io import CanonicalPaths, CanonicalSnapshot
+
+_platform = os.name
+
+
+def yaml_mapping_from_snapshot(snapshot: CanonicalSnapshot, *, round_trip: bool = False) -> dict[str, Any]:
+    """Parse this checked generation; malformed config raises, checked absence is empty."""
+    from ruamel.yaml import YAML
+
+    if snapshot.config is None:
+        return {}
+    yaml = YAML(typ="rt") if round_trip else YAML(typ="safe", pure=True)
+    data = yaml.load(snapshot.config.data.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("config YAML must contain a mapping")
+    return data
 
 
 def load_yaml_mapping(
@@ -47,6 +65,10 @@ def load_yaml_mapping(
     round_trip: bool = False,
 ) -> dict[str, Any]:
     """Load ``path`` as a YAML mapping, collapsing every failure to ``{}``.
+
+    This is a presentation adapter: an empty result cannot authorize a policy
+    decision. Canonical Windows config uses checked coordination; custom canonical
+    names must use explicit snapshots. Other YAML files retain generic behavior.
 
     A missing file, an unreadable file, a parse error, or a top-level YAML
     value that is not a mapping all return ``{}`` so callers can apply their
@@ -62,6 +84,20 @@ def load_yaml_mapping(
     ``TaggedScalar`` values that simply compare unequal, so a hand-edited
     section still reaches the conflict prompt instead of being overwritten.
     """
+    if _platform == "nt" and path.name.casefold() == "config.yaml":
+        from ruamel.yaml.error import YAMLError
+
+        from ._config_io import read_canonical_snapshot
+
+        windows_catch = catch if catch is not None else (OSError, ValueError, YAMLError)
+        try:
+            return yaml_mapping_from_snapshot(
+                read_canonical_snapshot(CanonicalPaths(path.parent, config_name=path.name)), round_trip=round_trip
+            )
+        except windows_catch as exc:
+            if log is not None:
+                log.warning("could not read checked config %s: %s", path, exc)
+            return {}
     if not path.exists():
         return {}
     from ruamel.yaml import YAML

@@ -191,7 +191,19 @@ def verify_anchor(store: AnchorStore, label: str, *, wmk: bytes, generation: int
         AnchorCorrupt: the anchor bytes are malformed (fail closed).
         AnchorMismatch: the wmk fingerprint or generation does not match.
     """
-    pinned = read_anchor(store, label)
+    verify_pinned(read_anchor(store, label), wmk=wmk, generation=generation)
+
+
+def verify_pinned(pinned: VaultAnchor, *, wmk: bytes, generation: int) -> None:
+    """:func:`verify_anchor` against an anchor the caller has just read.
+
+    Lets an open read the Keychain item once and pin-check the manifest
+    against that same value, instead of reading it a second time (every
+    Keychain read can cost the operator a macOS access dialog).
+
+    Raises:
+        AnchorMismatch: the wmk fingerprint or generation does not match.
+    """
     if not hmac.compare_digest(pinned.wmk_sha256, wmk_fingerprint(wmk)):
         raise AnchorMismatch("wmk fingerprint does not match the device-bound anchor")
     if pinned.generation != generation:

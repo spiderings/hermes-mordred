@@ -5,7 +5,7 @@
     "type": "auth_ok",
     "hermes_version": "0.1.0a12",
     "se_available": true,
-    "capabilities": ["discord_channel_resolve_v1"]
+    "capabilities": ["discord_channel_resolve_v1", "telegram_import_v1"]
   },
   {"type": "auth_fail", "reason": "invalid_token"},
   {"type": "error", "reason": "bad_json"},
@@ -92,6 +92,61 @@
     "request_id": "dapp-request-2",
     "error": "user_rejected"
   },
+  {
+    "id": "telegram-status",
+    "type": "telegram_status_result",
+    "ok": true,
+    "status": {
+      "installed": true,
+      "configured": true,
+      "logged_in": true,
+      "llm_backend": "venice",
+      "llm_model": "deepseek-v4-flash",
+      "syncing": false,
+      "progress": {
+        "dialogs_total": 3,
+        "dialogs_done": 3,
+        "messages_imported": 42,
+        "started_at": 1790000000,
+        "finished_at": 1790000060
+      },
+      "last_error": null,
+      "last_sync": 1790000060,
+      "dialog_count": 3,
+      "message_count": 420,
+      "account_label": "🔒ENC:v2:a2lk:bm9uY2U:Y2lwaGVy"
+    }
+  },
+  {"id": "telegram-status-fail", "type": "telegram_status_result", "ok": false, "error": "vault_unavailable"},
+  {"id": "telegram-sync", "type": "telegram_sync_result", "ok": true},
+  {"id": "telegram-sync-busy", "type": "telegram_sync_result", "ok": false, "error": "sync_in_progress"},
+  {
+    "id": "telegram-dialogs",
+    "type": "telegram_dialogs_result",
+    "ok": true,
+    "dialogs": [
+      {
+        "id": "-1001234567890",
+        "kind": "group",
+        "title": "🔒ENC:v2:a2lk:bm9uY2U:Y2lwaGVy",
+        "message_count": 120,
+        "last_date": 1790000000,
+        "archived": false
+      }
+    ]
+  },
+  {"id": "telegram-dialogs-fail", "type": "telegram_dialogs_result", "ok": false, "error": "telegram_not_configured"},
+  {
+    "id": "telegram-ask",
+    "type": "telegram_ask_meta",
+    "model": "deepseek-v4-flash",
+    "message_count": 80,
+    "dialog_count": 2,
+    "truncated": false
+  },
+  {"id": "telegram-ask", "type": "telegram_ask_chunk", "content": "🔒ENC:v2:a2lk:bm9uY2U:Y2lwaGVy"},
+  {"id": "telegram-ask", "type": "telegram_ask_end"},
+  {"id": "telegram-ask-fail", "type": "telegram_ask_error", "reason": "venice_model_not_private"},
   {
     "id": "accounts",
     "type": "accounts_result",

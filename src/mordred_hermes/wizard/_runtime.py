@@ -27,5 +27,5 @@ DEFAULT_MORDRED_DIR: Final = HERMES_BASE / "mordred"
 DEFAULT_POLICY_JSON_PATH: Final = DEFAULT_MORDRED_DIR / "policy.json"
 DEFAULT_AUDIT_LOG_PATH: Final = DEFAULT_MORDRED_DIR / "audit.log"
 
-# OpenClaw legacy base for Story 1.5 migration (PATHS.md §OpenClaw migration L286).
+# OpenClaw legacy source (PATHS.md §Migration from legacy OpenClaw paths).
 DEFAULT_OPENCLAW_BASE: Final = Path.home() / ".openclaw" / "mordred"

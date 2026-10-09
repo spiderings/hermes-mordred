@@ -35,9 +35,8 @@ not the per-file codec's. The vault also uses a single canonical ``wmk`` across
 all of its files (see :mod:`mordred_hermes.keyvault.vault_master`); this codec
 records whatever ``wmk`` it is given and does not enforce that invariant itself.
 
-Imports :mod:`cryptography` (via ``.crypto`` through ``.kek``) and so, like its
-keyvault crypto siblings, is only importable where the ``[macos]`` extra is
-installed.
+Imports :mod:`cryptography` through the cross-platform ``keyvault`` extra. The
+codec itself is platform-neutral.
 """
 
 from __future__ import annotations

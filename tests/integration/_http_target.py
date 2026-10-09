@@ -1,6 +1,6 @@
 """Minimal loopback HTTP server used as a relay target by integration tests.
 
-The SOCKS5h / provider verification tests (TODO §0.8 L110-122) need a
+The SOCKS5h and provider-verification tests need a
 real HTTP endpoint so the client-side request completes with a genuine
 ``200`` response — proving the full
 ``client → socks5h → inspector → resolved host → server`` chain.

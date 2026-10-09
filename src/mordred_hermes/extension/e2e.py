@@ -17,9 +17,21 @@ entire wire grammar before releasing any plaintext and fails closed.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import logging
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+# Platforms where E2E is mandatory across ALL channels: inbound cleartext is
+# refused (gateway_plugin._ENFORCE_ENCRYPTION_PLATFORMS is this same set), so an
+# outbound cleartext message into a channel whose key the extension already
+# holds is never right either — see :func:`outbound_must_encrypt`.
+MANDATORY_ENCRYPTION_PLATFORMS = frozenset({"slack", "discord"})
 
 # A `🔒ENC:v1/v2:…` token anywhere in the text. Extensions keep a leading
 # @mention plaintext, so the ciphertext is NOT necessarily at the start; the
@@ -221,7 +233,14 @@ def _canonical_v3_parts(token: str) -> tuple[str, str, int, int, bytes, bytes, s
     )
 
 
-def _channel_key_matches(stored_id: str, *, platform: str, chat_id: str) -> bool:
+def _channel_key_matches(
+    stored_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    scope_id: str | None = None,
+    slack_connect_host_scope_ids: frozenset[str] | None = None,
+) -> bool:
     """Does a stored channel-key id name exactly ``chat_id`` on ``platform``?
 
     The extension pushes ``channel_key_set`` keyed by its own composite id
@@ -235,11 +254,39 @@ def _channel_key_matches(stored_id: str, *, platform: str, chat_id: str) -> bool
     its FIRST segment is this event's platform, so the binding stays as tight
     as an exact match: a key stored for another platform that happens to share
     a channel id cannot unlock this one, and no bare suffix match is allowed.
+
+    ``scope_id`` is the workspace/guild the event actually arrived from
+    (``SessionSource.scope_id``: the Slack team id, the Discord guild id). When
+    the caller knows it, the composite's MIDDLE segment must equal it, so a key
+    bound in one workspace cannot unlock a same-id channel in another. The
+    middle segment is only *ignored* when the caller cannot know the scope:
+    the shipped Discord adapter never stamps ``scope_id``/``guild_id`` on the
+    source, some Slack event shapes carry no team id, and the outbound send
+    wrapper has no event at all. Refusing those would resurrect the #83 outage
+    (every v3 command failing ``key_not_bound_to_channel``), so an unknown
+    scope keeps the lenient first/last-segment match.
+
+    A Slack Connect event from an external member carries that member's team
+    as ``scope_id`` even though the extension key is normally stored under the
+    bot's installing team. ``slack_connect_host_scope_ids`` is the gateway's
+    independently authenticated set of installing Slack teams for that exact
+    external event. Only those scopes are accepted as alternates; callers may
+    not use it to disable scope binding generally, and it has no effect on
+    non-Slack platforms.
     """
     if stored_id == chat_id:
         return True
     segments = stored_id.split(":")
-    return len(segments) > 1 and segments[0].lower() == platform and segments[-1] == chat_id
+    if len(segments) < 2 or segments[0].lower() != platform or segments[-1] != chat_id:
+        return False
+    if scope_id and len(segments) > 2:
+        stored_scope = ":".join(segments[1:-1])
+        return stored_scope == scope_id or (
+            platform == "slack"
+            and slack_connect_host_scope_ids is not None
+            and stored_scope in slack_connect_host_scope_ids
+        )
+    return True
 
 
 def _context_channel_key(
@@ -248,6 +295,8 @@ def _context_channel_key(
     platform: str,
     chat_id: str,
     parent_chat_id: str | None,
+    scope_id: str | None = None,
+    slack_connect_host_scope_ids: frozenset[str] | None = None,
 ) -> bytes:
     """Resolve a key only from the authenticated event's channel context."""
     from mordred_hermes.extension.crypto import key_id
@@ -259,7 +308,13 @@ def _context_channel_key(
         candidates.append(parent_chat_id)
     for channel_id in candidates:
         for stored_id, raw_key in channel_keys.items():
-            if not _channel_key_matches(stored_id, platform=platform, chat_id=channel_id):
+            if not _channel_key_matches(
+                stored_id,
+                platform=platform,
+                chat_id=channel_id,
+                scope_id=scope_id,
+                slack_connect_host_scope_ids=slack_connect_host_scope_ids,
+            ):
                 continue
             if key_id(raw_key) == kid:
                 return raw_key
@@ -273,6 +328,8 @@ def _decrypt_gateway_claim(
     chat_id: str,
     thread_root: str | None,
     parent_chat_id: str | None,
+    scope_id: str | None = None,
+    slack_connect_host_scope_ids: frozenset[str] | None = None,
 ) -> tuple[str, str, ReplayClaim]:
     """Parse and authenticate one context-bound v3 platform message."""
     from mordred_hermes.extension.crypto import DecryptError, decrypt_message_v3
@@ -299,6 +356,8 @@ def _decrypt_gateway_claim(
         platform=platform,
         chat_id=chat_id,
         parent_chat_id=parent_chat_id,
+        scope_id=scope_id,
+        slack_connect_host_scope_ids=slack_connect_host_scope_ids,
     )
     try:
         plaintext = decrypt_message_v3(
@@ -321,6 +380,8 @@ def decrypt_gateway_envelope(
     chat_id: str,
     thread_root: str | None,
     parent_chat_id: str | None = None,
+    scope_id: str | None = None,
+    slack_connect_host_scope_ids: frozenset[str] | None = None,
 ) -> tuple[str | None, str | None, ReplayClaim | None]:
     """Authenticate and decrypt a complete gateway wire envelope.
 
@@ -335,6 +396,11 @@ def decrypt_gateway_envelope(
     only for stored/history compatibility. The returned replay claim must be
     committed after outbound reply-path verification and immediately before
     plaintext release. ``(None, None, None)`` means no encrypted claim.
+
+    ``scope_id`` is the event's workspace/guild id when the caller knows it;
+    it tightens composite channel-key binding (see :func:`_channel_key_matches`).
+    ``slack_connect_host_scope_ids`` permits only authenticated installing-team
+    alternatives for a proven external Slack Connect event.
     """
     if not text or ENC_CLAIM_RE.search(text) is None:
         return None, None, None
@@ -348,6 +414,8 @@ def decrypt_gateway_envelope(
             chat_id=chat_id,
             thread_root=thread_root,
             parent_chat_id=parent_chat_id,
+            scope_id=scope_id,
+            slack_connect_host_scope_ids=slack_connect_host_scope_ids,
         )
     except InvalidEncryptedEnvelope:
         raise
@@ -367,8 +435,62 @@ def claim_gateway_replay(replay: ReplayClaim) -> bool:
 # Conversations that received an encrypted message → reply-in-kind. Value is
 # (expiry, key_id) so replies re-encrypt with exactly the inbound key. Keyed by
 # (platform, channel_id, thread_root) so ids never collide across platforms.
+#
+# NOT keyed by multiplex profile, deliberately. The mark is written from the
+# inbound hook (which knows ``event.source.profile``) but read from the adapter
+# ``send`` wrapper, which receives only ``(self, chat_id, content, …)`` — the
+# shipped adapters expose no profile attribute, and the profile is resolved
+# per-source at ``build_source`` time, so a profile-keyed registry would miss on
+# every reply and fail closed into a locked notice. The residual risk is two
+# profiles whose workspaces reuse one channel id: Slack channel ids and Discord
+# snowflakes are platform-wide identifiers, so a collision needs the same id in
+# two workspaces. Its failure mode is fail-secure anyway — the reply encrypts
+# under the other profile's kid, which ``reply_key`` cannot resolve against the
+# active profile's ``HERMES_HOME`` keyring, so it degrades to a locked notice
+# rather than plaintext. The channel-binding rule below has no such gap: it
+# reads the key store of whatever ``HERMES_HOME`` the gateway has scoped in for
+# this profile's turn.
 _ENC_THREADS: dict[tuple[str, str, str | None], tuple[float, str | None]] = {}
 _ENC_TTL = 24 * 3600  # seconds
+
+# Set while Mordred itself sends a control notice (the needs-key setup guidance)
+# through a wrapped adapter. See :func:`control_notice_send`.
+_CONTROL_NOTICE: contextvars.ContextVar[bool] = contextvars.ContextVar("mordred_e2e_control_notice", default=False)
+
+
+@contextlib.contextmanager
+def control_notice_send() -> Iterator[None]:
+    """Mark the enclosed adapter ``send`` as a Mordred control notice.
+
+    The needs-key notice is Mordred's own fixed setup guidance, carries no
+    agent or user content, and is addressed to exactly the person who could not
+    encrypt — so it is the one message that must still reach a key-bound
+    channel in cleartext. Everything else routed into such a channel is agent
+    output and must be ciphertext (:func:`outbound_must_encrypt`).
+
+    Scoped through a ``ContextVar`` rather than a ``send`` argument because the
+    wrapper has to stay signature-compatible with the host's adapter API; a
+    task-local flag also cannot leak into a concurrent send.
+
+    One leak vector to know about: ``asyncio`` copies the current context when
+    a task is CREATED, so a task spawned *inside* this block inherits the
+    bypass for its whole lifetime. Not reachable today — the shipped adapters
+    ``await`` their send inline, and Mordred enters the marker inside
+    ``gateway_plugin._safe_send`` itself — but an adapter that hands the notice
+    to a background task would carry the bypass into whatever else that task
+    sends. Keep the marker around the single ``await`` that delivers the
+    notice, never around adapter setup or fan-out.
+    """
+    token = _CONTROL_NOTICE.set(True)
+    try:
+        yield
+    finally:
+        _CONTROL_NOTICE.reset(token)
+
+
+def in_control_notice() -> bool:
+    """Is the current task inside a :func:`control_notice_send` block?"""
+    return _CONTROL_NOTICE.get()
 
 
 def mark_encrypted_thread(
@@ -400,6 +522,14 @@ def is_encrypted_thread(platform: str, channel_id: str, thread_root: str | None)
     a thread_ts. Without the fallback the reply is judged unencrypted and goes
     out in CLEARTEXT. Mirrors :func:`thread_key_id`, which already scans
     ``(thread_root, None)`` — the two must agree or the reply path leaks.
+
+    On Slack that ``(channel, None)`` bucket is nearly always empty: the shipped
+    adapter's ``reply_in_thread`` session keying stamps a synthetic per-message
+    ``thread_ts == ts`` on top-level messages, so the inbound mark lands under a
+    thread root even for a channel-level mention. This predicate therefore only
+    covers conversations Mordred has actually *seen* ciphertext in, within the
+    24h TTL; it is not the outbound policy. Send-path callers must use
+    :func:`outbound_must_encrypt`.
     """
     now = time.time()
     _prune(now)
@@ -415,6 +545,131 @@ def thread_key_id(platform: str, channel_id: str, thread_root: str | None) -> st
         if exp > now and kid:
             return kid
     return None
+
+
+def bound_channel_key_ids(platform: str, channel_id: str) -> list[str]:
+    """Every DISTINCT keyId bound to this channel, in key-store order.
+
+    Answers "can the people in this channel decrypt?" from the persisted
+    keyring alone, so it survives a gateway restart, the 24h reply TTL, and
+    Slack's synthetic thread roots — unlike the in-memory thread bookkeeping.
+
+    More than one entry can name one channel. ``pairing.save_channel_key``
+    keys the store by the extension's full composite id and never evicts, so a
+    re-pairing or a workspace change leaves both ``slack:{old}:{cid}`` and
+    ``slack:{new}:{cid}`` bound to ``cid``. Deduplicating by keyId means the
+    same key pushed under two ids is *not* ambiguity; two different keys are.
+
+    Store failures propagate. An unreadable keyring already fails every inbound
+    command closed (``internal_error``); resolving it to "no key bound" here
+    would instead let the same failure re-open the cleartext send path.
+    """
+    from mordred_hermes.extension.crypto import key_id
+    from mordred_hermes.extension.pairing import load_channel_keys
+
+    if not platform or not channel_id:
+        return []
+    found: list[str] = []
+    for stored_id, raw_key in load_channel_keys().items():
+        # No scope id is available on the send path (no event, no adapter
+        # profile), so this is the lenient platform+channel match documented in
+        # _channel_key_matches.
+        if not _channel_key_matches(stored_id, platform=platform, chat_id=str(channel_id)):
+            continue
+        kid = key_id(raw_key)
+        if kid not in found:
+            found.append(kid)
+    return found
+
+
+def bound_channel_key_id(platform: str, channel_id: str) -> str | None:
+    """The one keyId to encrypt a channel-bound message with, or ``None``.
+
+    ``None`` means "do not guess", NOT "not encrypted" — the caller has already
+    decided the message must be encrypted (:func:`outbound_must_encrypt` asks
+    :func:`bound_channel_key_ids` whether *any* key is bound), so ``None``
+    lands on the visible locked-notice path rather than on cleartext.
+
+    Ambiguity fails closed because the store carries no recency signal to break
+    the tie. ``save_channel_key`` writes a plain ``{id: key}`` mapping with no
+    bound-at timestamp, and it updates an existing id *in place*, so JSON
+    insertion order records when an id was FIRST bound, not when it was last
+    refreshed — "first match" would therefore reliably pick the STALE key after
+    a re-pairing. Encrypting under a key nobody holds is the failure
+    :func:`reply_key` calls strictly worse than refusing: ``reply_key`` still
+    resolves it, so the send reports success while the channel sees
+    permanently unreadable ciphertext. A locked notice instead tells the
+    operator to clear the stale binding.
+
+    Live conversations are unaffected: :func:`outbound_key_id` prefers the
+    keyId actually observed inbound, so only a channel-bound send with no
+    reply-in-kind context can reach the ambiguous case. A caller that knows the
+    event's workspace can disambiguate before this point by filtering with
+    ``_channel_key_matches(..., scope_id=...)``; no send-path caller does.
+    """
+    kids = bound_channel_key_ids(platform, channel_id)
+    if len(kids) != 1:
+        if kids:
+            logger.warning(
+                "mordred_e2e: %s channel has %d different bound keys; refusing to guess which is current",
+                platform,
+                len(kids),
+            )
+        return None
+    return kids[0]
+
+
+def outbound_must_encrypt(platform: str, channel_id: str, thread_root: str | None) -> bool:
+    """Must an outbound message into this conversation be encrypted?
+
+    Two independent reasons, checked cheapest first:
+
+    1. Mordred saw ciphertext in this conversation within the reply TTL
+       (:func:`is_encrypted_thread`) — reply-in-kind, §4.
+    2. The channel has a bound ``K_chan`` on a platform where E2E is mandatory.
+
+    Rule 2 is what makes agent-initiated traffic safe. A cron result, a
+    proactive notification or any other send that carries no inbound thread
+    context has no reply-in-kind mark to find, so before this rule it left in
+    CLEARTEXT into a channel the operator had configured as a ciphertext-only
+    transport. A bound key means the recipients can decrypt, and inbound
+    cleartext is already refused there, so cleartext outbound is never right.
+
+    The single exception is Mordred's own needs-key notice
+    (:func:`control_notice_send`), which must stay readable by the sender who
+    could not encrypt. It is a fixed string with no agent or user content.
+
+    Rule 2 asks whether ANY key is bound, deliberately not which one: a channel
+    with two conflicting bindings is still a ciphertext-only channel, and it is
+    :func:`bound_channel_key_id` that then refuses to guess between them, so the
+    ambiguity surfaces as a locked notice instead of as cleartext.
+    """
+    if is_encrypted_thread(platform, channel_id, thread_root):
+        return True
+    if platform not in MANDATORY_ENCRYPTION_PLATFORMS or in_control_notice():
+        return False
+    return bool(bound_channel_key_ids(platform, channel_id))
+
+
+def outbound_key_id(platform: str, channel_id: str, thread_root: str | None) -> str | None:
+    """keyId to encrypt an outbound message with: the remembered inbound key
+    first (reply-in-kind uses exactly the key the sender used), else the key
+    bound to the channel.
+
+    Unlike :func:`outbound_must_encrypt` this swallows keyring failures: the
+    caller has already decided the message must be encrypted, and "no usable
+    key" is the designed, visible outcome (a locked notice) rather than a
+    crashing send. Conflicting channel bindings resolve to ``None`` the same
+    way (:func:`bound_channel_key_id`), but only when the conversation has no
+    remembered inbound keyId to prefer.
+    """
+    kid = thread_key_id(platform, channel_id, thread_root)
+    if kid:
+        return kid
+    try:
+        return bound_channel_key_id(platform, channel_id)
+    except Exception:
+        return None
 
 
 def reply_key(key_id_hint: str | None) -> bytes | None:

@@ -6,13 +6,15 @@ list loads no Mordred plugin, so no plugin gets a chance to report that the
 guard is absent.  The wheel therefore ships a narrowly-gated ``.pth`` file
 which calls :func:`run` for Hermes console processes before CLI imports.
 
-The bootstrap does two cheap, process-local things:
+The bootstrap does three cheap, process-local things:
 
 * prepares the loopback ``NO_PROXY`` entries before Hermes constructs shared
-  model clients; and
+  model clients;
 * wraps ``PluginManager.discover_and_load`` so every successful discovery
   contains at least one mandatory sibling-integrity callback, including after
-  a ``force=True`` rescan clears the hook table.
+  a ``force=True`` rescan clears the hook table; and
+* registers the agent-memory post-import hook, so the ``tools/memory_tool.py``
+  seam is wrapped even in a process that never completes plugin discovery.
 
 No policy file is read here.  The callback imports and evaluates policy lazily
 when Hermes fires ``on_session_start``.
@@ -153,6 +155,20 @@ def install() -> None:
     """Install all early runtime guards for the current Hermes process."""
     ensure_loopback_proxy_bypass()
     _install_plugin_discovery_wrapper()
+    _install_memory_import_hook()
+
+
+def _install_memory_import_hook() -> None:
+    """Register the memory seam's post-import finder (never imports the seam itself).
+
+    Import-time only: whether anything is sealed, and whether an unsupported seam
+    must stop the process, is decided when upstream actually imports
+    ``tools.memory_tool``. Safe mode changes what the hook then does, not whether
+    the finder is registered — see :mod:`.keyvault._memory_hook`.
+    """
+    from .keyvault._memory_hook import install_memory_import_hook
+
+    install_memory_import_hook()
 
 
 def run(*, installer: Callable[[], None] | None = None) -> bool:

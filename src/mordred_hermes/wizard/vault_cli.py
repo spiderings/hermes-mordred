@@ -1,6 +1,7 @@
 """``hermes mordred vault {status,...}`` — at-rest vault CLI.
 
-Design note: ``docs/dev/SECRETS_ENV_ENCRYPTION.md`` §8.2.
+The path and lifecycle contracts live in ``docs/dev/PATHS.md`` and
+``docs/dev/SPEC.md``.
 
 The at-rest vault (``keyvault/{vault,manifest,anchor,file_container}.py``)
 generalises secret-at-rest encryption beyond the legacy keyvault. This module

@@ -13,10 +13,18 @@ def _transfer_data(to_hex_no0x: str, amount: int) -> str:
     return "0xa9059cbb" + "00" * 12 + to_hex_no0x + amount.to_bytes(32, "big").hex()
 
 
-def test_personal_sign_low_risk():
-    analysis, decoded = analyze_sign("personal_sign", ["0xdeadbeef", _ADDR])
+def test_personal_sign_readable_text_is_low_risk():
+    analysis, decoded = analyze_sign("personal_sign", ["0x" + b"gm wagmi".hex(), _ADDR])
     assert analysis["risk"] == "low"
-    assert decoded == {}
+    assert decoded == {"payload_kind": "text", "message_preview": "gm wagmi"}
+
+
+def test_personal_sign_opaque_payload_is_not_low_risk():
+    """0xdeadbeef is not a message anyone can read, so the approval copy may
+    not promise "no asset movement" (see test_extension_wallet.py)."""
+    analysis, decoded = analyze_sign("personal_sign", ["0xdeadbeef", _ADDR])
+    assert analysis["risk"] == "medium"
+    assert decoded == {"payload_kind": "opaque_bytes"}
 
 
 def test_erc20_transfer_decoded():

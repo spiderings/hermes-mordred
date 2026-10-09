@@ -1,6 +1,7 @@
 """Story 1.5 -- migrate ``~/.openclaw/mordred/`` into ``~/.hermes/mordred/``.
 
-Per PATHS.md §OpenClaw migration L286 the H5 row-level conflict policy is:
+Per PATHS.md §Migration from legacy OpenClaw paths, the row-level conflict
+policy is:
 
 | OpenClaw path | Hermes destination | Conflict policy |
 |---|---|---|

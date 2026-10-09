@@ -17,8 +17,8 @@ authors = [{ name = "InternetMaximalism" }]
 license = { text = "MIT" }
 
 [project.urls]
-Homepage = "https://github.com/InternetMaximalism/hermes-mordred"
-Source = "https://github.com/InternetMaximalism/hermes-mordred"
+Homepage = "https://github.com/mordredagent/hermes-mordred"
+Source = "https://github.com/mordredagent/hermes-mordred"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_mordred_reservation"]

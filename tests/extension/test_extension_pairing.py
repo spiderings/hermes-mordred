@@ -23,11 +23,6 @@ from mordred_hermes.extension import extension_crypto as xc
 from mordred_hermes.extension import extension_pairing as pairing
 
 
-@pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-
 def _verify_attestation(challenge: bytes, se_pubkey_b64: str, signed_b64: str) -> bool:
     pub = load_der_public_key(xc.b64u_decode(se_pubkey_b64))
     raw = xc.b64u_decode(signed_b64)

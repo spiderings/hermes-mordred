@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import shutil
 import sys
@@ -251,45 +252,48 @@ def verify_digest(*, home: Path | None = None) -> int:
         return 1
 
 
-def recover(
-    *,
-    blob_path: Path,
-    home: Path | None = None,
-    backend: NativeBackend | None = None,
-    prompt_io: PromptIO | None = None,
-    audit_sink: AuditSink | None = None,
-) -> int:
-    """Restore a keyvault from an ``export_backup`` blob on this device.
+def _preflight_recovery_imports() -> None:
+    """Resolve the recovery stack before any secret is prompted for.
 
-    Reads the blob at ``blob_path``, prompts for the 24-word Seed Phrase
-    and the Passphrase, recomputes the seed-bound PoW, and restores the
-    keyvault via :func:`mordred_hermes.keyvault.api.import_backup`.
+    Before the split into helpers, ``recover`` imported the crypto-backed modules
+    right after reading the blob — so a broken install failed *before* the
+    operator typed the Seed Phrase. The helpers below import lazily; this keeps
+    that ordering by importing the same modules up front.
+    """
+    for name in (
+        "cryptography.exceptions",
+        "mordred_hermes.keyvault._bip39",
+        "mordred_hermes.keyvault.api",
+        "mordred_hermes.keyvault.pow",
+        "mordred_hermes.keyvault.backup",
+        "mordred_hermes.keyvault.recovery",
+    ):
+        importlib.import_module(name)
 
-    ``backend=None`` builds the production Secure-Enclave backend;
-    ``prompt_io=None`` uses the prompt_toolkit-backed prompts. Both are
-    injected by tests.
 
-    Returns 0 on success; 1 on an unreadable/corrupt blob, a Seed Phrase
-    that fails the BIP39 checksum, a verification-digest mismatch
-    (mis-transcribed seed/passphrase), or a Secure Enclave failure.
+def _read_backup_blob(blob_path: Path) -> bytes | None:
+    """Read the backup blob, reporting (and returning ``None`` on) an OSError.
+
+    Split out of :func:`recover` for cyclomatic headroom only — same message,
+    same exit behaviour (the caller returns 1 on ``None``).
     """
     try:
-        blob = blob_path.read_bytes()
+        return blob_path.read_bytes()
     except OSError as exc:
         _term.emit_error(f"cannot read backup blob {blob_path}: {exc}")
-        return 1
+        return None
 
-    from cryptography.exceptions import InvalidTag
 
+def _validated_seed_and_pow(seed_phrase: str) -> tuple[str, bytes] | None:
+    """Normalize the Seed Phrase, validate its BIP39 checksum, and compute the PoW.
+
+    Returns ``(normalized_seed, pow_bytes)`` on success or ``None`` (already
+    reported) when the checksum fails. Split out of :func:`recover` for
+    cyclomatic headroom only — the checksum validation and its error message,
+    and the PoW computation, are unchanged and in the same order.
+    """
     from ..keyvault import _bip39, api
     from ..keyvault import pow as kvpow
-
-    prompt_io = resolve_prompt_io(prompt_io)
-    # Security review H5: the Seed Phrase is the keyvault's root secret —
-    # collect it masked (ask_password), never with terminal echo
-    # (ask_text), so it does not land in scrollback or a shared TTY.
-    seed_phrase = prompt_io.ask_password("24-word Seed Phrase")
-    passphrase = prompt_io.ask_password("Passphrase")
 
     # Validate the BIP39 checksum up front for a legible error. import_backup
     # would also reject a mistyped seed, but later and via a digest mismatch.
@@ -298,16 +302,38 @@ def recover(
         _bip39.mnemonic_to_entropy(normalized_seed)
     except ValueError as exc:
         _term.emit_error(f"Seed Phrase rejected: {exc}")
-        return 1
+        return None
 
     # PoW is a deterministic function of the normalized seed (SPEC
     # §"Proof-of-Work (PoW) algorithm"), so recovery recomputes it rather
     # than asking the operator to transcribe 32 more bytes.
     pow_bytes = kvpow.compute_pow(normalized_seed, difficulty_bits=kvpow.POW_DIFFICULTY_BITS)
+    return normalized_seed, pow_bytes
 
-    backend = resolve_backend(backend)
-    sink = audit_sink if audit_sink is not None else _stderr_audit_sink
 
+def _import_backup_or_report(
+    *,
+    blob: bytes,
+    passphrase: str,
+    seed_phrase: str,
+    pow_bytes: bytes,
+    backend: NativeBackend,
+    sink: AuditSink,
+    home: Path | None,
+    prompt_io: PromptIO,
+) -> str | None:
+    """Import the backup, retrying once with a legacy backup passphrase on ``InvalidTag``.
+
+    Returns the imported ``key_id`` on success, or ``None`` after reporting the
+    failure. Split out of :func:`recover` for cyclomatic headroom only: every
+    exception type, message, and the InvalidTag -> legacy-prompt -> retry
+    sequence are unchanged, in the same order. The legacy backup passphrase
+    (prompted for only on that retry) never leaves this frame — its reference
+    is dropped when the function returns.
+    """
+    from cryptography.exceptions import InvalidTag
+
+    from ..keyvault import api
     from ..keyvault._exceptions import WrapError
     from ..keyvault.backup import BackupCorrupt, BackupImportConflict
     from ..keyvault.recovery import RecoveryDigestMismatch
@@ -338,7 +364,7 @@ def recover(
                     "Recovery rejected: backup ciphertext authentication failed "
                     "(wrong legacy encryption passphrase or a tampered blob)."
                 )
-                return 1
+                return None
             key_id = api.import_backup(
                 blob,
                 passphrase,
@@ -354,30 +380,91 @@ def recover(
             "Recovery rejected: the verification digest does not match — the Seed "
             "Phrase or Passphrase was mis-transcribed."
         )
-        return 1
+        return None
     except BackupCorrupt as exc:
         _term.emit_error(f"Recovery rejected: backup blob is corrupt — {exc}")
-        return 1
+        return None
     except BackupImportConflict as exc:
         _term.emit_error(
             f"Recovery rejected: destination keyvault is not fresh — {exc}. "
             "Use a new Hermes home, or verify a backup and reset the existing keyvault first."
         )
-        return 1
+        return None
     except InvalidTag:
         _term.emit_error(
             "Recovery rejected: backup ciphertext authentication failed "
             "(wrong legacy encryption passphrase or a tampered blob)."
         )
-        return 1
+        return None
     except WrapError as exc:
         _term.emit_error(f"Recovery failed: Secure Enclave error — {exc}")
+        return None
+    return key_id
+
+
+def recover(
+    *,
+    blob_path: Path,
+    home: Path | None = None,
+    backend: NativeBackend | None = None,
+    prompt_io: PromptIO | None = None,
+    audit_sink: AuditSink | None = None,
+) -> int:
+    """Restore a keyvault from an ``export_backup`` blob on this device.
+
+    Reads the blob at ``blob_path``, prompts for the 24-word Seed Phrase
+    and the Passphrase, recomputes the seed-bound PoW, and restores the
+    keyvault via :func:`mordred_hermes.keyvault.api.import_backup`.
+
+    ``backend=None`` builds the production Secure-Enclave backend;
+    ``prompt_io=None`` uses the prompt_toolkit-backed prompts. Both are
+    injected by tests.
+
+    Returns 0 on success; 1 on an unreadable/corrupt blob, a Seed Phrase
+    that fails the BIP39 checksum, a verification-digest mismatch
+    (mis-transcribed seed/passphrase), or a Secure Enclave failure.
+    """
+    blob = _read_backup_blob(blob_path)
+    if blob is None:
         return 1
+    _preflight_recovery_imports()
+
+    prompt_io = resolve_prompt_io(prompt_io)
+    # Security review H5: the Seed Phrase is the keyvault's root secret —
+    # collect it masked (ask_password), never with terminal echo
+    # (ask_text), so it does not land in scrollback or a shared TTY.
+    seed_phrase = prompt_io.ask_password("24-word Seed Phrase")
+    passphrase = prompt_io.ask_password("Passphrase")
+
+    validated = _validated_seed_and_pow(seed_phrase)
+    if validated is None:
+        return 1
+    normalized_seed, pow_bytes = validated
+    del validated  # the tuple would otherwise keep the normalized seed alive past the final del
+
+    backend = resolve_backend(backend)
+    sink = audit_sink if audit_sink is not None else _stderr_audit_sink
+
+    key_id = _import_backup_or_report(
+        blob=blob,
+        passphrase=passphrase,
+        seed_phrase=seed_phrase,
+        pow_bytes=pow_bytes,
+        backend=backend,
+        sink=sink,
+        home=home,
+        prompt_io=prompt_io,
+    )
+    if key_id is None:
+        return 1
+
     _provision_audit_log_key(backend, home=home)
     # L2 (PR #39 review): import_backup has consumed the seed/passphrase;
     # drop the str references (CPython cannot zero an immutable str in
     # place — this shortens the exposure window rather than scrubbing it).
-    del seed_phrase, passphrase, normalized_seed, legacy_backup_passphrase
+    # The legacy backup passphrase, if prompted for, was local to
+    # _import_backup_or_report and is already gone with that frame.
+    del seed_phrase, passphrase, normalized_seed
     print(f"Keyvault recovered. Imported key: {_terminal_safe(key_id)}")
     return 0
 
@@ -747,7 +834,38 @@ def _delete_wrapping_keys(
     return failures
 
 
-def reset_keyvault(  # noqa: C901, PLR0912, PLR0915 - destructive state machine is intentionally explicit
+def reset_keyvault(
+    *,
+    home: Path | None = None,
+    backend: NativeBackend | None = None,
+    prompt_io: PromptIO | None = None,
+    assume_yes: bool = False,
+) -> int:
+    """Reset keyvault only after independent TPM memory custody is removed."""
+    from ..keyvault._memory_key import MemoryKeyError, memory_key_lock, memory_key_path
+
+    root = _resolve_root(home)
+    resolved_home = root.parent.parent
+    wrapped = memory_key_path(resolved_home)
+    if (sys.platform == "linux" and root.exists()) or wrapped.exists() or wrapped.is_symlink():
+        try:
+            # Same lock as provision/purge: no new memory key can appear between
+            # this guard and recursive removal of its native keyvault/tpm store.
+            with memory_key_lock(resolved_home):
+                if wrapped.exists() or wrapped.is_symlink() or (root.parent / "memory-vault.marker").exists():
+                    _term.emit_error(
+                        "TPM memory depends on this keyvault directory. Run `hermes-mordred encryption purge memory` "
+                        "to restore plaintext and remove its key before keyvault reset. Nothing was deleted."
+                    )
+                    return 1
+                return _reset_keyvault(home=resolved_home, backend=backend, prompt_io=prompt_io, assume_yes=assume_yes)
+        except MemoryKeyError:
+            _term.emit_error("cannot lock TPM memory before keyvault reset; nothing was deleted")
+            return 1
+    return _reset_keyvault(home=resolved_home, backend=backend, prompt_io=prompt_io, assume_yes=assume_yes)
+
+
+def _reset_keyvault(  # noqa: C901, PLR0912, PLR0915 - destructive state machine is intentionally explicit
     *,
     home: Path | None = None,
     backend: NativeBackend | None = None,
