@@ -69,37 +69,17 @@ jobs:
         run: |
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install -e ".[dev,keyvault,extension]" uv
-      - name: Bisect A1 private fs wallet lifecycle confidential build
-        timeout-minutes: 8
+      - name: Bisect A5a wizard config portable
+        timeout-minutes: 10
         continue-on-error: true
         run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=240 -v -p no:cacheprovider
-          tests/test_private_fs.py tests/test_private_fs_posix.py tests/test_private_fs_windows.py tests/test_private_fs_windows_faults.py tests/test_private_fs_processes.py tests/test_keyvault_wallet_storage.py tests/test_private_fs_lifecycle.py tests/test_private_fs_lifecycle_faults.py tests/test_private_fs_confidential.py tests/test_private_fs_confidential_windows.py tests/test_private_fs_public_build.py tests/test_private_fs_public_build_windows.py tests/test_private_fs_principal.py
-      - name: Bisect A2 windows runtime installer principal
-        timeout-minutes: 8
+          .\.venv\Scripts\python.exe .github/diag/run_bounded.py 300 -q -o addopts= -v -p no:cacheprovider tests/test_wizard_config_windows.py
+      - name: Bisect A5b wizard config native
+        timeout-minutes: 10
         continue-on-error: true
         run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=240 -v -p no:cacheprovider
-          tests/test_windows_runtime.py tests/test_windows_installer.py tests/test_windows_install_ownership.py tests/test_windows_install_powershell.py tests/test_private_fs_principal.py
-      - name: Bisect A3 config io readers
-        timeout-minutes: 8
-        continue-on-error: true
-        run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=240 -v -p no:cacheprovider
-          tests/test_config_io_custody.py tests/test_config_io.py tests/test_config_readers.py tests/test_config_io_windows.py
-      - name: Bisect A4 audit sessions rotation
-        timeout-minutes: 8
-        continue-on-error: true
-        run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=240 -v -p no:cacheprovider
-          tests/test_audit_session.py tests/test_audit_session_faults.py tests/test_audit_rotation.py tests/test_audit_session_processes.py tests/test_audit_session_windows.py
-      - name: Bisect A5 wizard config
-        timeout-minutes: 8
-        continue-on-error: true
-        run: >-
-          .\.venv\Scripts\python.exe -m pytest -q -o addopts= -o faulthandler_timeout=240 -v -p no:cacheprovider
-          tests/test_wizard_config_windows.py tests/test_wizard_config_native_windows.py
-      - name: Bisect B custody profile
+          .\.venv\Scripts\python.exe .github/diag/run_bounded.py 300 -q -o addopts= -v -p no:cacheprovider tests/test_wizard_config_native_windows.py
+      - name: Bisect B custody profile (bounded)
         timeout-minutes: 10
         continue-on-error: true
         run: >-
